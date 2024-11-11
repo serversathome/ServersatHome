@@ -89,3 +89,13 @@ echo "Media directory structure created!"
 
 #create docker network called group
 sudo docker network create arr && echo "Docker network 'arr' created."
+
+# Add updates
+sudo crontab -l | { cat; echo "0 3 * * * apt update -y && apt upgrade -y"; } | sudo crontab -
+
+# Add NFS package
+sudo apt install nfs-common -y
+
+#Add a mount point for TrueNAS
+sudo sh -c 'echo "10.99.0.200:/mnt/bigdeal/media /media nfs defaults 0 0" >> /etc/fstab && mount -a'
+
