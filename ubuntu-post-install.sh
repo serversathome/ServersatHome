@@ -87,9 +87,6 @@ echo "Done!"
 
 echo "Media directory structure created!"
 
-#create docker network called group
-sudo docker network create arr && echo "Docker network 'arr' created."
-
 # Add updates
 sudo crontab -l | { cat; echo "0 3 * * * apt update -y && apt upgrade -y"; } | sudo crontab -
 
