@@ -1,0 +1,11 @@
+services:
+  baserow:
+    container_name: baserow
+    environment:
+      - BASEROW_PUBLIC_URL=http://10.99.0.163:8092
+    volumes:
+      - /mnt/tank/baserow:/baserow/data
+    ports:
+      - 8092:80
+    restart: unless-stopped
+    image: baserow/baserow:1.29.3
