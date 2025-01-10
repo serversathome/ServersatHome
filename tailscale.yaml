@@ -1,7 +1,6 @@
 services:
   tailscale:
     container_name: tailscale
-    restart: unless-stopped
     volumes:
       - /var/lib:/var/lib
       - /dev/net/tun:/dev/net/tun
@@ -10,9 +9,10 @@ services:
       - NET_ADMIN
       - NET_RAW
     environment:
-      - TS_AUTHKEY=auth key goes here
-      - TS_ROUTES=192.168.X.X/24
-      - TS_STATE_DIR=/var/lib/tailscale
-      - TS_EXTRA_ARGS=--advertise-exit-node
+      - TS_AUTHKEY= #auth key goes here
+      - TS_ROUTES=192.168.X.X/24 #Enables subnet routes for device
+      - TS_STATE_DIR=/var/lib/tailscale #Keeps auth persistence
+      - TS_EXTRA_ARGS=--advertise-exit-node #Enables device as a exit node
     image: tailscale/tailscale
-networks: {}
+    restart: unless-stopped
+
