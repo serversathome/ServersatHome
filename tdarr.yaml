@@ -1,0 +1,74 @@
+services:
+  tdarr:
+    container_name: tdarr
+    image: ghcr.io/haveagitgat/tdarr:latest
+    restart: unless-stopped
+    network_mode: bridge
+    ports:
+      - 8265:8265 # webUI port
+      - 8266:8266 # server port
+    environment:
+      - TZ=Europe/London
+      - PUID=568
+      - PGID=568
+      - UMASK_SET=002
+      - serverIP=0.0.0.0
+      - serverPort=8266
+      - webUIPort=8265
+      - internalNode=true
+      - inContainer=true
+      - ffmpegVersion=6
+      - nodeName=MyInternalNode
+      - NVIDIA_DRIVER_CAPABILITIES=all
+      - NVIDIA_VISIBLE_DEVICES=all
+    volumes:
+      - ./configs/tdarr/server:/app/server
+      - ./configs/tdarr/configs:/app/configs
+      - ./configs/tdarr/logs:/app/logs
+      - /mnt/tank/media:/media
+      - ./configs/tdarr/transcode_cache:/temp
+    devices:
+      - /dev/dri:/dev/dri
+  #  deploy:
+  #    resources:
+  #      reservations:
+  #        devices:
+  #        - driver: nvidia
+  #          count: all
+  #          capabilities: [gpu]
+
+
+  # node example
+  tdarr-node:
+    container_name: tdarr-node
+    image: ghcr.io/haveagitgat/tdarr_node:latest
+    restart: unless-stopped
+    network_mode: service:tdarr
+    environment:
+      - TZ=Europe/London
+      - PUID=568
+      - PGID=568
+      - UMASK_SET=002
+      - nodeName=MyExternalNode
+      - serverIP=0.0.0.0
+      - serverPort=8266
+      - inContainer=true
+      - ffmpegVersion=6
+      - NVIDIA_DRIVER_CAPABILITIES=all
+      - NVIDIA_VISIBLE_DEVICES=all
+    volumes:
+      - ./configs/tdarr/configs:/app/configs
+      - ./configs/tdarr/logs:/app/logs
+      - /mnt/tank/media:/media
+      - ./configs/tdarr/transcode_cache:/temp
+    devices:
+      - /dev/dri:/dev/dri
+networks: {}
+
+#    deploy:
+#      resources:
+#        reservations:
+#          devices:
+#          - driver: nvidia
+#            count: all
+#            capabilities: [gpu]
