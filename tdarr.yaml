@@ -8,7 +8,7 @@ services:
       - 8265:8265 # webUI port
       - 8266:8266 # server port
     environment:
-      - TZ=Europe/London
+      - TZ=America/New_York
       - PUID=568
       - PGID=568
       - UMASK_SET=002
