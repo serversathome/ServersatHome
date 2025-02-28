@@ -12,6 +12,7 @@ CONFIG_DATASETS=("prowlarr" "radarr" "sonarr" "jellyseerr" "recyclarr" "bazarr" 
 TDARR_SUBDIRS=("server" "logs" "transcode_cache")
 MEDIA_SUBDIRECTORIES=("movies" "tv" "downloads")
 DOCKER_COMPOSE_PATH="/mnt/$POOLNAME/docker"
+QBITTORRENT_WIREGUARD_DIR="/mnt/$POOLNAME/configs/qbittorrent/wireguard"
 
 # Function to create and set up a dataset
 create_dataset() {
@@ -77,6 +78,7 @@ if mountpoint -q "$TDARR_MOUNTPOINT"; then
 else
     echo "⚠️ Skipping tdarr subdirectory creation; dataset is not mounted."
 fi
+
 # Ensure Docker Compose directory exists
 create_directory "$DOCKER_COMPOSE_PATH"
 
@@ -88,10 +90,9 @@ if [ ! -d "$DOCKER_COMPOSE_PATH" ]; then
 fi
 
 # Generate docker-compose.yml
-docker_compose_file="$docker_compose_path/docker-compose.yml"
-
-
 cat > "$DOCKER_COMPOSE_FILE" <<EOF
+version: '3.9'
+
 networks:
   media_network:
     driver: bridge
@@ -285,3 +286,33 @@ EOF
 
 echo "Docker Compose file created at $DOCKER_COMPOSE_FILE"
 echo "Script completed."
+
+# Ask the user if they want to launch the Docker containers
+read -p "Would you like to launch the Docker containers now? (yes/no): " LAUNCH_CONTAINERS
+
+if [[ "$LAUNCH_CONTAINERS" =~ ^[Yy]es$ ]]; then
+    # Ensure the WireGuard directory exists
+    create_directory "$QBITTORRENT_WIREGUARD_DIR"
+
+    # Prompt the user to paste their WireGuard VPN configuration
+    echo "Please paste your WireGuard VPN configuration below (press Ctrl+D when done):"
+    WG_CONFIG=$(cat)
+
+    # Save the VPN configuration as wg0.conf
+    echo "$WG_CONFIG" > "$QBITTORRENT_WIREGUARD_DIR/wg0.conf"
+    echo "WireGuard configuration saved to $QBITTORRENT_WIREGUARD_DIR/wg0.conf"
+
+    # Change to the Docker Compose directory and launch the containers
+    cd "$DOCKER_COMPOSE_PATH"
+    echo "Launching Docker containers from $DOCKER_COMPOSE_PATH..."
+    docker compose up -d
+
+    if [ $? -eq 0 ]; then
+        echo "Docker containers launched successfully!"
+    else
+        echo "⚠️ Failed to launch Docker containers. Check the logs for errors."
+    fi
+else
+    echo "Docker containers were not launched. You can start them manually by running:"
+    echo "cd $DOCKER_COMPOSE_PATH && docker compose up -d"
+fi
