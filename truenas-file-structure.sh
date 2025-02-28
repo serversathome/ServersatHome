@@ -3,6 +3,10 @@
 # Prompt the user for the pool name
 read -p "Enter the pool name: " POOLNAME
 
+# Retrieve the private IP address of the server and convert it to CIDR notation
+PRIVATE_IP=$(hostname -I | awk '{print $1}')
+CIDR_NETWORK="${PRIVATE_IP%.*}.0/24"
+
 # Define datasets and directories
 CONFIG_DATASETS=("prowlarr" "radarr" "sonarr" "jellyseerr" "recyclarr" "bazarr" "tdarr" "jellyfin" "qbittorrent" "dozzle")
 TDARR_SUBDIRS=("server" "logs" "transcode_cache")
@@ -251,7 +255,7 @@ services:
       - VPN_ENABLED=true
       - VPN_CONF=wg0
       - VPN_PROVIDER=generic
-      - VPN_LAN_NETWORK=10.99.0.0/24
+      - VPN_LAN_NETWORK=$CIDR_NETWORK
       - VPN_EXPOSE_PORTS_ON_LAN=
       - VPN_AUTO_PORT_FORWARD=true
       - VPN_AUTO_PORT_FORWARD_TO_PORTS=5687
