@@ -154,6 +154,20 @@ services:
       - media_network
     volumes:
       - /mnt/$POOLNAME/configs/jellyseerr:/app/config
+      
+  flaresolverr:
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    container_name: flaresolverr
+    environment:
+      - LOG_LEVEL=info
+      - LOG_HTML=false
+      - CAPTCHA_SOLVER=none
+      - TZ=America/New_York
+    networks:
+      - media_network
+    ports:
+      - 8191:8191
+    restart: unless-stopped
 
   recyclarr:
     image: ghcr.io/recyclarr/recyclarr
