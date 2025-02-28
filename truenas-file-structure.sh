@@ -92,8 +92,6 @@ docker_compose_file="$docker_compose_path/docker-compose.yml"
 
 
 cat > "$DOCKER_COMPOSE_FILE" <<EOF
-version: '3.9'
-
 networks:
   media_network:
     driver: bridge
