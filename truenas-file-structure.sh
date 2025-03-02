@@ -309,7 +309,7 @@ if [[ "$LAUNCH_CONTAINERS" =~ ^[Yy]es$ ]]; then
     create_directory "$QBITTORRENT_WIREGUARD_DIR"
 
     # Prompt the user to paste their WireGuard VPN configuration
-    echo "Please paste your WireGuard VPN configuration below by using SHIFT+INS to paste (press Ctrl+D when done):"
+    echo "Please paste your WireGuard VPN configuration below by using SHIFT+INS to paste (press ENTER then Ctrl+D when done):"
     WG_CONFIG=$(cat)
 
     # Save the VPN configuration as wg0.conf
