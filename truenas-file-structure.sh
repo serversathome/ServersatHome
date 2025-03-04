@@ -558,3 +558,39 @@ else
     echo "Docker containers were not launched. You can start them manually by running:"
     echo "cd $DOCKER_COMPOSE_PATH && docker compose up -d"
 fi
+# Print running containers and their accessible URLs
+if [[ "$LAUNCH_CONTAINERS" =~ ^[Yy]es$ ]]; then
+    echo "Listing all running containers and their accessible URLs:"
+
+    # Get the host's IP address
+    host_ip=$(hostname -I | awk '{print $1}')
+
+    # Get a list of all running containers
+    docker ps --format "{{.Names}}" | while read -r container_name; do
+        # Get the container's exposed ports
+        ports=$(docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{ (index $conf 0).HostPort }} {{end}}{{end}}' "$container_name")
+
+        # Print the container name and its accessible URL
+        if [ -n "$ports" ]; then
+            for port in $ports; do
+                echo "$container_name | http://$host_ip:$port"
+            done
+        else
+            echo "$container_name | No exposed port found"
+        fi
+    done
+
+    # Extract and print the qBittorrent password from the logs
+    qbittorrent_container="qbittorrent"
+    if docker ps --format "{{.Names}}" | grep -q "$qbittorrent_container"; then
+        echo "Fetching qBittorrent password from logs..."
+        qbittorrent_password=$(docker logs "$qbittorrent_container" 2>&1 | grep "The WebUI administrator password was not set." | awk -F ': ' '{print $NF}')
+        if [ -n "$qbittorrent_password" ]; then
+            echo "qBittorrent WebUI password: $qbittorrent_password"
+        else
+            echo "qBittorrent WebUI password not found in logs."
+        fi
+    else
+        echo "qBittorrent container is not running."
+    fi
+fi
