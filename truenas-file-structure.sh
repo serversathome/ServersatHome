@@ -301,9 +301,7 @@ echo "Script completed."
 
 # Ask the user if they want to launch the Docker containers
 read -p "Would you like to launch the Docker containers now? (yes/no): " LAUNCH_CONTAINERS
-
-# ... (rest of your existing script remains unchanged)
-
+# Launch Docker containers
 if [[ "$LAUNCH_CONTAINERS" =~ ^[Yy]es$ ]]; then
     # Ensure the WireGuard directory exists
     create_directory "$QBITTORRENT_WIREGUARD_DIR"
@@ -323,6 +321,38 @@ if [[ "$LAUNCH_CONTAINERS" =~ ^[Yy]es$ ]]; then
 
     if [ $? -eq 0 ]; then
         echo "Docker containers launched successfully!"
+
+        # Modify qBittorrent.conf after the container is running
+        QBITTORRENT_CONF_FILE="/mnt/$POOLNAME/configs/qbittorrent/config/qBittorrent.conf"
+        echo "Waiting for qBittorrent to generate its configuration file..."
+        while [ ! -f "$QBITTORRENT_CONF_FILE" ]; do
+            sleep 5
+            echo "Waiting for $QBITTORRENT_CONF_FILE to be created..."
+        done
+
+        # Update or add the DefaultSavePath in the [BitTorrent] section
+        if grep -q "\[BitTorrent\]" "$QBITTORRENT_CONF_FILE"; then
+            echo "[BitTorrent] section found in $QBITTORRENT_CONF_FILE"
+            if grep -q "Session\\DefaultSavePath=" "$QBITTORRENT_CONF_FILE"; then
+                echo "Updating Session\\DefaultSavePath in $QBITTORRENT_CONF_FILE"
+                sed -i "/\[BitTorrent\]/,/^\[/ s|Session\\DefaultSavePath=.*|Session\\DefaultSavePath=/media/downloads|" "$QBITTORRENT_CONF_FILE"
+            else
+                echo "Adding Session\\DefaultSavePath under [BitTorrent] section in $QBITTORRENT_CONF_FILE"
+                sed -i "/\[BitTorrent\]/a Session\\DefaultSavePath=/media/downloads" "$QBITTORRENT_CONF_FILE"
+            fi
+        else
+            echo "[BitTorrent] section not found in $QBITTORRENT_CONF_FILE"
+            echo "Adding [BitTorrent] section and Session\\DefaultSavePath to $QBITTORRENT_CONF_FILE"
+            echo -e "\n[BitTorrent]\nSession\\DefaultSavePath=/media/downloads" >> "$QBITTORRENT_CONF_FILE"
+        fi
+
+        echo "qBittorrent default save path set to /media/downloads in $QBITTORRENT_CONF_FILE"
+
+        # Restart the qBittorrent container to apply the changes
+        echo "Restarting qBittorrent container to apply the new configuration..."
+        docker restart qbittorrent
+
+        echo "qBittorrent configuration updated and container restarted."
 
         # Ask the user if they want to configure recyclarr
         read -p "Would you like to sync recyclarr to radarr and sonarr? (yes/no): " CONFIGURE_RECYCLARR
