@@ -273,7 +273,6 @@ services:
       - VPN_KEEP_LOCAL_DNS=false
       - VPN_FIREWALL_TYPE=auto
       - PRIVOXY_ENABLED=false
-      - UNBOUND_ENABLED=false
     cap_add:
       - NET_ADMIN
     sysctls:
@@ -551,6 +550,34 @@ EOF
         else
             echo "Skipping recyclarr configuration."
         fi
+
+        # Add root folders to Radarr and Sonarr using their APIs
+        echo "Adding root folders to Radarr and Sonarr..."
+
+        # Wait for Radarr and Sonarr to be fully initialized
+        echo "Waiting for Radarr and Sonarr to be ready..."
+        until curl -s "http://localhost:7878/api/v3/system/status" -o /dev/null; do sleep 5; done
+        until curl -s "http://localhost:8989/api/v3/system/status" -o /dev/null; do sleep 5; done
+
+        # Add root folder to Radarr
+        echo "Adding root folder to Radarr..."
+        curl -X POST "http://localhost:7878/api/v3/rootfolder" \
+          -H "X-Api-Key: $RADARR_API_KEY" \
+          -H "Content-Type: application/json" \
+          -d '{
+                "path": "/media/movies"
+              }'
+
+        # Add root folder to Sonarr
+        echo "Adding root folder to Sonarr..."
+        curl -X POST "http://localhost:8989/api/v3/rootfolder" \
+          -H "X-Api-Key: $SONARR_API_KEY" \
+          -H "Content-Type: application/json" \
+          -d '{
+                "path": "/media/tv"
+              }'
+
+        echo "Root folders added successfully!"
     else
         echo "⚠️ Failed to launch Docker containers. Check the logs for errors."
     fi
