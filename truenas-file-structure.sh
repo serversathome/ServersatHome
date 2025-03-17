@@ -273,6 +273,7 @@ services:
       - VPN_KEEP_LOCAL_DNS=false
       - VPN_FIREWALL_TYPE=auto
       - PRIVOXY_ENABLED=false
+      - UNBOUND_ENABLED=false
     cap_add:
       - NET_ADMIN
     sysctls:
