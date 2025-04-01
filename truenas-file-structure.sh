@@ -294,6 +294,23 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - /mnt/$POOLNAME/configs/dozzle:/data
+
+  watchtower:
+    container_name: watchtower
+    environment:
+      - TZ=America/New_York
+      - WATCHTOWER_CLEANUP=true
+      - WATCHTOWER_NOTIFICATIONS_HOSTNAME=TrueNAS
+      - WATCHTOWER_INCLUDE_STOPPED=true
+      - WATCHTOWER_DISABLE_CONTAINERS=ix*
+      - WATCHTOWER_NO_STARTUP_MESSAGE=true
+      - WATCHTOWER_SCHEDULE=0 0 3 * * *
+    image: containrrr/watchtower
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+
+      
 EOF
 
 echo "Docker Compose file created at $DOCKER_COMPOSE_FILE"
