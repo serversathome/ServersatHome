@@ -267,10 +267,10 @@ services:
       - VPN_CONF=wg0
       - VPN_PROVIDER=generic
       - VPN_LAN_NETWORK=$CIDR_NETWORK,10.8.0.0/24
+      - VPN_LAN_LEAK_ENABLED=false
       - VPN_EXPOSE_PORTS_ON_LAN=
       - VPN_AUTO_PORT_FORWARD=true
-      - VPN_AUTO_PORT_FORWARD_TO_PORTS=5687
-      - VPN_KEEP_LOCAL_DNS=false
+      - VPN_AUTO_PORT_FORWARD_TO_PORTS=
       - VPN_FIREWALL_TYPE=auto
       - PRIVOXY_ENABLED=false
       - UNBOUND_ENABLED=false
