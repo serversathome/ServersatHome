@@ -10,8 +10,6 @@ Whether you're new to self-hosting or a seasoned sysadmin, this project is here 
 
 <p align="center">
   <a href="https://github.com/serversathome/stargazers"><img src="https://img.shields.io/github/stars/serversathome?style=social" alt="Stars"></a>
-  <a href="https://github.com/serversathome/network/members"><img src="https://img.shields.io/github/forks/serversathome?style=social" alt="Forks"></a>
-  <a href="https://github.com/serversathome/blob/main/LICENSE"><img src="https://img.shields.io/github/license/serversathome" alt="License"></a>
 </p>
 
 ---
