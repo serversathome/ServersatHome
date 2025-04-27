@@ -1,7 +1,8 @@
 <!-- Banner image -->
 <p align="center">
-  <img src="[](https://blog.serversatho.me/content/images/size/w2000/2024/08/bigstock-server-racks-in-server-room-da-150954236.jpg)" />
+  <img src="https://raw.githubusercontent.com/serversathome/ServersatHome/main/serverbanner.jpg" alt="Servers@Home Banner" />
 </p>
+
 
 # Servers@Home
 
