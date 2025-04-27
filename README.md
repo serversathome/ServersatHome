@@ -3,14 +3,15 @@
   <img src="https://raw.githubusercontent.com/serversathome/ServersatHome/main/serverbanner.jpg" alt="Servers@Home Banner" />
 </p>
 
-
 # Servers@Home
 
 **Servers@Home** is your home for learning, building, and mastering self-hosted services, home labs, and server setups.  
 Whether you're new to self-hosting or a seasoned sysadmin, this project is here to help you level up your homelab journey! 🚀
 
 <p align="center">
-  <a href="https://github.com/serversathome/stargazers"><img src="https://img.shields.io/github/stars/serversathome?style=social" alt="Stars"></a>
+  <a href="https://github.com/serversathome/stargazers">
+    <img src="https://img.shields.io/github/stars/serversathome?style=social" alt="GitHub Stars">
+  </a>
 </p>
 
 ---
@@ -38,7 +39,29 @@ Here are some of the resources and tutorials featured by Servers@Home:
 - 💬 **[Discord Server](https://discord.gg/syvCPcRJnR)** – Join the community, get help, and chat with other homelab enthusiasts!
 - 🧡 **[Patreon](https://www.patreon.com/serversathome)** – Support Servers@Home and help keep the project growing!
 
+---
 
 ## 🌟 Star History
 
 [![Star History Chart](https://api.star-history.com/svg?repos=serversathome/serversathome&type=Date)](https://star-history.com/#serversathome/serversathome)
+
+---
+
+## ☕ Support & Shop
+
+If you'd like to support Servers@Home or grab some homelab swag:
+
+- ☕ **[Buy Me a Coffee](https://www.buymeacoffee.com/serversathome)** — Help fuel the tutorials and videos!
+- 🛒 **[Servers@Home Shop](https://buymeacoffee.com/serversathome/extras)** — T-shirts and services for homelab lovers!
+
+<p align="center">
+  <a href="https://www.buymeacoffee.com/serversathome">
+    <img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Support%20Now-yellow?logo=buy-me-a-coffee" alt="Buy Me A Coffee">
+  </a>
+  &nbsp;
+  <a href="https://buymeacoffee.com/serversathome/extras">
+    <img src="https://img.shields.io/badge/Shop-Servers@Home%20Extras-blue" alt="Shop Servers@Home Extras">
+  </a>
+</p>
+
+
