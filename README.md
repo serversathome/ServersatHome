@@ -1,5 +1,45 @@
-# Welcome to the Servers@Home Github!
+<!-- Banner image -->
+<p align="center">
+  <img src="[](https://blog.serversatho.me/content/images/size/w2000/2024/08/bigstock-server-racks-in-server-room-da-150954236.jpg)" />
+</p>
 
-This space will serve as a home for select code which I want to share with the community to help beginners learn how to get comfortable with self-hosting.
+# Servers@Home
 
-For more info on these projects and their use go to the landing page (https://serversatho.me)
+**Servers@Home** is your home for learning, building, and mastering self-hosted services, home labs, and server setups.  
+Whether you're new to self-hosting or a seasoned sysadmin, this project is here to help you level up your homelab journey! 🚀
+
+<p align="center">
+  <a href="https://github.com/serversathome/stargazers"><img src="https://img.shields.io/github/stars/serversathome?style=social" alt="Stars"></a>
+  <a href="https://github.com/serversathome/network/members"><img src="https://img.shields.io/github/forks/serversathome?style=social" alt="Forks"></a>
+  <a href="https://github.com/serversathome/blob/main/LICENSE"><img src="https://img.shields.io/github/license/serversathome" alt="License"></a>
+</p>
+
+---
+
+## 🏠 About
+
+At **Servers@Home**, we explore topics like:
+- Building home servers with TrueNAS, Proxmox, and Docker
+- Deploying self-hosted apps like Jellyfin, Nextcloud, Immich, and more
+- Managing networks, VPNs, Cloudflare tunnels, and homelab security
+- Real-world tutorials designed for beginners and enthusiasts alike
+
+**Our mission:** Make self-hosting approachable, fun, and rewarding! ✨
+
+---
+
+## ⚡ Projects and Resources
+
+Here are some of the resources and tutorials featured by Servers@Home:
+
+- 📖 **[Blog](https://blog.serversatho.me)** – Tutorials, updates, and articles on self-hosting and server setups.
+- 📚 **[Wiki](https://wiki.serversatho.me)** – Quick reference guides, project documentation, and helpful snippets.
+- 🎓 **[Udemy Course: TrueNAS Fundamentals](https://www.udemy.com/course/truenas-fundamentals-for-beginners/)** – Learn the essentials of TrueNAS Scale from scratch.
+- 💼 **[LinkedIn Page](https://www.linkedin.com/company/serversathome/)** – Follow for news, updates, and homelab tips.
+- 💬 **[Discord Server](https://discord.gg/syvCPcRJnR)** – Join the community, get help, and chat with other homelab enthusiasts!
+- 🧡 **[Patreon](https://www.patreon.com/serversathome)** – Support Servers@Home and help keep the project growing!
+
+
+## 🌟 Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=serversathome/serversathome&type=Date)](https://star-history.com/#serversathome/serversathome)
