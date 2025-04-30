@@ -35,4 +35,15 @@ Write-Host "Creating Glances service..."
 Write-Host "Starting Glances service..."
 Start-Service $glancesServiceName
 
+# Step 5: Add Windows Firewall inbound rule for Glances
+Write-Host "Adding firewall rule for Glances on port 61208..."
+New-NetFirewallRule -DisplayName "Allow Glances Web UI" `
+    -Direction Inbound `
+    -Protocol TCP `
+    -LocalPort 61208 `
+    -Action Allow `
+    -Profile Any `
+    -Description "Allows inbound TCP traffic for Glances web interface on port 61208"
+
+
 Write-Host "Done. Glances is running on port 61208 and will auto-start on boot."
