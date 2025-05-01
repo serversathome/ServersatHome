@@ -1,5 +1,5 @@
 # run this if you are prevented from running scripts: 
-#Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned -Force
+# Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned -Force
 
 # Run this as Administrator
 
