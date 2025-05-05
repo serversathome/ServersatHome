@@ -1,4 +1,5 @@
 #!/bin/bash
+# version 0.9
 
 # Check if running as root
 if [[ $EUID -ne 0 ]]; then
