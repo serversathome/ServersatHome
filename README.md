@@ -43,7 +43,7 @@ Here are some of the resources and tutorials featured by Servers@Home:
 
 ## 🌟 Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=serversathome/serversathome&type=Date)](https://www.star-history.com/#serversathome/serversathome&Date)
+<iframe style="width:100%;height:auto;min-width:600px;min-height:400px;" src="https://www.star-history.com/embed?secret=Z2hwX2pqcjVBMEhwWWY2NlVGRWpmTlJyRThhU013ZktWWDBoRFRndg==#serversathome/serversathome&Date" frameBorder="0"></iframe>
 
 ---
 
