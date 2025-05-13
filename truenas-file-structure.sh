@@ -150,6 +150,7 @@ services:
       - TZ=America/New_York
     networks:
       - media_network
+    user: "568:568"
     volumes:
       - /mnt/$POOLNAME/configs/jellyseerr:/app/config
       
