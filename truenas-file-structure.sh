@@ -33,7 +33,7 @@ create_dataset() {
 
     # Verify mount exists before applying permissions
     if [ -d "$mountpoint" ]; then
-        chown apps:apps "$mountpoint"
+        chown root:apps "$mountpoint"
         chmod 770 "$mountpoint"
     else
         echo "⚠️ Warning: $mountpoint does not exist after mounting. Check dataset status."
@@ -46,7 +46,7 @@ create_directory() {
     if [ ! -d "$dir_path" ]; then
         echo "Creating directory: $dir_path"
         mkdir -p "$dir_path"
-        chown apps:apps "$dir_path"
+        chown root:apps "$dir_path"
         chmod 770 "$dir_path"
     else
         echo "Directory already exists: $dir_path, skipping..."
