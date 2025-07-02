@@ -148,7 +148,7 @@ EOF
 echo "Deployment files created in 'headscale' directory."
 
 # Start the Docker containers
-if ! docker-compose -f headscale/docker-compose.yaml up -d; then
+if ! docker compose -f headscale/docker-compose.yaml up -d; then
     echo "Failed to start Docker containers. Exiting..."
     exit 1
 fi
