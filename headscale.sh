@@ -10,7 +10,13 @@ fi
 if ! command -v docker &> /dev/null; then
     echo "Docker not found. Installing Docker..."
     curl -fsSL https://get.docker.com -o get-docker.sh && sh get-docker.sh
+    if [ $? -ne 0 ]; then
+        echo "Docker installation failed. Exiting..."
+        exit 1
+    fi
     echo "Docker installed successfully."
+    sudo systemctl start docker
+    sudo systemctl enable docker
 else
     echo "Docker is already installed."
 fi
@@ -19,6 +25,10 @@ fi
 if ! command -v docker-compose &> /dev/null; then
     echo "Docker Compose not found. Installing Docker Compose..."
     sudo apt-get -y install docker-compose
+    if [ $? -ne 0 ]; then
+        echo "Docker Compose installation failed. Exiting..."
+        exit 1
+    fi
     echo "Docker Compose installed successfully."
 else
     echo "Docker Compose is already installed."
@@ -166,13 +176,20 @@ EOF
 echo "Deployment files created in 'headscale' directory."
 
 # Start the Docker containers
-docker-compose -f headscale/docker-compose.yaml up -d
+if ! docker-compose -f headscale/docker-compose.yaml up -d; then
+    echo "Failed to start Docker containers. Exiting..."
+    exit 1
+fi
 
 # Wait a few seconds for the containers to start
 sleep 10
 
 # Create the API key and capture the output
 API_KEY=$(docker exec headscale headscale apikey create)
+if [ $? -ne 0 ]; then
+    echo "Failed to create API Key. Exiting..."
+    exit 1
+fi
 
 # Display the API key and instructions to the user
 echo "API Key generated: $API_KEY"
