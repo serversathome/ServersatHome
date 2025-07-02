@@ -45,7 +45,7 @@ services:
       - "traefik.http.routers.headscale-admin.tls=true"
 
   traefik:
-    image: "traefik:v3.3"
+    image: "traefik:latest"
     container_name: "traefik"
     command:
       - "--api.insecure=true"
