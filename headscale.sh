@@ -9,9 +9,10 @@ fi
 # Install Docker if not already installed
 if ! command -v docker &> /dev/null; then
     echo "Docker not found. Installing Docker..."
-    curl -fsSL https://get.docker.com -o get-docker.sh && sh get-docker.sh
-    if [ $? -ne 0 ]; then
-        echo "Docker installation failed. Exiting..."
+
+    # Run Docker installation with timeout
+    if ! timeout 300 bash -c "curl -fsSL https://get.docker.com -o get-docker.sh && sh get-docker.sh"; then
+        echo "Docker installation failed or timed out. Exiting..."
         exit 1
     fi
     echo "Docker installed successfully."
@@ -24,8 +25,7 @@ fi
 # Install Docker Compose if not already installed
 if ! command -v docker-compose &> /dev/null; then
     echo "Docker Compose not found. Installing Docker Compose..."
-    sudo apt-get -y install docker-compose
-    if [ $? -ne 0 ]; then
+    if ! apt-get -y install docker-compose; then
         echo "Docker Compose installation failed. Exiting..."
         exit 1
     fi
@@ -33,7 +33,6 @@ if ! command -v docker-compose &> /dev/null; then
 else
     echo "Docker Compose is already installed."
 fi
-
 # Prompt the user for the full domain (including subdomain)
 read -p "Enter your full domain (e.g., headscale.example.com): " FULL_DOMAIN
 
