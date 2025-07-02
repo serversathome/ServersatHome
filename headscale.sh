@@ -6,6 +6,24 @@ if [[ $EUID -ne 0 ]]; then
    exit 1
 fi
 
+# Install Docker if not already installed
+if ! command -v docker &> /dev/null; then
+    echo "Docker not found. Installing Docker..."
+    curl -fsSL https://get.docker.com -o get-docker.sh && sh get-docker.sh
+    echo "Docker installed successfully."
+else
+    echo "Docker is already installed."
+fi
+
+# Install Docker Compose if not already installed
+if ! command -v docker-compose &> /dev/null; then
+    echo "Docker Compose not found. Installing Docker Compose..."
+    sudo apt-get -y install docker-compose
+    echo "Docker Compose installed successfully."
+else
+    echo "Docker Compose is already installed."
+fi
+
 # Prompt the user for the full domain (including subdomain)
 read -p "Enter your full domain (e.g., headscale.example.com): " FULL_DOMAIN
 
