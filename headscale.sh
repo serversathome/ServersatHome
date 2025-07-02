@@ -24,7 +24,7 @@ services:
       - './data:/var/lib/headscale'
       - './configs/headscale:/etc/headscale'
     environment:
-      TZ: 'America/Edmonton'
+      TZ: 'America/New_York'
     labels:
       - "traefik.enable=true"
       - "traefik.http.routers.headscale.rule=Host(\`$FULL_DOMAIN\`)"
