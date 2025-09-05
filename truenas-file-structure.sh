@@ -196,46 +196,6 @@ services:
       - /mnt/$POOLNAME/configs/bazarr:/config
       - /mnt/$POOLNAME/media:/media
 
-  tdarr:
-    container_name: tdarr
-    image: ghcr.io/haveagitgat/tdarr:latest
-    restart: unless-stopped
-    ports:
-      - 8265:8265 # webUI port
-      - 8266:8266 # server port
-    environment:
-      - TZ=America/New_York
-      - PUID=568
-      - PGID=568
-      - UMASK_SET=002
-      - serverIP=0.0.0.0
-      - serverPort=8266
-      - webUIPort=8265
-      - internalNode=true
-      - inContainer=true
-      - ffmpegVersion=6
-      - nodeName=MyInternalNode
-      - NVIDIA_DRIVER_CAPABILITIES=all
-      - NVIDIA_VISIBLE_DEVICES=all
-    volumes:
-      - /mnt/$POOLNAME/configs/tdarr:/app/config
-      - /mnt/$POOLNAME/configs/tdarr/server:/app/server
-      - /mnt/$POOLNAME/configs/tdarr/logs:/app/logs
-      - /mnt/$POOLNAME/configs/tdarr/transcode_cache:/temp
-      - /mnt/$POOLNAME/media:/media
-
-    devices:
-      - /dev/dri:/dev/dri
-  #  deploy:
-  #    resources:
-  #      reservations:
-  #        devices:
-  #        - driver: nvidia
-  #          count: all
-  #          capabilities: [gpu]
-    networks:
-      - media_network
-
   jellyfin:
     container_name: jellyfin
     environment:
