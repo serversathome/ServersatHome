@@ -112,3 +112,37 @@ services:
     volumes:
       - ./configs/qbit/:/config
       - ${MEDIA_PATH}:/media  # Use the MEDIA_PATH variable
+
+
+  profilarr:
+    image: santiagosayshey/profilarr:latest
+    container_name: profilarr
+    ports:
+      - 6868:6868
+    volumes:
+      - ./configs/profilarr:/config
+    environment:
+      - TZ=America/New_York
+    restart: unless-stopped
+
+  watchtower:
+    image: nickfedor/watchtower
+    container_name: watchtower
+    environment:
+      - TZ=America/New_York
+      - WATCHTOWER_NOTIFICATIONS_HOSTNAME=truenas
+      - WATCHTOWER_CLEANUP=true
+      - WATCHTOWER_INCLUDE_STOPPED=true
+      - WATCHTOWER_SCHEDULE=0 0 3 * * *
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+
+  dozzle:
+    container_name: dozzle
+    image: amir20/dozzle:latest
+    ports:
+      - '8888:8080'
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
