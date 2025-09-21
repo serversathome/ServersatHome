@@ -49,7 +49,6 @@ services:
       - TZ=America/New_York
     ports:
       - 5055:5055
-    user: "568:568"
     volumes:
       - ./configs/jellyseerr/:/app/config
     restart: unless-stopped
