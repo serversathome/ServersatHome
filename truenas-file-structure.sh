@@ -234,7 +234,7 @@ services:
       - VPN_AUTO_PORT_FORWARD_TO_PORTS=
       - VPN_FIREWALL_TYPE=auto
       - VPN_HEALTHCHECK_ENABLED=false
-      - VPN_NAMESERVERS=
+      - VPN_NAMESERVERS=wg
       - PRIVOXY_ENABLED=false
     cap_add:
       - NET_ADMIN
