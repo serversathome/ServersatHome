@@ -5,10 +5,10 @@ services:
     environment:
       - PUID=568
       - PGID=568
-      - TZ=America/New_York
+      - TZ=${TZ}
     volumes:
-      - ./configs/prowlarr/:/config
-      - ${MEDIA_PATH}:/media/  # Use the MEDIA_PATH variable
+      - ${CONFIG_PATH}/prowlarr/:/config
+      - ${MEDIA_PATH}:/media/  
     ports:
       - 9696:9696
     restart: unless-stopped
@@ -19,10 +19,10 @@ services:
     environment:
       - PUID=568
       - PGID=568
-      - TZ=America/New_York
+      - TZ=${TZ}
     volumes:
-      - ./configs/radarr/:/config
-      - ${MEDIA_PATH}:/media  # Use the MEDIA_PATH variable
+      - ${CONFIG_PATH}/radarr/:/config
+      - ${MEDIA_PATH}:/media  
     ports:
       - 7878:7878
     restart: unless-stopped
@@ -33,10 +33,10 @@ services:
     environment:
       - PUID=568
       - PGID=568
-      - TZ=America/New_York
+      - TZ=${TZ}
     volumes:
-      - ./configs/sonarr/:/config
-      - ${MEDIA_PATH}:/media  # Use the MEDIA_PATH variable
+      - ${CONFIG_PATH}/sonarr/:/config
+      - ${MEDIA_PATH}:/media  
     ports:
       - 8989:8989
     restart: unless-stopped
@@ -46,11 +46,11 @@ services:
     container_name: jellyseerr
     environment:
       - LOG_LEVEL=debug
-      - TZ=America/New_York
+      - TZ=${TZ}
     ports:
       - 5055:5055
     volumes:
-      - ./configs/jellyseerr/:/app/config
+      - ${CONFIG_PATH}/jellyseerr/:/app/config
     restart: unless-stopped
     
   jellyfin:
@@ -59,10 +59,10 @@ services:
     environment:
       - PUID=568
       - PGID=568
-      - TZ=America/New_York
+      - TZ=${TZ}
     volumes:
-      - ./configs/jellyfin:/config
-      - ${MEDIA_PATH}:/media  # Use the MEDIA_PATH variable
+      - ${CONFIG_PATH}/jellyfin:/config
+      - ${MEDIA_PATH}:/media  
     ports:
       - 8096:8096
     restart: unless-stopped
@@ -74,7 +74,7 @@ services:
       - LOG_LEVEL=info
       - LOG_HTML=false
       - CAPTCHA_SOLVER=none
-      - TZ=America/New_York
+      - TZ=${TZ}
     ports:
       - 8191:8191
     restart: unless-stopped
@@ -89,7 +89,7 @@ services:
       - PUID=568
       - PGID=568
       - UMASK=002
-      - TZ=America/New_York
+      - TZ=${TZ}
       - WEBUI_PORTS=8080/tcp,8080/udp
       - VPN_ENABLED=true
       - VPN_CONF=wg0
@@ -109,8 +109,8 @@ services:
       - net.ipv4.conf.all.src_valid_mark=1
       - net.ipv6.conf.all.disable_ipv6=1
     volumes:
-      - ./configs/qbit/:/config
-      - ${MEDIA_PATH}:/media  # Use the MEDIA_PATH variable
+      - ${CONFIG_PATH}/qbit/:/config
+      - ${MEDIA_PATH}:/media  
 
 
   profilarr:
@@ -119,16 +119,16 @@ services:
     ports:
       - 6868:6868
     volumes:
-      - ./configs/profilarr:/config
+      - ${CONFIG_PATH}/profilarr:/config
     environment:
-      - TZ=America/New_York
+      - TZ=${TZ}
     restart: unless-stopped
 
   watchtower:
     image: nickfedor/watchtower
     container_name: watchtower
     environment:
-      - TZ=America/New_York
+      - TZ=${TZ}
       - WATCHTOWER_NOTIFICATIONS_HOSTNAME=truenas
       - WATCHTOWER_CLEANUP=true
       - WATCHTOWER_INCLUDE_STOPPED=true
@@ -145,3 +145,14 @@ services:
     restart: unless-stopped
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+      
+  huntarr:
+    image: huntarr/huntarr:latest
+    container_name: huntarr
+    restart: unless-stopped
+    ports:
+      - "9705:9705"
+    volumes:
+      - ${CONFIG_PATH}/huntarr:/config
+    environment:
+      - TZ=${TZ}
