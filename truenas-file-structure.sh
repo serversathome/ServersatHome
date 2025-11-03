@@ -331,33 +331,75 @@ if [[ "$LAUNCH_CONTAINERS" =~ ^[Yy]es$ ]]; then
 
         echo "qBittorrent configuration updated and container restarted."
 
+        # Extract API keys from Radarr and Sonarr config files
+        echo "Extracting API keys from Radarr and Sonarr..."
+        RADARR_CONFIG_FILE="/mnt/$CONFIG_POOL/configs/radarr/config.xml"
+        SONARR_CONFIG_FILE="/mnt/$CONFIG_POOL/configs/sonarr/config.xml"
+
+        # Function to extract API key from config file
+        extract_api_key() {
+            local config_file="$1"
+            if [ -f "$config_file" ]; then
+                grep -oP '(?<=<ApiKey>)[^<]+' "$config_file"
+            else
+                echo ""
+            fi
+        }
+
+        # Wait for config files to be generated
+        echo "Waiting for Radarr and Sonarr to generate config files..."
+        while [ ! -f "$RADARR_CONFIG_FILE" ] || [ ! -f "$SONARR_CONFIG_FILE" ]; do
+            sleep 5
+            echo "Waiting for config files..."
+        done
+
+        # Extract Radarr API key
+        RADARR_API_KEY=$(extract_api_key "$RADARR_CONFIG_FILE")
+        if [ -z "$RADARR_API_KEY" ]; then
+            echo "⚠️ Warning: Radarr API key not found in $RADARR_CONFIG_FILE"
+        else
+            echo "Radarr API key extracted successfully"
+        fi
+
+        # Extract Sonarr API key
+        SONARR_API_KEY=$(extract_api_key "$SONARR_CONFIG_FILE")
+        if [ -z "$SONARR_API_KEY" ]; then
+            echo "⚠️ Warning: Sonarr API key not found in $SONARR_CONFIG_FILE"
+        else
+            echo "Sonarr API key extracted successfully"
+        fi
+
         # Add root folders to Radarr and Sonarr using their APIs
-        echo "Adding root folders to Radarr and Sonarr..."
+        if [ -n "$RADARR_API_KEY" ] && [ -n "$SONARR_API_KEY" ]; then
+            echo "Adding root folders to Radarr and Sonarr..."
 
-        # Wait for Radarr and Sonarr to be fully initialized
-        echo "Waiting for Radarr and Sonarr to be ready..."
-        until curl -s "http://localhost:7878/api/v3/system/status" -o /dev/null; do sleep 5; done
-        until curl -s "http://localhost:8989/api/v3/system/status" -o /dev/null; do sleep 5; done
+            # Wait for Radarr and Sonarr to be fully initialized
+            echo "Waiting for Radarr and Sonarr to be ready..."
+            until curl -s "http://localhost:7878/api/v3/system/status" -o /dev/null; do sleep 5; done
+            until curl -s "http://localhost:8989/api/v3/system/status" -o /dev/null; do sleep 5; done
 
-        # Add root folder to Radarr
-        echo "Adding root folder to Radarr..."
-        curl -X POST "http://localhost:7878/api/v3/rootfolder" \
-          -H "X-Api-Key: $RADARR_API_KEY" \
-          -H "Content-Type: application/json" \
-          -d '{
-                "path": "/media/movies"
-              }'
+            # Add root folder to Radarr
+            echo "Adding root folder to Radarr..."
+            curl -X POST "http://localhost:7878/api/v3/rootfolder" \
+              -H "X-Api-Key: $RADARR_API_KEY" \
+              -H "Content-Type: application/json" \
+              -d '{
+                    "path": "/media/movies"
+                  }'
 
-        # Add root folder to Sonarr
-        echo "Adding root folder to Sonarr..."
-        curl -X POST "http://localhost:8989/api/v3/rootfolder" \
-          -H "X-Api-Key: $SONARR_API_KEY" \
-          -H "Content-Type: application/json" \
-          -d '{
-                "path": "/media/tv"
-              }'
+            # Add root folder to Sonarr
+            echo "Adding root folder to Sonarr..."
+            curl -X POST "http://localhost:8989/api/v3/rootfolder" \
+              -H "X-Api-Key: $SONARR_API_KEY" \
+              -H "Content-Type: application/json" \
+              -d '{
+                    "path": "/media/tv"
+                  }'
 
-        echo "Root folders added successfully!"
+            echo "Root folders added successfully!"
+        else
+            echo "⚠️ Skipping root folder creation due to missing API keys. You can add them manually later."
+        fi
     else
         echo "⚠️ Failed to launch Docker containers. Check the logs for errors."
     fi
@@ -387,19 +429,19 @@ if [[ "$LAUNCH_CONTAINERS" =~ ^[Yy]es$ ]]; then
         fi
     done
 
-# Extract and print the qBittorrent password from the logs
+    # Extract and print the qBittorrent password from the logs
     qbittorrent_container="qbittorrent"
     if docker ps --format "{{.Names}}" | grep -q "$qbittorrent_container"; then
         echo "Fetching qBittorrent password from logs..."
+        # Wait a few seconds for qBittorrent to fully start and log the password
         sleep 10
-        qbittorrent_password=$(docker logs "$qbittorrent_container" 2>&1 | grep -oP 'A temporary password is provided for this session: \K\S+' | tail -3)
+        qbittorrent_password=$(docker logs "$qbittorrent_container" 2>&1 | grep -oP 'A temporary password is provided for this session: \K\S+' | tail -1)
         if [ -n "$qbittorrent_password" ]; then
             echo "qBittorrent WebUI password: $qbittorrent_password"
         else
-            echo "qBittorrent WebUI password not found in logs."
+            echo "qBittorrent WebUI password not found in logs. The container may still be starting."
         fi
     else
         echo "qBittorrent container is not running."
     fi
 fi
-
