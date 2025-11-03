@@ -391,7 +391,7 @@ if [[ "$LAUNCH_CONTAINERS" =~ ^[Yy]es$ ]]; then
     qbittorrent_container="qbittorrent"
     if docker ps --format "{{.Names}}" | grep -q "$qbittorrent_container"; then
         echo "Fetching qBittorrent password from logs..."
-        qbittorrent_password=$(docker logs "$qbittorrent_container" 2>&1 | grep -oP 'A temporary password is provided for this session: \K\S+' | tail -1)
+        qbittorrent_password=$(docker logs "$qbittorrent_container" 2>&1 | grep -oP 'A temporary password is provided for this session: \K\S+' | tail -3)
         if [ -n "$qbittorrent_password" ]; then
             echo "qBittorrent WebUI password: $qbittorrent_password"
         else
