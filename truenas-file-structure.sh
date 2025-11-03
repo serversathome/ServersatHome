@@ -1,23 +1,24 @@
 #!/bin/bash
 
-# Prompt the user for the pool name
-read -p "Enter the pool name: " POOLNAME
+# Prompt the user for pool names
+read -p "Enter the pool name for configs: " CONFIG_POOL
+read -p "Enter the pool name for media (can be same as configs): " MEDIA_POOL
 
 # Retrieve the private IP address of the server and convert it to CIDR notation
 PRIVATE_IP=$(hostname -I | awk '{print $1}')
 CIDR_NETWORK="${PRIVATE_IP%.*}.0/24"
 
 # Define datasets and directories
-CONFIG_DATASETS=("prowlarr" "radarr" "sonarr" "jellyseerr" "recyclarr" "bazarr" "tdarr" "jellyfin" "qbittorrent" "dozzle")
-TDARR_SUBDIRS=("server" "logs" "transcode_cache")
+CONFIG_DATASETS=("prowlarr" "radarr" "sonarr" "jellyseerr" "profilarr" "bazarr" "jellyfin" "qbittorrent" "dozzle")
 MEDIA_SUBDIRECTORIES=("movies" "tv" "downloads")
-DOCKER_COMPOSE_PATH="/mnt/$POOLNAME/docker"
-QBITTORRENT_WIREGUARD_DIR="/mnt/$POOLNAME/configs/qbittorrent/wireguard"
+DOCKER_COMPOSE_PATH="/mnt/$CONFIG_POOL/docker"
+QBITTORRENT_WIREGUARD_DIR="/mnt/$CONFIG_POOL/configs/qbittorrent/wireguard"
 
 # Function to create and set up a dataset
 create_dataset() {
-    local dataset_name="$1"
-    local dataset_path="$POOLNAME/$dataset_name"
+    local pool_name="$1"
+    local dataset_name="$2"
+    local dataset_path="$pool_name/$dataset_name"
     local mountpoint="/mnt/$dataset_path"
 
     if ! zfs list "$dataset_path" >/dev/null 2>&1; then
@@ -49,35 +50,27 @@ create_directory() {
         chown root:apps "$dir_path"
         chmod 770 "$dir_path"
     else
-        echo "Directory already exists: $dir_path, skipping..."
+        echo "Directory already exists: $dir_path, updating permissions..."
+        chown root:apps "$dir_path"
+        chmod 770 "$dir_path"
     fi
 }
 
-# Create the "configs" dataset (parent)
-create_dataset "configs"
+# Create the "configs" dataset (parent) on the config pool
+create_dataset "$CONFIG_POOL" "configs"
 
-# Create the config datasets
+# Create the config datasets on the config pool
 for dataset in "${CONFIG_DATASETS[@]}"; do
-    create_dataset "configs/$dataset"
+    create_dataset "$CONFIG_POOL" "configs/$dataset"
 done
 
-# Create the "media" dataset (instead of a directory)
-create_dataset "media"
+# Create the "media" dataset on the media pool
+create_dataset "$MEDIA_POOL" "media"
 
 # Create subdirectories inside the media dataset
 for subdir in "${MEDIA_SUBDIRECTORIES[@]}"; do
-    create_directory "/mnt/$POOLNAME/media/$subdir"
+    create_directory "/mnt/$MEDIA_POOL/media/$subdir"
 done
-
-# Ensure Tdarr subdirectories exist (only if tdarr dataset is properly mounted)
-TDARR_MOUNTPOINT="/mnt/$POOLNAME/configs/tdarr"
-if mountpoint -q "$TDARR_MOUNTPOINT"; then
-    for subdir in "${TDARR_SUBDIRS[@]}"; do
-        create_directory "$TDARR_MOUNTPOINT/$subdir"
-    done
-else
-    echo "⚠️ Skipping tdarr subdirectory creation; dataset is not mounted."
-fi
 
 # Ensure Docker Compose directory exists
 create_directory "$DOCKER_COMPOSE_PATH"
@@ -87,6 +80,8 @@ DOCKER_COMPOSE_FILE="$DOCKER_COMPOSE_PATH/docker-compose.yml"
 if [ ! -d "$DOCKER_COMPOSE_PATH" ]; then
     echo "⚠️ Docker Compose directory missing, creating: $DOCKER_COMPOSE_PATH"
     mkdir -p "$DOCKER_COMPOSE_PATH"
+    chown root:apps "$DOCKER_COMPOSE_PATH"
+    chmod 770 "$DOCKER_COMPOSE_PATH"
 fi
 
 # Generate docker-compose.yml
@@ -105,8 +100,8 @@ services:
     networks:
       - media_network
     volumes:
-      - /mnt/$POOLNAME/configs/prowlarr:/config
-      - /mnt/$POOLNAME/media:/media
+      - /mnt/$CONFIG_POOL/configs/prowlarr:/config
+      - /mnt/$MEDIA_POOL/media:/media
 
   radarr:
     image: linuxserver/radarr
@@ -121,8 +116,8 @@ services:
     networks:
       - media_network
     volumes:
-      - /mnt/$POOLNAME/configs/radarr:/config
-      - /mnt/$POOLNAME/media:/media
+      - /mnt/$CONFIG_POOL/configs/radarr:/config
+      - /mnt/$MEDIA_POOL/media:/media
 
   sonarr:
     image: linuxserver/sonarr
@@ -137,8 +132,8 @@ services:
     networks:
       - media_network
     volumes:
-      - /mnt/$POOLNAME/configs/sonarr:/config
-      - /mnt/$POOLNAME/media:/media
+      - /mnt/$CONFIG_POOL/configs/sonarr:/config
+      - /mnt/$MEDIA_POOL/media:/media
 
   jellyseerr:
     image: fallenbagel/jellyseerr
@@ -152,7 +147,7 @@ services:
       - media_network
     user: "568:568"
     volumes:
-      - /mnt/$POOLNAME/configs/jellyseerr:/app/config
+      - /mnt/$CONFIG_POOL/configs/jellyseerr:/app/config
       
   flaresolverr:
     image: ghcr.io/flaresolverr/flaresolverr:latest
@@ -168,17 +163,18 @@ services:
       - 8191:8191
     restart: unless-stopped
 
-  recyclarr:
-    image: ghcr.io/recyclarr/recyclarr
-    user: 568:568
-    container_name: recyclarr
-    restart: unless-stopped
-    environment:
-      CRON_SCHEDULE: 0 0 * * *
+  profilarr:
+    image: santiagosayshey/profilarr:latest
+    container_name: profilarr
+    ports:
+      - 6868:6868
     networks:
       - media_network
     volumes:
-      - /mnt/$POOLNAME/configs/recyclarr:/config
+      - /mnt/$CONFIG_POOL/configs/profilarr:/config
+    environment:
+      - TZ=America/New_York
+    restart: unless-stopped
 
   bazarr:
     image: linuxserver/bazarr
@@ -193,8 +189,8 @@ services:
     networks:
       - media_network
     volumes:
-      - /mnt/$POOLNAME/configs/bazarr:/config
-      - /mnt/$POOLNAME/media:/media
+      - /mnt/$CONFIG_POOL/configs/bazarr:/config
+      - /mnt/$MEDIA_POOL/media:/media
 
   jellyfin:
     container_name: jellyfin
@@ -209,8 +205,8 @@ services:
     networks:
       - media_network
     volumes:
-      - /mnt/$POOLNAME/configs/jellyfin:/config
-      - /mnt/$POOLNAME/media:/media
+      - /mnt/$CONFIG_POOL/configs/jellyfin:/config
+      - /mnt/$MEDIA_POOL/media:/media
 
   qbittorrent:
     container_name: qbittorrent
@@ -242,8 +238,8 @@ services:
       - net.ipv4.conf.all.src_valid_mark=1
       - net.ipv6.conf.all.disable_ipv6=1
     volumes:
-      - /mnt/$POOLNAME/configs/qbittorrent:/config
-      - /mnt/$POOLNAME/media:/media
+      - /mnt/$CONFIG_POOL/configs/qbittorrent:/config
+      - /mnt/$MEDIA_POOL/media:/media
 
   dozzle:
     image: amir20/dozzle
@@ -255,7 +251,7 @@ services:
       - media_network
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - /mnt/$POOLNAME/configs/dozzle:/data
+      - /mnt/$CONFIG_POOL/configs/dozzle:/data
 
   watchtower:
     container_name: watchtower
@@ -291,6 +287,8 @@ if [[ "$LAUNCH_CONTAINERS" =~ ^[Yy]es$ ]]; then
 
     # Save the VPN configuration as wg0.conf
     echo "$WG_CONFIG" > "$QBITTORRENT_WIREGUARD_DIR/wg0.conf"
+    chown root:apps "$QBITTORRENT_WIREGUARD_DIR/wg0.conf"
+    chmod 660 "$QBITTORRENT_WIREGUARD_DIR/wg0.conf"
     echo "WireGuard configuration saved to $QBITTORRENT_WIREGUARD_DIR/wg0.conf"
 
     # Change to the Docker Compose directory and launch the containers
@@ -302,7 +300,7 @@ if [[ "$LAUNCH_CONTAINERS" =~ ^[Yy]es$ ]]; then
         echo "Docker containers launched successfully!"
 
         # Modify qBittorrent.conf after the container is running
-        QBITTORRENT_CONF_FILE="/mnt/$POOLNAME/configs/qbittorrent/config/qBittorrent.conf"
+        QBITTORRENT_CONF_FILE="/mnt/$CONFIG_POOL/configs/qbittorrent/config/qBittorrent.conf"
         echo "Waiting for qBittorrent to generate its configuration file..."
         while [ ! -f "$QBITTORRENT_CONF_FILE" ]; do
             sleep 5
@@ -332,204 +330,6 @@ if [[ "$LAUNCH_CONTAINERS" =~ ^[Yy]es$ ]]; then
         docker restart qbittorrent
 
         echo "qBittorrent configuration updated and container restarted."
-
-        # Ask the user if they want to configure recyclarr
-        read -p "Would you like to sync recyclarr to radarr and sonarr? (yes/no): " CONFIGURE_RECYCLARR
-
-        if [[ "$CONFIGURE_RECYCLARR" =~ ^[Yy]es$ ]]; then
-            echo "Configuring recyclarr..."
-
-            # Paths to Radarr and Sonarr config files
-            RADARR_CONFIG_FILE="/mnt/$POOLNAME/configs/radarr/config.xml"
-            SONARR_CONFIG_FILE="/mnt/$POOLNAME/configs/sonarr/config.xml"
-
-            # Function to extract API key from config file
-            extract_api_key() {
-                local config_file="$1"
-                if [ -f "$config_file" ]; then
-                    grep -oP '(?<=<ApiKey>)[^<]+' "$config_file"
-                else
-                    echo ""
-                fi
-            }
-
-            # Extract Radarr API key
-            RADARR_API_KEY=$(extract_api_key "$RADARR_CONFIG_FILE")
-            if [ -z "$RADARR_API_KEY" ]; then
-                echo "⚠️ Error: Radarr API key not found in $RADARR_CONFIG_FILE"
-                exit 1
-            fi
-
-            # Extract Sonarr API key
-            SONARR_API_KEY=$(extract_api_key "$SONARR_CONFIG_FILE")
-            if [ -z "$SONARR_API_KEY" ]; then
-                echo "⚠️ Error: Sonarr API key not found in $SONARR_CONFIG_FILE"
-                exit 1
-            fi
-
-            echo "Radarr API key: $RADARR_API_KEY"
-            echo "Sonarr API key: $SONARR_API_KEY"
-
-            # Step 1: Run `recyclarr config create` inside the recyclarr container
-            echo "Creating recyclarr configuration..."
-            docker exec -it recyclarr recyclarr config create
-
-            # Step 2: Overwrite the recyclarr.yml file with the provided template
-            RECYCLARR_YML="/mnt/$POOLNAME/configs/recyclarr/recyclarr.yml"
-            echo "Updating $RECYCLARR_YML with API keys..."
-
-            cat > "$RECYCLARR_YML" <<EOF
-sonarr:
-  web-1080p-v4:
-    base_url: http://sonarr:8989
-    api_key: $SONARR_API_KEY
-    delete_old_custom_formats: true
-    replace_existing_custom_formats: true
-    include:
-      # Comment out any of the following includes to disable them
-      - template: sonarr-quality-definition-series
-      - template: sonarr-v4-quality-profile-web-1080p
-      - template: sonarr-v4-custom-formats-web-1080p
-      - template: sonarr-v4-quality-profile-web-2160p
-      - template: sonarr-v4-custom-formats-web-2160p
-
-# Custom Formats: https://recyclarr.dev/wiki/yaml/config-reference/custom-formats/
-    custom_formats:
-      # HDR Formats
-      - trash_ids:
-          # Comment out the next line if you and all of your users' setups are fully DV compatible
-          - 9b27ab6498ec0f31a3353992e19434ca # DV (WEBDL)
-          # HDR10Plus Boost - Uncomment the next line if any of your devices DO support HDR10+
-          # - 0dad0a507451acddd754fe6dc3a7f5e7 # HDR10Plus Boost
-        assign_scores_to:
-          - name: WEB-2160p
-
-
-      # Optional
-      - trash_ids:
-           - 32b367365729d530ca1c124a0b180c64 # Bad Dual Groups
-           - 82d40da2bc6923f41e14394075dd4b03 # No-RlsGroup
-           - e1a997ddb54e3ecbfe06341ad323c458 # Obfuscated
-           - 06d66ab109d4d2eddb2794d21526d140 # Retags
-           - 1b3994c551cbb92a2c781af061f4ab44 # Scene
-        assign_scores_to:
-          - name: WEB-2160p
-
-      - trash_ids:
-          # Uncomment the next six lines to allow x265 HD releases with HDR/DV
-          # - 47435ece6b99a0b477caf360e79ba0bb # x265 (HD)
-        # assign_scores_to:
-          # - name: WEB-2160p
-            # score: 0
-      # - trash_ids:
-          # - 9b64dff695c2115facf1b6ea59c9bd07 # x265 (no HDR/DV)
-        assign_scores_to:
-          - name: WEB-2160p
-
-      - trash_ids:
-          - 2016d1676f5ee13a5b7257ff86ac9a93 # SDR
-        assign_scores_to:
-          - name: WEB-2160p
-            # score: 0 # Uncomment this line to enable SDR releases
-
-      # Optional
-      - trash_ids:
-           - 32b367365729d530ca1c124a0b180c64 # Bad Dual Groups
-           - 82d40da2bc6923f41e14394075dd4b03 # No-RlsGroup
-           - e1a997ddb54e3ecbfe06341ad323c458 # Obfuscated
-           - 06d66ab109d4d2eddb2794d21526d140 # Retags
-           - 1b3994c551cbb92a2c781af061f4ab44 # Scene
-        assign_scores_to:
-          - name: WEB-1080p
-
-      - trash_ids:
-          # Uncomment the next six lines to allow x265 HD releases with HDR/DV
-          # - 47435ece6b99a0b477caf360e79ba0bb # x265 (HD)
-        # assign_scores_to:
-          # - name: WEB-1080p
-            # score: 0
-      # - trash_ids:
-          # - 9b64dff695c2115facf1b6ea59c9bd07 # x265 (no HDR/DV)
-        assign_scores_to:
-          - name: WEB-1080p
-
-# Configuration specific to Radarr.
-radarr:
- uhd-bluray-web:
-    base_url: http://radarr:7878
-    api_key: $RADARR_API_KEY
-    delete_old_custom_formats: true
-    replace_existing_custom_formats: true
-    include:
-     # Comment out any of the following includes to disable them
-     - template: radarr-quality-definition-movie
-     - template: radarr-quality-profile-uhd-bluray-web
-     - template: radarr-custom-formats-uhd-bluray-web
-     - template: radarr-quality-definition-movie
-     - template: radarr-quality-profile-hd-bluray-web
-     - template: radarr-custom-formats-hd-bluray-web
-
-# Custom Formats: https://recyclarr.dev/wiki/yaml/config-reference/custom-formats/
-    custom_formats:
-     # Audio
-     - trash_ids:
-         # Uncomment the next section to enable Advanced Audio Formats
-         # - 496f355514737f7d83bf7aa4d24f8169 # TrueHD Atmos
-         # - 2f22d89048b01681dde8afe203bf2e95 # DTS X
-         # - 417804f7f2c4308c1f4c5d380d4c4475 # ATMOS (undefined)
-         # - 1af239278386be2919e1bcee0bde047e # DD+ ATMOS
-         # - 3cafb66171b47f226146a0770576870f # TrueHD
-         # - dcf3ec6938fa32445f590a4da84256cd # DTS-HD MA
-         # - a570d4a0e56a2874b64e5bfa55202a1b # FLAC
-         # - e7c2fcae07cbada050a0af3357491d7b # PCM
-         # - 8e109e50e0a0b83a5098b056e13bf6db # DTS-HD HRA
-         # - 185f1dd7264c4562b9022d963ac37424 # DD+
-         # - f9f847ac70a0af62ea4a08280b859636 # DTS-ES
-         # - 1c1a4c5e823891c75bc50380a6866f73 # DTS
-         # - 240770601cc226190c367ef59aba7463 # AAC
-         # - c2998bd0d90ed5621d8df281e839436e # DD
-       assign_scores_to:
-         - name: UHD Bluray + WEB
-
-     # Movie Versions
-     - trash_ids:
-         - 9f6cbff8cfe4ebbc1bde14c7b7bec0de # IMAX Enhanced
-       assign_scores_to:
-         - name: UHD Bluray + WEB
-           # score: 0 # Uncomment this line to disable prioritised IMAX Enhanced releases
-
-     # Optional
-     - trash_ids:
-         # Comment out the next line if you and all of your users' setups are fully DV compatible
-         - 923b6abef9b17f937fab56cfcf89e1f1 # DV (WEBDL)
-         # HDR10Plus Boost - Uncomment the next line if any of your devices DO support HDR10+
-         # - b17886cb4158d9fea189859409975758 # HDR10Plus Boost
-       assign_scores_to:
-         - name: UHD Bluray + WEB
-
-     - trash_ids:
-         - 9c38ebb7384dada637be8899efa68e6f # SDR
-       assign_scores_to:
-         - name: UHD Bluray + WEB
-           # score: 0 # Uncomment this line to allow SDR releases
-
-     - trash_ids:
-         - 9f6cbff8cfe4ebbc1bde14c7b7bec0de # IMAX Enhanced
-       assign_scores_to:
-         - name: HD Bluray + WEB
-           # score: 0 # Uncomment this line to disable prioritised IMAX Enhanced releases
-EOF
-
-            echo "recyclarr.yml file updated successfully!"
-
-            # Step 3: Run `recyclarr sync` inside the recyclarr container
-            echo "Running recyclarr sync..."
-            docker exec -it recyclarr recyclarr sync
-
-            echo "recyclarr configuration and sync completed!"
-        else
-            echo "Skipping recyclarr configuration."
-        fi
 
         # Add root folders to Radarr and Sonarr using their APIs
         echo "Adding root folders to Radarr and Sonarr..."
