@@ -263,7 +263,7 @@ services:
       - WATCHTOWER_DISABLE_CONTAINERS=ix*
       - WATCHTOWER_NO_STARTUP_MESSAGE=true
       - WATCHTOWER_SCHEDULE=0 0 3 * * *
-    image: containrrr/watchtower
+    image: nickfedor/watchtower
     restart: unless-stopped
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
