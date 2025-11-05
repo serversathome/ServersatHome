@@ -31,6 +31,15 @@ SUBSYSTEMS=$(echo "$DISCOVERY" | awk '
     /traddr:/ {traddr=$2; gsub(/^ */, "", traddr); if(subnqn!="" && traddr!="") print subsystem "|" subnqn "|" traddr}
 ')
 
+i=1
+declare -A SUBS
+while IFS="|" read -r idx nqn traddr; do
+    SUBS[$i]="$nqn|$traddr"
+    echo "[$i] NQN: $nqn  IP: $traddr"
+    ((i++))
+done <<< "$SUBSYSTEMS"
+
+
 # Display menu
 echo "Discovered NVMe-oF subsystems:"
 i=1
