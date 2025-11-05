@@ -14,12 +14,8 @@ if [[ -z "$TRUENAS_IP" ]]; then
     exit 1
 fi
 
-# Install nvme-cli if missing
-if ! command -v nvme &> /dev/null; then
-    echo "nvme-cli not found, installing..."
-    apt-get update || echo "Warning: apt update failed, continuing anyway"
-    apt-get install -y nvme-cli
-fi
+apt-get install -y nvme-cli
+
 
 # Discover NVMe-oF targets
 echo "Discovering NVMe-oF targets on $TRUENAS_IP..."
