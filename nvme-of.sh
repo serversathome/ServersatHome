@@ -2,7 +2,7 @@
 
 # ==========================================
 # Proxmox NVMe-oF Auto Setup for TrueNAS
-# Enhanced: Multiple Target Selection
+# User-Friendly Version with Multiple Target Selection
 # ==========================================
 
 set -euo pipefail
@@ -14,8 +14,7 @@ if [[ -z "$TRUENAS_IP" ]]; then
     exit 1
 fi
 
-apt-get install -y nvme-cli
-
+apt install -y nvme-cli
 
 # Discover NVMe-oF targets
 echo "Discovering NVMe-oF targets on $TRUENAS_IP..."
@@ -25,22 +24,34 @@ if [[ -z "$DISCOVERY" ]]; then
     exit 1
 fi
 
-# Show targets for user selection
-echo "Discovered NVMe-oF targets:"
-echo "$DISCOVERY" | awk 'NR>1 {printf "[%d] NQN: %s  IP: %s  Transport: %s\n", NR-1, $1, $2, $3}'
+# Parse NVMe subsystems into a clean list (subtype=nvme)
+SUBSYSTEMS=$(echo "$DISCOVERY" | awk '
+    /subtype: *nvme/ {subsystem=n++; subnqn=""; traddr="";}
+    /subnqn:/ {subnqn=$2; gsub(/^ */, "", subnqn)}
+    /traddr:/ {traddr=$2; gsub(/^ */, "", traddr); if(subnqn!="" && traddr!="") print subsystem "|" subnqn "|" traddr}
+')
+
+# Display menu
+echo "Discovered NVMe-oF subsystems:"
+i=1
+declare -A SUBS
+while IFS="|" read -r idx nqn traddr; do
+    SUBS[$i]="$nqn|$traddr"
+    echo "[$i] NQN: $nqn  IP: $traddr"
+    ((i++))
+done <<< "$SUBSYSTEMS"
 
 # Prompt user to select target
-read -rp "Select the target to use (enter the number): " TARGET_INDEX
-if ! [[ "$TARGET_INDEX" =~ ^[0-9]+$ ]]; then
+read -rp "Select the target to use (enter number): " TARGET_INDEX
+if ! [[ "$TARGET_INDEX" =~ ^[0-9]+$ ]] || [[ -z "${SUBS[$TARGET_INDEX]:-}" ]]; then
     echo "Invalid selection."
     exit 1
 fi
 
-# Extract selected target info
-SELECTED_LINE=$(echo "$DISCOVERY" | awk "NR==$((TARGET_INDEX+1))")
-NQN=$(echo "$SELECTED_LINE" | awk '{print $1}')
-TRADDR=$(echo "$SELECTED_LINE" | awk '{print $2}')
-TRANSPORT=$(echo "$SELECTED_LINE" | awk '{print $3}')
+SELECTED=${SUBS[$TARGET_INDEX]}
+NQN=$(echo "$SELECTED" | cut -d'|' -f1)
+TRADDR=$(echo "$SELECTED" | cut -d'|' -f2)
+TRANSPORT="tcp"
 
 echo "Selected NQN: $NQN"
 echo "Target IP: $TRADDR"
