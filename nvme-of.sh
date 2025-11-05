@@ -19,40 +19,19 @@ apt install -y nvme-cli
 # Discover NVMe-oF targets
 echo "Discovering NVMe-oF targets on $TRUENAS_IP..."
 DISCOVERY=$(nvme discover -t tcp -a "$TRUENAS_IP" -s 4420)
-if [[ -z "$DISCOVERY" ]]; then
-    echo "No NVMe-oF targets found. Check IP/network."
-    exit 1
-fi
 
-# Parse NVMe subsystems into a clean list (subtype=nvme)
-DISCOVERY=$(nvme discover -t tcp -a "$TRUENAS_IP" -s 4420)
-
+# Parse only real NVMe subsystems
 SUBSYSTEMS=$(echo "$DISCOVERY" | awk '
 /subtype: *nvme/ {subnqn=""; traddr=""; next}
 /subnqn:/ {subnqn=$2}
 /traddr:/ {traddr=$2; if(subnqn!="" && traddr!="") print subnqn "|" traddr}
 ')
 
-i=1
-declare -A SUBS
-while IFS="|" read -r nqn traddr; do
-    SUBS[$i]="$nqn|$traddr"
-    echo "[$i] NQN: $nqn  IP: $traddr"
-    ((i++))
-done <<< "$SUBSYSTEMS"
-
-read -rp "Select the target to use (enter number): " TARGET_INDEX
-SELECTED=${SUBS[$TARGET_INDEX]}
-NQN=$(echo "$SELECTED" | cut -d'|' -f1)
-TRADDR=$(echo "$SELECTED" | cut -d'|' -f2)
-
-
-
-# Display menu
+# Display clean menu
 echo "Discovered NVMe-oF subsystems:"
 i=1
 declare -A SUBS
-while IFS="|" read -r idx nqn traddr; do
+while IFS="|" read -r nqn traddr; do
     SUBS[$i]="$nqn|$traddr"
     echo "[$i] NQN: $nqn  IP: $traddr"
     ((i++))
@@ -73,6 +52,8 @@ TRANSPORT="tcp"
 echo "Selected NQN: $NQN"
 echo "Target IP: $TRADDR"
 echo "Transport: $TRANSPORT"
+
+
 
 # Connect to NVMe-oF target
 echo "Connecting to NVMe-oF target..."
