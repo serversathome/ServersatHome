@@ -2,7 +2,7 @@
 
 # ==========================================
 # Proxmox NVMe-oF Auto Setup for TrueNAS
-# User-Friendly Version with Multiple Target Selection
+# Fully Automated and User-Friendly
 # ==========================================
 
 set -euo pipefail
@@ -14,21 +14,27 @@ if [[ -z "$TRUENAS_IP" ]]; then
     exit 1
 fi
 
+
 apt install -y nvme-cli
+
 
 # Discover NVMe-oF targets
 echo "Discovering NVMe-oF targets on $TRUENAS_IP..."
 DISCOVERY=$(nvme discover -t tcp -a "$TRUENAS_IP" -s 4420)
 
-# Parse only real NVMe subsystems
+# Filter for real NVMe subsystems only (ignore discovery controller)
 SUBSYSTEMS=$(echo "$DISCOVERY" | awk '
 /subtype: *nvme/ {subnqn=""; traddr=""; next}
 /subnqn:/ {subnqn=$2}
-/traddr:/ {traddr=$2; if(subnqn!="" && traddr!="") print subnqn "|" traddr}
+/traddr:/ {traddr=$2; if(subnqn !~ /discovery/ && subnqn!="" && traddr!="") print subnqn "|" traddr}
 ')
 
-# Display clean menu
-echo "Discovered NVMe-oF subsystems:"
+if [[ -z "$SUBSYSTEMS" ]]; then
+    echo "No NVMe-oF subsystems found. Check IP/network."
+    exit 1
+fi
+
+# Display menu
 i=1
 declare -A SUBS
 while IFS="|" read -r nqn traddr; do
@@ -53,13 +59,11 @@ echo "Selected NQN: $NQN"
 echo "Target IP: $TRADDR"
 echo "Transport: $TRANSPORT"
 
-
-
 # Connect to NVMe-oF target
 echo "Connecting to NVMe-oF target..."
 nvme connect -t "$TRANSPORT" -a "$TRADDR" -s 4420 -n "$NQN"
 
-# Identify NVMe device
+# Detect NVMe device
 DEVICE=$(nvme list | grep "$NQN" | awk '{print $1}')
 if [[ -z "$DEVICE" ]]; then
     echo "Failed to detect NVMe device after connect."
