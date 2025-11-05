@@ -34,11 +34,8 @@ while true; do
     fi
 done
 
-# Install nvme-cli
-if ! command -v nvme &> /dev/null; then
-    echo_info "Installing nvme-cli..."
-    apt update && apt install -y nvme-cli
-fi
+apt install -y nvme-cli
+
 
 # Discover targets
 echo_info "Discovering NVMe-oF targets on $TRUENAS_IP..."
@@ -177,6 +174,10 @@ echo ""
 zpool status "$POOL_NAME"
 echo ""
 
+# Disable ZFS cache import for this pool since it won't be available at boot
+echo_info "Configuring ZFS to not use cache for this pool..."
+zpool set cachefile=none "$POOL_NAME"
+
 # Create systemd services
 echo_info "Creating systemd services..."
 
@@ -186,6 +187,7 @@ cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<EOF
 Description=Connect NVMe-oF for ${POOL_NAME}
 After=network-online.target
 Wants=network-online.target
+DefaultDependencies=no
 Before=zfs-import.target
 
 [Service]
@@ -198,32 +200,38 @@ StandardOutput=journal
 StandardError=journal
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=sysinit.target
 EOF
 
 ZPOOL_SERVICE="zpool-import-${POOL_NAME}"
 cat > "/etc/systemd/system/${ZPOOL_SERVICE}.service" <<EOF
 [Unit]
 Description=Import ZFS pool ${POOL_NAME}
-After=${SERVICE_NAME}.service zfs-import.target
+After=${SERVICE_NAME}.service
 Requires=${SERVICE_NAME}.service
-Before=zfs-mount.service
+DefaultDependencies=no
+Before=zfs-mount.service zfs.target
 
 [Service]
 Type=oneshot
 ExecStartPre=/bin/sleep 5
-ExecStart=/sbin/zpool import -f ${POOL_NAME}
+ExecStart=/sbin/zpool import -f -N ${POOL_NAME}
+ExecStartPost=/sbin/zfs mount -a
 RemainAfterExit=yes
 StandardOutput=journal
 StandardError=journal
 
 [Install]
-WantedBy=zfs-mount.service
+WantedBy=zfs.target
 EOF
 
 systemctl daemon-reload
 systemctl enable "${SERVICE_NAME}.service"
 systemctl enable "${ZPOOL_SERVICE}.service"
+
+# Also mask the zfs-import-cache service to prevent conflicts
+echo_info "Disabling zfs-import-cache.service to prevent conflicts..."
+systemctl mask zfs-import-cache.service
 
 echo ""
 echo_success "Setup Complete!"
@@ -232,4 +240,10 @@ echo_info "Pool: $POOL_NAME at /$POOL_NAME"
 echo_info "Device: $DEVICE"
 echo_info "Services: ${SERVICE_NAME}.service, ${ZPOOL_SERVICE}.service"
 echo ""
-echo_info "Reboot to test persistence!"
+echo_success "Configuration:"
+echo "  ✓ NVMe-oF connection will start early in boot (sysinit.target)"
+echo "  ✓ Pool import will happen after NVMe connection"
+echo "  ✓ ZFS cache import disabled (pool not in cache file)"
+echo ""
+echo_info "Test with: systemctl status ${SERVICE_NAME}.service"
+echo_info "Reboot to test full persistence!"
