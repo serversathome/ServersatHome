@@ -4,57 +4,52 @@
 # Fully Automated and User-Friendly
 # ==========================================
 
-# Color output for better UX
+# Color output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
 echo_error() { echo -e "${RED}Error: $1${NC}" >&2; }
 echo_success() { echo -e "${GREEN}✅ $1${NC}"; }
 echo_info() { echo -e "${YELLOW}ℹ️  $1${NC}"; }
 
-# Check if running as root
+# Root check
 if [[ $EUID -ne 0 ]]; then
    echo_error "This script must be run as root"
    exit 1
 fi
 
-# Prompt for TrueNAS IP with validation
+# Get TrueNAS IP
 while true; do
     read -rp "Enter the IP of your TrueNAS NVMe-oF server: " TRUENAS_IP
     if [[ -z "$TRUENAS_IP" ]]; then
         echo_error "No IP entered."
         continue
     fi
-    # Basic IP validation
     if [[ $TRUENAS_IP =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
         break
     else
-        echo_error "Invalid IP format. Please try again."
+        echo_error "Invalid IP format."
     fi
 done
 
-# Install nvme-cli if not present
+# Install nvme-cli
 if ! command -v nvme &> /dev/null; then
     echo_info "Installing nvme-cli..."
     apt update && apt install -y nvme-cli
-else
-    echo_info "nvme-cli already installed"
 fi
 
-# Discover NVMe-oF targets
+# Discover targets
 echo_info "Discovering NVMe-oF targets on $TRUENAS_IP..."
 DISCOVERY=$(nvme discover -t tcp -a "$TRUENAS_IP" -s 4420 2>&1)
-DISC_STATUS=$?
-
-if [[ $DISC_STATUS -ne 0 ]]; then
-    echo_error "Failed to discover targets. Check network connectivity and TrueNAS configuration."
+if [[ $? -ne 0 ]]; then
+    echo_error "Failed to discover targets."
     echo "$DISCOVERY"
     exit 1
 fi
 
-# Filter for real NVMe subsystems only (ignore discovery controller)
+# Parse subsystems
 SUBSYSTEMS=$(echo "$DISCOVERY" | awk '
 /subtype: *nvme/ {subnqn=""; traddr=""; next}
 /subnqn:/ {subnqn=$2}
@@ -62,7 +57,7 @@ SUBSYSTEMS=$(echo "$DISCOVERY" | awk '
 ')
 
 if [[ -z "$SUBSYSTEMS" ]]; then
-    echo_error "No NVMe-oF subsystems found. Check IP/network."
+    echo_error "No NVMe-oF subsystems found."
     exit 1
 fi
 
@@ -80,14 +75,13 @@ while IFS="|" read -r nqn traddr; do
     ((i++))
 done <<< "$SUBSYSTEMS"
 
-# Prompt user to select target
+# Select target
 while true; do
-    read -rp "Select the target to use (enter number): " TARGET_INDEX
+    read -rp "Select target (enter number): " TARGET_INDEX
     if [[ "$TARGET_INDEX" =~ ^[0-9]+$ ]] && [[ -n "${SUBS[$TARGET_INDEX]:-}" ]]; then
         break
-    else
-        echo_error "Invalid selection. Please enter a number from 1 to $((i-1))."
     fi
+    echo_error "Invalid selection."
 done
 
 SELECTED=${SUBS[$TARGET_INDEX]}
@@ -96,180 +90,100 @@ TRADDR=$(echo "$SELECTED" | cut -d'|' -f2)
 TRANSPORT="tcp"
 
 echo ""
-echo_info "Selected configuration:"
-echo "  NQN: $NQN"
-echo "  Target IP: $TRADDR"
-echo "  Transport: $TRANSPORT"
+echo_info "Selected: $NQN"
 echo ""
 
-# Get list of devices before connection
-DEVICES_BEFORE=$(ls /dev/nvme* 2>/dev/null | grep -E 'nvme[0-9]+n[0-9]+$' || echo "")
+# Snapshot existing devices
+DEVICES_BEFORE=$(lsblk -ndo NAME | grep -E '^nvme[0-9]+n[0-9]+$' || true)
 
-# Check if already connected
-if nvme list 2>/dev/null | grep -q "$NQN"; then
-    echo_info "Already connected to this target."
-elif nvme list-subsys 2>/dev/null | grep -q "$NQN"; then
-    echo_info "Already connected to this target (found in subsystems)."
-else
-    # Connect to NVMe-oF target
-    echo_info "Connecting to NVMe-oF target..."
-    nvme connect -t "$TRANSPORT" -a "$TRADDR" -s 4420 -n "$NQN" 2>&1
-    CONNECT_STATUS=$?
-    
-    if [[ $CONNECT_STATUS -ne 0 ]]; then
-        echo_error "Connection failed with status: $CONNECT_STATUS"
-        exit 1
-    fi
-    
-    echo_info "Waiting for device to be recognized..."
-    sleep 5
+# Connect
+echo_info "Connecting to NVMe-oF target..."
+nvme connect -t "$TRANSPORT" -a "$TRADDR" -s 4420 -n "$NQN" 2>&1
+sleep 5
+
+# Find new device
+DEVICES_AFTER=$(lsblk -ndo NAME | grep -E '^nvme[0-9]+n[0-9]+$' || true)
+DEVICE=$(comm -13 <(echo "$DEVICES_BEFORE" | sort) <(echo "$DEVICES_AFTER" | sort) | head -n1)
+
+# If no new device found, just take the first nvme device (likely already connected)
+if [[ -z "$DEVICE" ]]; then
+    DEVICE=$(lsblk -ndo NAME | grep -E '^nvme[0-9]+n[0-9]+$' | head -n1)
 fi
 
-# Detect NEW NVMe device by comparing before/after
-MAX_RETRIES=15
-RETRY_COUNT=0
-DEVICE=""
-
-echo_info "Detecting NVMe device..."
-while [[ $RETRY_COUNT -lt $MAX_RETRIES ]]; do
-    # Get current devices
-    DEVICES_AFTER=$(ls /dev/nvme* 2>/dev/null | grep -E 'nvme[0-9]+n[0-9]+$' || echo "")
-    
-    # Find new device (the one that wasn't there before, or if DEVICES_BEFORE is empty, just get any nvme device)
-    if [[ -z "$DEVICES_BEFORE" ]]; then
-        # No devices before, so take the first one we find
-        DEVICE=$(echo "$DEVICES_AFTER" | head -n1)
-    else
-        # Find the new device
-        DEVICE=$(comm -13 <(echo "$DEVICES_BEFORE" | sort) <(echo "$DEVICES_AFTER" | sort) | head -n1)
-    fi
-    
-    # If we still don't have a device, try to match by checking nvme list-subsys
-    if [[ -z "$DEVICE" ]]; then
-        # Try to find device by matching NQN in subsystem info
-        SUBSYS_INFO=$(nvme list-subsys 2>/dev/null || echo "")
-        if echo "$SUBSYS_INFO" | grep -q "$NQN"; then
-            # Extract the nvme device number from the subsystem that matches our NQN
-            NVME_NUM=$(echo "$SUBSYS_INFO" | grep -B 20 "$NQN" | grep "nvme[0-9]" | head -n1 | grep -o "nvme[0-9]\+" | head -n1)
-            if [[ -n "$NVME_NUM" ]]; then
-                # Find the namespace device
-                DEVICE=$(ls /dev/${NVME_NUM}n* 2>/dev/null | head -n1)
-            fi
-        fi
-    fi
-    
-    if [[ -n "$DEVICE" ]]; then
-        echo_success "Found device: $DEVICE"
-        break
-    fi
-    
-    RETRY_COUNT=$((RETRY_COUNT + 1))
-    if [[ $RETRY_COUNT -lt $MAX_RETRIES ]]; then
-        echo_info "Waiting for device to appear (attempt $RETRY_COUNT/$MAX_RETRIES)..."
-        sleep 2
-    fi
-done
-
 if [[ -z "$DEVICE" ]]; then
-    echo_error "Failed to detect NVMe device after $MAX_RETRIES attempts."
-    echo ""
-    echo "Debug information:"
-    echo "==================="
-    echo "All NVMe devices:"
-    nvme list 2>&1
-    echo ""
-    echo "All NVMe subsystems:"
-    nvme list-subsys 2>&1
-    echo ""
-    echo "Block devices:"
-    lsblk | grep nvme
+    echo_error "Failed to detect NVMe device."
+    lsblk
     exit 1
 fi
 
-echo_success "Device ready: $DEVICE"
+DEVICE="/dev/$DEVICE"
+echo_success "Device: $DEVICE"
 
-# Check if we can import an existing pool from this device
+# Check for existing pool
 echo_info "Checking for existing ZFS pools..."
-IMPORT_OUTPUT=$(zpool import 2>&1 || echo "")
+IMPORT_OUTPUT=$(zpool import 2>&1 || true)
 
 if echo "$IMPORT_OUTPUT" | grep -q "pool:"; then
-    echo_info "Found importable pool(s):"
     echo "$IMPORT_OUTPUT"
     echo ""
-    read -rp "Do you want to import an existing pool? (yes/no): " IMPORT_EXISTING
+    read -rp "Import existing pool? (yes/no): " IMPORT_EXISTING
     
     if [[ "$IMPORT_EXISTING" == "yes" ]]; then
-        read -rp "Enter the pool name to import: " POOL_NAME
-        echo_info "Importing pool '$POOL_NAME'..."
+        read -rp "Pool name to import: " POOL_NAME
         zpool import -f "$POOL_NAME"
-        IMPORT_STATUS=$?
-        
-        if [[ $IMPORT_STATUS -eq 0 ]]; then
-            echo_success "Pool '$POOL_NAME' imported successfully"
+        if [[ $? -eq 0 ]]; then
+            echo_success "Pool imported"
             CREATE_NEW_POOL="no"
         else
-            echo_error "Failed to import pool. Will create new pool instead."
             CREATE_NEW_POOL="yes"
         fi
     else
         CREATE_NEW_POOL="yes"
     fi
 else
-    echo_info "No existing pools found on device."
     CREATE_NEW_POOL="yes"
 fi
 
+# Create new pool if needed
 if [[ "$CREATE_NEW_POOL" == "yes" ]]; then
-    # Prompt for ZFS pool name with validation
     while true; do
-        read -rp "Enter a name for the new ZFS pool: " POOL_NAME
+        read -rp "Enter ZFS pool name: " POOL_NAME
         if [[ -z "$POOL_NAME" ]]; then
-            echo_error "No pool name entered."
+            echo_error "No name entered."
             continue
         fi
-        # Check if pool already exists
         if zpool list "$POOL_NAME" &>/dev/null; then
-            echo_error "Pool '$POOL_NAME' already exists. Choose a different name."
+            echo_error "Pool exists."
             continue
         fi
-        # Validate pool name (alphanumeric, dash, underscore)
         if [[ "$POOL_NAME" =~ ^[a-zA-Z0-9_-]+$ ]]; then
             break
-        else
-            echo_error "Invalid pool name. Use only letters, numbers, dashes, and underscores."
         fi
+        echo_error "Invalid name."
     done
 
-    # Create ZFS pool
     echo_info "Creating ZFS pool '$POOL_NAME' on $DEVICE..."
     zpool create "$POOL_NAME" "$DEVICE"
-    CREATE_STATUS=$?
-    
-    if [[ $CREATE_STATUS -eq 0 ]]; then
-        echo_success "ZFS pool '$POOL_NAME' created successfully"
+    if [[ $? -eq 0 ]]; then
+        echo_success "Pool created"
     else
-        echo_error "Failed to create ZFS pool (exit code: $CREATE_STATUS)"
+        echo_error "Failed to create pool"
         exit 1
     fi
 fi
 
-# Show current pool status
+# Show pool
 echo ""
-echo "Current pool status:"
-zpool status "$POOL_NAME" 2>&1
+zpool status "$POOL_NAME"
 echo ""
 
-# ------------------------------------------
-# Create systemd service for NVMe connect
-# ------------------------------------------
-echo_info "Creating systemd services for persistence..."
+# Create systemd services
+echo_info "Creating systemd services..."
 
 SERVICE_NAME="nvme-connect-${POOL_NAME}"
-NVME_SERVICE="/etc/systemd/system/${SERVICE_NAME}.service"
-
-cat > "$NVME_SERVICE" <<SERVICEEOF
+cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<EOF
 [Unit]
-Description=Connect NVMe-oF volume from TrueNAS for pool ${POOL_NAME}
+Description=Connect NVMe-oF for ${POOL_NAME}
 After=network-online.target
 Wants=network-online.target
 Before=zfs-import.target
@@ -285,19 +199,12 @@ StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
-SERVICEEOF
+EOF
 
-echo_success "Created $NVME_SERVICE"
-
-# ------------------------------------------
-# Create systemd service for ZFS import
-# ------------------------------------------
-ZPOOL_SERVICE_NAME="zpool-import-${POOL_NAME}"
-ZPOOL_SERVICE="/etc/systemd/system/${ZPOOL_SERVICE_NAME}.service"
-
-cat > "$ZPOOL_SERVICE" <<ZPOOLEOF
+ZPOOL_SERVICE="zpool-import-${POOL_NAME}"
+cat > "/etc/systemd/system/${ZPOOL_SERVICE}.service" <<EOF
 [Unit]
-Description=Import ZFS pool ${POOL_NAME} after NVMe connection
+Description=Import ZFS pool ${POOL_NAME}
 After=${SERVICE_NAME}.service zfs-import.target
 Requires=${SERVICE_NAME}.service
 Before=zfs-mount.service
@@ -312,33 +219,17 @@ StandardError=journal
 
 [Install]
 WantedBy=zfs-mount.service
-ZPOOLEOF
+EOF
 
-echo_success "Created $ZPOOL_SERVICE"
-
-# Reload systemd and enable services
-echo_info "Enabling systemd services..."
 systemctl daemon-reload
 systemctl enable "${SERVICE_NAME}.service"
-systemctl enable "${ZPOOL_SERVICE_NAME}.service"
+systemctl enable "${ZPOOL_SERVICE}.service"
 
 echo ""
-echo_success "===================="
 echo_success "Setup Complete!"
-echo_success "===================="
 echo ""
-echo_info "Pool Information:"
-echo "  Pool Name: $POOL_NAME"
-echo "  Mount Point: /$POOL_NAME"
-echo "  Device: $DEVICE"
+echo_info "Pool: $POOL_NAME at /$POOL_NAME"
+echo_info "Device: $DEVICE"
+echo_info "Services: ${SERVICE_NAME}.service, ${ZPOOL_SERVICE}.service"
 echo ""
-echo_info "Services Created:"
-echo "  - ${SERVICE_NAME}.service"
-echo "  - ${ZPOOL_SERVICE_NAME}.service"
-echo ""
-echo_info "Verify with:"
-echo "  zpool status $POOL_NAME"
-echo "  zfs list"
-echo "  systemctl status ${SERVICE_NAME}.service"
-echo ""
-echo_success "System will automatically connect and mount on reboot!"
+echo_info "Reboot to test persistence!"
