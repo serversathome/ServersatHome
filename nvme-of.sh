@@ -17,7 +17,8 @@ fi
 # Install nvme-cli if missing
 if ! command -v nvme &> /dev/null; then
     echo "nvme-cli not found, installing..."
-    apt install -y nvme-cli
+    apt-get update || echo "Warning: apt update failed, continuing anyway"
+    apt-get install -y nvme-cli
 fi
 
 # Discover NVMe-oF targets
