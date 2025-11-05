@@ -25,19 +25,27 @@ if [[ -z "$DISCOVERY" ]]; then
 fi
 
 # Parse NVMe subsystems into a clean list (subtype=nvme)
+DISCOVERY=$(nvme discover -t tcp -a "$TRUENAS_IP" -s 4420)
+
 SUBSYSTEMS=$(echo "$DISCOVERY" | awk '
-    /subtype: *nvme/ {subsystem=n++; subnqn=""; traddr="";}
-    /subnqn:/ {subnqn=$2; gsub(/^ */, "", subnqn)}
-    /traddr:/ {traddr=$2; gsub(/^ */, "", traddr); if(subnqn!="" && traddr!="") print subsystem "|" subnqn "|" traddr}
+/subtype: *nvme/ {subnqn=""; traddr=""; next}
+/subnqn:/ {subnqn=$2}
+/traddr:/ {traddr=$2; if(subnqn!="" && traddr!="") print subnqn "|" traddr}
 ')
 
 i=1
 declare -A SUBS
-while IFS="|" read -r idx nqn traddr; do
+while IFS="|" read -r nqn traddr; do
     SUBS[$i]="$nqn|$traddr"
     echo "[$i] NQN: $nqn  IP: $traddr"
     ((i++))
 done <<< "$SUBSYSTEMS"
+
+read -rp "Select the target to use (enter number): " TARGET_INDEX
+SELECTED=${SUBS[$TARGET_INDEX]}
+NQN=$(echo "$SELECTED" | cut -d'|' -f1)
+TRADDR=$(echo "$SELECTED" | cut -d'|' -f2)
+
 
 
 # Display menu
