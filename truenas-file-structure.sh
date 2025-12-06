@@ -223,7 +223,7 @@ services:
       - VPN_ENABLED=true
       - VPN_CONF=wg0
       - VPN_PROVIDER=generic
-      - VPN_LAN_NETWORK=$CIDR_NETWORK,10.8.0.0/24
+      - VPN_LAN_NETWORK=$CIDR_NETWORK,10.8.0.0/24,100.64.0.0/10,100.84.0.0/10
       - VPN_LAN_LEAK_ENABLED=false
       - VPN_EXPOSE_PORTS_ON_LAN=
       - VPN_AUTO_PORT_FORWARD=true
