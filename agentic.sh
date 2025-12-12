@@ -144,7 +144,18 @@ services:
       - /:/mnt/root
 EOF
 
-# 8️⃣ Start all containers
+
+# Ensure Docker service is running
+systemctl enable docker
+systemctl start docker
+
+# Wait a few seconds for Docker to be ready
+sleep 5
+
+# Verify Docker is working
+docker info >/dev/null 2>&1 || { echo "Docker not running, exiting"; exit 1; }
+
+# Then start containers
 docker compose -f watchtower-compose.yml up -d
 docker compose -f code-server-compose.yml up -d
 docker compose -f nextexplorer-compose.yml up -d
