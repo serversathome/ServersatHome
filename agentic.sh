@@ -17,10 +17,8 @@ apt install -y \
   nginx certbot \
   cron docker.io docker-compose
 
-# 2️⃣ Install Docker via your custom script
-wget https://raw.githubusercontent.com/imjustleaving/ServersatHome/refs/heads/main/install-docker.sh
-chmod +x install-docker.sh
-bash install-docker.sh
+# 2️⃣ Install Docker
+curl -fsSL https://get.docker.com -o get-docker.sh && sh get-docker.sh
 
 # 3️⃣ Install Node.js 20.x via NodeSource (includes npm)
 curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
