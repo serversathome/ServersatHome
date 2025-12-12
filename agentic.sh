@@ -150,6 +150,9 @@ systemctl start docker
 # Wait a few seconds for Docker to be ready
 sleep 5
 
+systemctl daemon-reload
+systemctl start docker
+
 # Verify Docker is working
 docker info >/dev/null 2>&1 || { echo "Docker not running, exiting"; exit 1; }
 
