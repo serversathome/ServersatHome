@@ -82,30 +82,38 @@ EOF
 #  Add weekly auto-update cron job
 (crontab -l 2>/dev/null; echo "0 3 * * 0 apt update && apt upgrade -y && apt autoremove -y && apt clean -y") | crontab -
 
-#  Setup /docker directory and docker-compose files
+# Setup /docker directory and docker-compose files
 DOCKER_DIR="/docker"
 mkdir -p "$DOCKER_DIR"
 cd "$DOCKER_DIR"
 
-# Watchtower docker-compose
-cat > watchtower-compose.yml << 'EOF'
+###############################################
+# Watchtower
+###############################################
+mkdir -p "$DOCKER_DIR/watchtower"
+cat > "$DOCKER_DIR/watchtower/docker-compose.yml" << 'EOF'
 services:
   watchtower:
     image: nickfedor/watchtower
     container_name: watchtower
     environment:
       - TZ=America/New_York
-      - WATCHTOWER_NOTIFICATIONS_HOSTNAME=
       - WATCHTOWER_CLEANUP=true
       - WATCHTOWER_INCLUDE_STOPPED=true
       - WATCHTOWER_SCHEDULE=0 0 3 * * *
     restart: unless-stopped
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+    security_opt:
+      - apparmor=unconfined
 EOF
 
-# Code-Server docker-compose
-cat > code-server-compose.yml << 'EOF'
+
+###############################################
+# Code-Server
+###############################################
+mkdir -p "$DOCKER_DIR/code-server"
+cat > "$DOCKER_DIR/code-server/docker-compose.yml" << 'EOF'
 services:
   code-server:
     image: lscr.io/linuxserver/code-server:latest
@@ -121,10 +129,16 @@ services:
     ports:
       - 8443:8443
     restart: unless-stopped
+    security_opt:
+      - apparmor=unconfined
 EOF
 
-# NextExplorer docker-compose
-cat > nextexplorer-compose.yml << 'EOF'
+
+###############################################
+# NextExplorer
+###############################################
+mkdir -p "$DOCKER_DIR/nextexplorer"
+cat > "$DOCKER_DIR/nextexplorer/docker-compose.yml" << 'EOF'
 services:
   nextexplorer:
     image: nxzai/explorer:latest
@@ -140,15 +154,17 @@ services:
       - ./config:/config
       - ./cache:/cache
       - /:/mnt/root
+    security_opt:
+      - apparmor=unconfined
 EOF
 
 
-
-
-# Then start containers
-docker compose -f code-server-compose.yml up -d
-docker compose -f nextexplorer-compose.yml up -d
-docker compose -f watchtower-compose.yml up -d
+###############################################
+# Start all containers
+###############################################
+cd "$DOCKER_DIR/watchtower" && docker compose up -d
+cd "$DOCKER_DIR/code-server" && docker compose up -d
+cd "$DOCKER_DIR/nextexplorer" && docker compose up -d
 
 
 echo "✅ Setup complete! Your LXC is ready with agentic coding environment and Docker containers."
