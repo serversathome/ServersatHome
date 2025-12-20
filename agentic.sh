@@ -180,9 +180,9 @@ Then start a session with either:
 
 # For Gemini:
 cd /project
-gemini start --context ./context.md --memory ./history --watch ./src
+gemini
 
 # For Claude:
 cd /project
-claude start --context ./context.md --memory ./history --watch ./src
+claude
 "
