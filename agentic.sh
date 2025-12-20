@@ -15,7 +15,9 @@ apt install -y \
   make cmake pkg-config \
   libssl-dev libffi-dev libsqlite3-dev zlib1g-dev \
   nginx certbot \
-  cron docker.io docker-compose
+  cron 
+
+  curl -fsSL https://get.docker.com -o get-docker.sh && sh get-docker.sh
 
 
 #  Install Node.js 20.x via NodeSource (includes npm)
@@ -77,10 +79,10 @@ When a new project begins, you will:
 Produce high-quality, production-ready software documented with an ongoing historical record.
 EOF
 
-# 6️⃣ Add weekly auto-update cron job
+#  Add weekly auto-update cron job
 (crontab -l 2>/dev/null; echo "0 3 * * 0 apt update && apt upgrade -y && apt autoremove -y && apt clean -y") | crontab -
 
-# 7️⃣ Setup /docker directory and docker-compose files
+#  Setup /docker directory and docker-compose files
 DOCKER_DIR="/docker"
 mkdir -p "$DOCKER_DIR"
 cd "$DOCKER_DIR"
@@ -144,9 +146,9 @@ EOF
 
 
 # Then start containers
-docker compose -f watchtower-compose.yml up -d
-docker compose -f code-server-compose.yml up -d
-docker compose -f nextexplorer-compose.yml up -d
+docker compose watchtower-compose.yml up -d
+docker compose code-server-compose.yml up -d
+docker compose nextexplorer-compose.yml up -d
 
 echo "✅ Setup complete! Your LXC is ready with agentic coding environment and Docker containers."
 echo "To install the AI CLIs:
