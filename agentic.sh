@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-# 1️⃣ Update system and install core dependencies
+#  Update system and install core dependencies
 apt update && apt upgrade -y
 apt install -y \
   git curl wget unzip zip htop nano vim bash-completion \
@@ -17,19 +17,17 @@ apt install -y \
   nginx certbot \
   cron docker.io docker-compose
 
-# 2️⃣ Install Docker
-curl -fsSL https://get.docker.com -o get-docker.sh && sh get-docker.sh
 
-# 3️⃣ Install Node.js 20.x via NodeSource (includes npm)
+#  Install Node.js 20.x via NodeSource (includes npm)
 curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
 apt install -y nodejs
 
-# 4️⃣ Setup /project structure
+#  Setup /project structure
 PROJECT_DIR="/project"
 mkdir -p "$PROJECT_DIR"/{src,config,data,history}
 chown -R $USER:$USER "$PROJECT_DIR"
 
-# 5️⃣ Create context.md
+#  Create context.md
 cat > "$PROJECT_DIR/context.md" << 'EOF'
 # 🧠 Agentic Coding Context
 ## Overview
@@ -143,18 +141,7 @@ services:
 EOF
 
 
-# Ensure Docker service is running
-systemctl enable docker
-systemctl start docker
 
-# Wait a few seconds for Docker to be ready
-sleep 5
-
-systemctl daemon-reload
-systemctl start docker
-
-# Verify Docker is working
-docker info >/dev/null 2>&1 || { echo "Docker not running, exiting"; exit 1; }
 
 # Then start containers
 docker compose -f watchtower-compose.yml up -d
