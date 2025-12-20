@@ -146,9 +146,10 @@ EOF
 
 
 # Then start containers
-docker compose watchtower-compose.yml up -d
-docker compose code-server-compose.yml up -d
-docker compose nextexplorer-compose.yml up -d
+docker compose -f code-server-compose.yml up -d
+docker compose -f nextexplorer-compose.yml up -d
+docker compose -f watchtower-compose.yml up -d
+
 
 echo "✅ Setup complete! Your LXC is ready with agentic coding environment and Docker containers."
 echo "To install the AI CLIs:
