@@ -17,8 +17,8 @@ apt install -y \
   nginx certbot \
   cron 
 
-  curl -fsSL https://get.docker.com -o get-docker.sh && sh get-docker.sh
-
+# Install Docker
+curl -fsSL https://get.docker.com -o get-docker.sh && sh get-docker.sh
 
 #  Install Node.js 20.x via NodeSource (includes npm)
 curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
@@ -108,7 +108,6 @@ services:
       - apparmor=unconfined
 EOF
 
-
 ###############################################
 # Code-Server
 ###############################################
@@ -132,7 +131,6 @@ services:
     security_opt:
       - apparmor=unconfined
 EOF
-
 
 ###############################################
 # NextExplorer
@@ -158,7 +156,6 @@ services:
       - apparmor=unconfined
 EOF
 
-
 ###############################################
 # Start all containers
 ###############################################
@@ -166,8 +163,24 @@ cd "$DOCKER_DIR/watchtower" && docker compose up -d
 cd "$DOCKER_DIR/code-server" && docker compose up -d
 cd "$DOCKER_DIR/nextexplorer" && docker compose up -d
 
+###############################################
+# Enable SSH root login
+###############################################
+if grep -q '^#PermitRootLogin prohibit-password' /etc/ssh/sshd_config; then
+  sed -i 's/^#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config
+elif grep -q '^PermitRootLogin' /etc/ssh/sshd_config; then
+  sed -i 's/^PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+else
+  echo "PermitRootLogin yes" >> /etc/ssh/sshd_config
+fi
 
+systemctl restart ssh || systemctl restart sshd
+
+###############################################
+# Done
+###############################################
 echo "✅ Setup complete! Your LXC is ready with agentic coding environment and Docker containers."
+echo "Root SSH login has been enabled."
 echo "To install the AI CLIs:
 
 Gemini CLI:
