@@ -231,6 +231,14 @@ if [ -z "$USER_DOMAIN" ]; then
 fi
 
 # ============================================================================
+#  Increase storage quota to 1PB (effectively unlimited)
+# ============================================================================
+
+log_step "Increasing storage quota to 1 PB..."
+sed -i 's|10e12   // 10TB for good measure|10e15   // 1PB for self-host|' next/src/lib/server/mongoose/models/User.js
+log_info "Storage quota set to 1 PB (effectively unlimited)"
+
+# ============================================================================
 #  Deploy with Docker Compose
 # ============================================================================
 
