@@ -135,19 +135,25 @@ services:
       - /mnt/$CONFIG_POOL/configs/sonarr:/config
       - /mnt/$MEDIA_POOL/media:/media
 
-  jellyseerr:
-    image: fallenbagel/jellyseerr
-    container_name: jellyseerr
-    restart: unless-stopped
+  seerr:
+    image: ghcr.io/seerr-team/seerr:latest
+    init: true
+    container_name: seerr
+    environment:
+      - LOG_LEVEL=debug
+      - TZ=America/New_York
+      - PORT=5055
     ports:
       - 5055:5055
-    environment:
-      - TZ=America/New_York
-    networks:
-      - media_network
-    user: "568:568"
+    healthcheck:
+      test: wget --no-verbose --tries=1 --spider http://localhost:5055/api/v1/status || exit 1
+      start_period: 20s
+      timeout: 3s
+      interval: 15s
+      retries: 3
+    restart: unless-stopped
     volumes:
-      - /mnt/$CONFIG_POOL/configs/jellyseerr:/app/config
+      - /mnt/$CONFIG_POOL/configs/seerr:/app/config
       
   flaresolverr:
     image: ghcr.io/flaresolverr/flaresolverr:latest
