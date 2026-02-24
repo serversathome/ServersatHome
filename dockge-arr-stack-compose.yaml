@@ -41,16 +41,24 @@ services:
       - 8989:8989
     restart: unless-stopped
 
-  jellyseerr:
-    image: fallenbagel/jellyseerr:latest
-    container_name: jellyseerr
+  seerr:
+    image: ghcr.io/seerr-team/seerr:latest
+    init: true
+    container_name: seerr
     environment:
       - LOG_LEVEL=debug
-      - TZ=${TZ}
+      - TZ=America/New_York
+      - PORT=5055
     ports:
       - 5055:5055
     volumes:
-      - ${CONFIG_PATH}/jellyseerr/:/app/config
+      - ${CONFIG_PATH}/seerr:/app/config
+    healthcheck:
+      test: wget --no-verbose --tries=1 --spider http://localhost:5055/api/v1/status || exit 1
+      start_period: 20s
+      timeout: 3s
+      interval: 15s
+      retries: 3
     restart: unless-stopped
     
   jellyfin:
@@ -146,13 +154,3 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       
-  huntarr:
-    image: huntarr/huntarr:latest
-    container_name: huntarr
-    restart: unless-stopped
-    ports:
-      - "9705:9705"
-    volumes:
-      - ${CONFIG_PATH}/huntarr:/config
-    environment:
-      - TZ=${TZ}
