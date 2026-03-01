@@ -10,7 +10,7 @@ set -euo pipefail
 # --- Version Pinning ---
 HEADSCALE_VERSION="0.28.0"
 HEADSCALE_UI_VERSION="2025.08.23"
-TRAEFIK_VERSION="v3.3"
+TRAEFIK_VERSION="v3.6"
 
 # Check if the script is run as root
 if [[ $EUID -ne 0 ]]; then
@@ -72,7 +72,6 @@ services:
     volumes:
       - './config:/etc/headscale:ro'
       - './lib:/var/lib/headscale'
-    environment:
       TZ: 'America/New_York'
     healthcheck:
       test: ["CMD", "headscale", "health"]
