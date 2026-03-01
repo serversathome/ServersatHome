@@ -69,10 +69,11 @@ services:
     read_only: true
     tmpfs:
       - /var/run/headscale
+    environment:
+      TZ: 'America/New_York'
     volumes:
       - './config:/etc/headscale:ro'
       - './lib:/var/lib/headscale'
-      TZ: 'America/New_York'
     healthcheck:
       test: ["CMD", "headscale", "health"]
       interval: 30s
