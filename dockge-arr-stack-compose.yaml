@@ -90,7 +90,7 @@ services:
 
   qbittorrent:
     container_name: qbittorrent
-    image: ghcr.io/hotio/qbittorrent
+    image: ghcr.io/hotio/qbittorrent:release-5.1.2
     restart: unless-stopped
     ports:
       - 8080:8080
@@ -98,16 +98,16 @@ services:
       - PUID=568
       - PGID=568
       - UMASK=002
-      - TZ=${TZ}
+      - TZ=America/New_York
       - WEBUI_PORTS=8080/tcp,8080/udp
       - VPN_ENABLED=true
       - VPN_CONF=wg0
       - VPN_PROVIDER=generic
-      - VPN_LAN_NETWORK=
+      - VPN_LAN_NETWORK=${LAN}
       - VPN_LAN_LEAK_ENABLED=false
       - VPN_EXPOSE_PORTS_ON_LAN=
-      - VPN_AUTO_PORT_FORWARD=true
-      - VPN_PORT_REDIRECTS=
+      - VPN_AUTO_PORT_FORWARD= # enter port number here
+      - VPN_PORT_REDIRECTS= # enter port number here
       - VPN_FIREWALL_TYPE=auto
       - VPN_HEALTHCHECK_ENABLED=false
       - VPN_NAMESERVERS=wg
