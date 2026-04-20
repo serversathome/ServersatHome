@@ -44,6 +44,7 @@ services:
   seerr:
     image: ghcr.io/seerr-team/seerr:latest
     init: true
+    user: "568:568"
     container_name: seerr
     environment:
       - LOG_LEVEL=debug
@@ -120,6 +121,16 @@ services:
       - ${CONFIG_PATH}/qbit/:/config
       - ${MEDIA_PATH}:/media  
 
+  qui:
+    image: ghcr.io/autobrr/qui:latest
+    container_name: qui
+    user: "568:568"
+    restart: unless-stopped
+    ports:
+      - "7476:7476"
+    volumes:
+      - ${CONFIG_PATH}/qui/:/config
+      - ${MEDIA_PATH}:/media  
 
   profilarr:
     image: santiagosayshey/profilarr:latest
@@ -131,6 +142,18 @@ services:
     environment:
       - TZ=${TZ}
     restart: unless-stopped
+
+
+  newtarr:
+    image: ghcr.io/elfhosted/newtarr:v1.0.0
+    container_name: newtarr
+    restart: unless-stopped
+    ports:
+      - "9705:9705"
+    volumes:
+      - ${CONFIG_PATH}/newtarr:/config
+    environment:
+      - TZ=America/New_York
 
   watchtower:
     image: nickfedor/watchtower
