@@ -118,7 +118,7 @@ services:
       - net.ipv4.conf.all.src_valid_mark=1
       - net.ipv6.conf.all.disable_ipv6=1
     volumes:
-      - ${CONFIG_PATH}/qbit/:/config
+      - ${CONFIG_PATH}/qbittorrent/:/config
       - ${MEDIA_PATH}:/media  
 
   qui:
