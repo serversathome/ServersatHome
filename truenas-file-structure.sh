@@ -9,7 +9,7 @@ PRIVATE_IP=$(hostname -I | awk '{print $1}')
 CIDR_NETWORK="${PRIVATE_IP%.*}.0/24"
 
 # Define datasets and directories
-CONFIG_DATASETS=("prowlarr" "radarr" "sonarr" "jellyseerr" "profilarr" "bazarr" "jellyfin" "qbittorrent" "dozzle")
+CONFIG_DATASETS=("prowlarr" "radarr" "sonarr" "seerr" "profilarr" "bazarr" "jellyfin" "qbittorrent" "dozzle")
 MEDIA_SUBDIRECTORIES=("movies" "tv" "downloads")
 DOCKER_COMPOSE_PATH="/mnt/$CONFIG_POOL/docker"
 QBITTORRENT_WIREGUARD_DIR="/mnt/$CONFIG_POOL/configs/qbittorrent/wireguard"
@@ -86,10 +86,6 @@ fi
 
 # Generate docker-compose.yml
 cat > "$DOCKER_COMPOSE_FILE" <<EOF
-networks:
-  media_network:
-    driver: bridge
-
 services:
   prowlarr:
     image: linuxserver/prowlarr
@@ -97,8 +93,6 @@ services:
     restart: unless-stopped
     ports:
       - 9696:9696
-    networks:
-      - media_network
     volumes:
       - /mnt/$CONFIG_POOL/configs/prowlarr:/config
       - /mnt/$MEDIA_POOL/media:/media
@@ -113,8 +107,6 @@ services:
       - PUID=568
       - PGID=568
       - TZ=America/New_York
-    networks:
-      - media_network
     volumes:
       - /mnt/$CONFIG_POOL/configs/radarr:/config
       - /mnt/$MEDIA_POOL/media:/media
@@ -129,8 +121,6 @@ services:
       - PUID=568
       - PGID=568
       - TZ=America/New_York
-    networks:
-      - media_network
     volumes:
       - /mnt/$CONFIG_POOL/configs/sonarr:/config
       - /mnt/$MEDIA_POOL/media:/media
@@ -139,8 +129,9 @@ services:
     image: ghcr.io/seerr-team/seerr:latest
     init: true
     container_name: seerr
+    user: "568:568"
     environment:
-      - LOG_LEVEL=debug
+      - LOG_LEVEL=info
       - TZ=America/New_York
       - PORT=5055
     ports:
@@ -154,7 +145,7 @@ services:
     restart: unless-stopped
     volumes:
       - /mnt/$CONFIG_POOL/configs/seerr:/app/config
-      
+
   flaresolverr:
     image: ghcr.io/flaresolverr/flaresolverr:latest
     container_name: flaresolverr
@@ -163,8 +154,6 @@ services:
       - LOG_HTML=false
       - CAPTCHA_SOLVER=none
       - TZ=America/New_York
-    networks:
-      - media_network
     ports:
       - 8191:8191
     restart: unless-stopped
@@ -174,8 +163,6 @@ services:
     container_name: profilarr
     ports:
       - 6868:6868
-    networks:
-      - media_network
     volumes:
       - /mnt/$CONFIG_POOL/configs/profilarr:/config
     environment:
@@ -192,8 +179,6 @@ services:
       - PUID=568
       - PGID=568
       - TZ=America/New_York
-    networks:
-      - media_network
     volumes:
       - /mnt/$CONFIG_POOL/configs/bazarr:/config
       - /mnt/$MEDIA_POOL/media:/media
@@ -208,8 +193,6 @@ services:
     ports:
       - '8096:8096'
     restart: unless-stopped
-    networks:
-      - media_network
     volumes:
       - /mnt/$CONFIG_POOL/configs/jellyfin:/config
       - /mnt/$MEDIA_POOL/media:/media
@@ -253,8 +236,6 @@ services:
     restart: unless-stopped
     ports:
       - '8888:8080'
-    networks:
-      - media_network
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - /mnt/$CONFIG_POOL/configs/dozzle:/data
