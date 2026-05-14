@@ -48,7 +48,7 @@ services:
     container_name: seerr
     environment:
       - LOG_LEVEL=debug
-      - TZ=America/New_York
+      - TZ=${TZ}
       - PORT=5055
     ports:
       - 5055:5055
@@ -98,7 +98,7 @@ services:
       - PUID=568
       - PGID=568
       - UMASK=002
-      - TZ=America/New_York
+      - TZ=${TZ}
       - WEBUI_PORTS=8080/tcp,8080/udp
       - VPN_ENABLED=true
       - VPN_CONF=wg0
@@ -153,7 +153,7 @@ services:
     volumes:
       - ${CONFIG_PATH}/newtarr:/config
     environment:
-      - TZ=America/New_York
+      - TZ=${TZ}
 
   watchtower:
     image: nickfedor/watchtower
