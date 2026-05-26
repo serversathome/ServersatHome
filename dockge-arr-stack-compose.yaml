@@ -133,26 +133,17 @@ services:
       - ${MEDIA_PATH}:/media  
 
   profilarr:
-    image: santiagosayshey/profilarr:latest
+    image: ghcr.io/dictionarry-hub/profilarr:latest
     container_name: profilarr
+    restart: unless-stopped
     ports:
-      - 6868:6868
+      - "6868:6868"
     volumes:
       - ${CONFIG_PATH}/profilarr:/config
     environment:
-      - TZ=${TZ}
-    restart: unless-stopped
-
-
-  newtarr:
-    image: ghcr.io/elfhosted/newtarr:v1.0.0
-    container_name: newtarr
-    restart: unless-stopped
-    ports:
-      - "9705:9705"
-    volumes:
-      - ${CONFIG_PATH}/newtarr:/config
-    environment:
+      - PUID=568
+      - PGID=568
+      - UMASK=022
       - TZ=${TZ}
 
   watchtower:
