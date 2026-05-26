@@ -158,16 +158,20 @@ services:
       - 8191:8191
     restart: unless-stopped
 
+
   profilarr:
-    image: santiagosayshey/profilarr:latest
+    image: ghcr.io/dictionarry-hub/profilarr:latest
     container_name: profilarr
+    restart: unless-stopped
     ports:
-      - 6868:6868
+      - "6868:6868"
     volumes:
       - /mnt/$CONFIG_POOL/configs/profilarr:/config
     environment:
+      - PUID=568
+      - PGID=568
+      - UMASK=022
       - TZ=America/New_York
-    restart: unless-stopped
 
   bazarr:
     image: linuxserver/bazarr
