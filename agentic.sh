@@ -1,13 +1,15 @@
+
 #!/usr/bin/env bash
 # ============================================================================
 #  Claude Code LXC Deployer for Proxmox
 #  Creates a fully provisioned Ubuntu 26.04 LXC container ready for Claude Code
 #
 #  Run on your Proxmox host:
-#    curl -fsSL https://raw.githubusercontent.com/serversathome-personal/code/main/agentic.sh -o /tmp/agentic.sh && bash /tmp/agentic.sh
+#    curl -fsSL https://raw.githubusercontent.com/serversathome/ServersatHome/main/agentic.sh -o /tmp/agentic.sh && bash /tmp/agentic.sh
 #
-#  GitHub: https://github.com/serversathome-personal/code
+#  GitHub: https://github.com/serversathome/ServersatHome
 # ============================================================================
+
 set -euo pipefail
 
 # ── Colors & Helpers ────────────────────────────────────────────────────────
