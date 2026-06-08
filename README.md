@@ -36,7 +36,7 @@ Servers@Home is run by **Evan** — a Solutions Architect by day, homelabber by 
 
 Topics we cover:
 
-- 🖥️ Home servers built on **TrueNAS SCALE**, **Proxmox**, and **Docker**
+- 🖥️ Home servers built on **TrueNAS**, **Proxmox**, and **Docker**
 - 📦 Self-hosted apps — **Jellyfin**, **Nextcloud**, **Immich**, **Matrix/Synapse**, **Joplin**, and dozens more
 - 🌐 Networking, **VPNs**, **Cloudflare Tunnels**, **NetBird**, and homelab security
 - 🛠️ Real-world tutorials, scripts, and reference architectures
