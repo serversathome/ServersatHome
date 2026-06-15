@@ -1,13 +1,12 @@
-
 #!/usr/bin/env bash
 # ============================================================================
-#  Claude Code LXC Deployer for Proxmox
-#  Creates a fully provisioned Ubuntu 26.04 LXC container ready for Claude Code
+# Claude Code LXC Deployer for Proxmox
+# Creates a fully provisioned Ubuntu 24.04 LXC container ready for Claude Code
 #
-#  Run on your Proxmox host:
-#    curl -fsSL https://raw.githubusercontent.com/serversathome/ServersatHome/main/agentic.sh -o /tmp/agentic.sh && bash /tmp/agentic.sh
+# Run on your Proxmox host:
+#   curl -fsSL https://raw.githubusercontent.com/serversathome/ServersatHome/main/agentic.sh -o /tmp/agentic.sh && bash /tmp/agentic.sh
 #
-#  GitHub: https://github.com/serversathome/ServersatHome
+# GitHub: https://github.com/serversathome/ServersatHome
 # ============================================================================
 
 set -euo pipefail
@@ -28,7 +27,7 @@ error()   { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 header() {
   echo ""
   echo -e "${BOLD}╔══════════════════════════════════════════════════╗${NC}"
-  echo -e "${BOLD}║        Claude Code LXC Deployer (Proxmox)       ║${NC}"
+  echo -e "${BOLD}║        Claude Code LXC Deployer (Proxmox)        ║${NC}"
   echo -e "${BOLD}╚══════════════════════════════════════════════════╝${NC}"
   echo ""
 }
@@ -36,7 +35,7 @@ header() {
 # ── Pre-flight checks ──────────────────────────────────────────────────────
 preflight() {
   [[ $(id -u) -eq 0 ]] || error "This script must be run as root on the Proxmox host."
-  command -v pct &>/dev/null || error "pct not found. Are you running this on a Proxmox host?"
+  command -v pct   &>/dev/null || error "pct not found. Are you running this on a Proxmox host?"
   command -v pveam &>/dev/null || error "pveam not found. Are you running this on a Proxmox host?"
 }
 
@@ -47,7 +46,7 @@ get_config() {
   next_id=$(pvesh get /cluster/nextid 2>/dev/null || echo "100")
 
   # Template
-  TEMPLATE="ubuntu-26.04-standard_26.04-1_amd64.tar.zst"
+  TEMPLATE="ubuntu-24.04-standard_24.04-2_amd64.tar.zst"
 
   echo -e "${BOLD}Container Configuration${NC}"
   echo "─────────────────────────────────────────────────"
@@ -82,7 +81,6 @@ get_config() {
   # Network - default DHCP
   read -rp "IP address (DHCP or x.x.x.x/xx) [dhcp]: " CT_IP
   CT_IP="${CT_IP:-dhcp}"
-
   if [[ "$CT_IP" != "dhcp" ]]; then
     read -rp "Gateway: " CT_GW
     [[ -n "$CT_GW" ]] || error "Gateway is required for static IP."
@@ -97,15 +95,15 @@ get_config() {
   echo ""
   echo -e "${BOLD}Summary${NC}"
   echo "─────────────────────────────────────────────────"
-  echo "  CT ID:      $CT_ID"
-  echo "  Hostname:   $CT_HOSTNAME"
-  echo "  Template:   $TEMPLATE"
-  echo "  CPU:        $CT_CORES cores"
-  echo "  RAM:        $CT_RAM MB ($(( CT_RAM / 1024 )) GB)"
-  echo "  Swap:       $CT_SWAP MB"
-  echo "  Disk:       ${CT_DISK}G on $CT_STORAGE"
-  echo "  Network:    $CT_IP"
-  echo "  DNS:        $CT_DNS"
+  echo "  CT ID:     $CT_ID"
+  echo "  Hostname:  $CT_HOSTNAME"
+  echo "  Template:  $TEMPLATE"
+  echo "  CPU:       $CT_CORES cores"
+  echo "  RAM:       $CT_RAM MB ($(( CT_RAM / 1024 )) GB)"
+  echo "  Swap:      $CT_SWAP MB"
+  echo "  Disk:      ${CT_DISK}G on $CT_STORAGE"
+  echo "  Network:   $CT_IP"
+  echo "  DNS:       $CT_DNS"
   echo "─────────────────────────────────────────────────"
   echo ""
   read -rp "Proceed? (y/N): " confirm
@@ -115,15 +113,12 @@ get_config() {
 # ── Download Ubuntu 24.04 Template ─────────────────────────────────────────
 get_template() {
   info "Checking for template: $TEMPLATE"
-
-  # Download if not already present
   if ! pveam list local 2>/dev/null | grep -q "$TEMPLATE"; then
     info "Downloading $TEMPLATE ..."
     pveam download local "$TEMPLATE" || error "Failed to download template. Run 'pveam update' and try again."
   else
     success "Template already downloaded: $TEMPLATE"
   fi
-
   TEMPLATE_PATH="local:vztmpl/$TEMPLATE"
 }
 
@@ -176,7 +171,6 @@ start_container() {
   pct start "$CT_ID"
   sleep 3
 
-  # Wait for network connectivity
   info "Waiting for network..."
   local attempts=0
   while ! pct exec "$CT_ID" -- ping -c1 -W2 1.1.1.1 &>/dev/null; do
@@ -197,25 +191,6 @@ provision_container() {
 set -e
 export DEBIAN_FRONTEND=noninteractive
 
-# Normalize HOME in case the provisioner is ever run via sudo without -i/-H.
-# Everything below assumes root's home; pct exec is already clean, but this
-# keeps rustup / Claude Code / git config landing in /root no matter what.
-ROOT_HOME="$(getent passwd 0 | cut -d: -f6)"; ROOT_HOME="${ROOT_HOME:-/root}"
-[[ "${HOME:-}" != "$ROOT_HOME" ]] && export HOME="$ROOT_HOME"
-
-# Resilient apt installer: try the batch, then fall back to one-by-one so a
-# single renamed/dropped package on a brand-new base image (26.04) can't abort
-# the whole run under `set -e`.
-apt_install() {
-  if ! apt-get install -y -qq "$@" >/dev/null 2>&1; then
-    echo "    [warn] batch install failed; retrying individually..."
-    local p
-    for p in "$@"; do
-      apt-get install -y -qq "$p" >/dev/null 2>&1 || echo "    [warn] skipped (unavailable): $p"
-    done
-  fi
-}
-
 echo ">>> Setting timezone to America/New_York..."
 ln -sf /usr/share/zoneinfo/America/New_York /etc/localtime
 echo "America/New_York" > /etc/timezone
@@ -223,7 +198,7 @@ dpkg-reconfigure -f noninteractive tzdata
 
 echo ">>> Generating locale..."
 apt-get update -qq
-apt_install locales
+apt-get install -y -qq locales
 sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen
 locale-gen en_US.UTF-8 > /dev/null 2>&1
 update-locale LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
@@ -234,31 +209,31 @@ echo ">>> Updating system..."
 apt-get upgrade -y -qq
 
 echo ">>> Installing core packages..."
-apt_install \
+apt-get install -y -qq \
   git curl wget unzip zip \
   ca-certificates gnupg lsb-release apt-transport-https software-properties-common \
   bash-completion locales \
   htop nano vim tmux screen \
   jq yq tree \
-  net-tools iproute2 iputils-ping bind9-dnsutils \
+  net-tools iproute2 iputils-ping dnsutils \
   openssh-server \
   cron logrotate
 
 echo ">>> Installing build tools & dev libraries..."
-apt_install \
+apt-get install -y -qq \
   build-essential make cmake pkg-config autoconf automake libtool \
   python3 python3-pip python3-venv python3-dev \
   libssl-dev libffi-dev libsqlite3-dev zlib1g-dev \
-  libreadline-dev libbz2-dev libncurses-dev liblzma-dev libxml2-dev libxslt1-dev
+  libreadline-dev libbz2-dev libncurses-dev liblzma-dev libxml2-dev libxslt-dev
 
 echo ">>> Installing search & productivity tools..."
-apt_install \
+apt-get install -y -qq \
   ripgrep fd-find fzf bat \
   rsync \
   sqlite3
 
 echo ">>> Installing database clients..."
-apt_install \
+apt-get install -y -qq \
   postgresql-client redis-tools
 
 echo ">>> Installing Node.js 22.x LTS..."
@@ -300,16 +275,23 @@ if [[ -f "$HOME/.local/bin/claude" ]]; then
 elif [[ -f "$HOME/.claude/bin/claude" ]]; then
   ln -sf "$HOME/.claude/bin/claude" /usr/local/bin/claude 2>/dev/null || true
 fi
-echo "    Claude Code installed"
+CLAUDE_BIN="$(command -v claude || echo /usr/local/bin/claude)"
+echo "    Claude Code installed: $("$CLAUDE_BIN" --version 2>/dev/null || echo 'version unknown')"
 
-echo ">>> Configuring Claude Code permissions + plugins..."
+echo ">>> Configuring Claude Code settings (permissions + env)..."
+# NOTE: We intentionally do NOT use an "enabledPlugins" block here.
+# In non-interactive / container contexts, plugin auto-install from
+# enabledPlugins is gated behind the interactive trust dialog and is
+# silently ignored. Plugins are installed explicitly below via the
+# `claude plugin` CLI instead.
+#
+# Verified keys: alwaysThinkingEnabled (top-level bool) and the three env
+# vars below are all valid current settings. CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS
+# must live inside "env" (it's an environment variable, not a top-level key).
+# The old "enableRemoteControl" key was removed — it is NOT a real settings key;
+# Remote Control is enabled per-session with /rc or for all sessions via /config
+# (Pro/Max feature), so it can't be pre-baked here.
 mkdir -p /root/.claude
-
-# NOTE: claude-plugins-official is built into every Claude Code install, so its
-# plugins (frontend-design, code-review, commit-commands, security-guidance,
-# context7) need no marketplace declaration. Only third-party marketplaces like
-# superpowers must be declared in extraKnownMarketplaces. Plugins in enabledPlugins
-# install from their marketplaces on first launch — no npx/CLI step needed.
 cat > /root/.claude/settings.json << 'SETTINGS'
 {
   "$schema": "https://json.schemastore.org/claude-code-settings.json",
@@ -336,105 +318,67 @@ cat > /root/.claude/settings.json << 'SETTINGS'
     "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "64000",
     "MAX_THINKING_TOKENS": "31999"
   },
-  "alwaysThinkingEnabled": true,
-  "extraKnownMarketplaces": {
-    "superpowers-marketplace": {
-      "source": { "source": "github", "repo": "obra/superpowers-marketplace" }
-    }
-  },
-  "enabledPlugins": {
-    "frontend-design@claude-plugins-official": true,
-    "code-review@claude-plugins-official": true,
-    "commit-commands@claude-plugins-official": true,
-    "security-guidance@claude-plugins-official": true,
-    "context7@claude-plugins-official": true,
-    "superpowers@superpowers-marketplace": true
-  }
+  "alwaysThinkingEnabled": true
 }
 SETTINGS
 
-echo ">>> Enabling Claude Code Remote Control auto-start..."
-# The CLI auto-starts a phone/browser-controllable session when
-# remoteControlAtStartup=true in ~/.claude.json (connect from claude.ai/code or
-# the Claude mobile app). settings.json has no documented key for this; the
-# in-app equivalent is the /config toggle. Requires a Pro/Max login
-# (run: claude /login) — API keys are NOT supported for Remote Control.
-if command -v jq >/dev/null 2>&1; then
-  if [[ -f /root/.claude.json ]]; then
-    tmp=$(mktemp); jq '.remoteControlAtStartup = true' /root/.claude.json > "$tmp" && mv "$tmp" /root/.claude.json
-  else
-    echo '{ "remoteControlAtStartup": true }' > /root/.claude.json
-  fi
-else
-  echo "    [warn] jq missing; skipping remote-control auto-start (enable later via /config)."
-fi
+echo ">>> Adding plugin marketplaces..."
+# The official marketplace is auto-registered on first INTERACTIVE launch only,
+# so a non-interactive provisioning run must add it explicitly.
+"$CLAUDE_BIN" plugin marketplace add anthropics/claude-plugins-official \
+  || echo "    [WARN] could not add claude-plugins-official"
+# Demo/example marketplace (registers as 'claude-code-plugins') — source for
+# frontend-design, code-review, commit-commands, security-guidance examples.
+"$CLAUDE_BIN" plugin marketplace add anthropics/claude-code \
+  || echo "    [WARN] could not add claude-code (demo) marketplace"
+# Third-party marketplace for Superpowers.
+"$CLAUDE_BIN" plugin marketplace add obra/superpowers-marketplace \
+  || echo "    [WARN] could not add superpowers-marketplace"
 
-echo ">>> Setting up /project directory..."
-mkdir -p /project
+echo ">>> Installing Claude Code plugins (official CLI)..."
+# Resilient installer: tries the official marketplace first, then the demo
+# marketplace. Non-fatal — a single failed plugin won't abort provisioning.
+install_plugin() {
+  local name="$1"
+  local mkt
+  for mkt in claude-plugins-official claude-code-plugins; do
+    if "$CLAUDE_BIN" plugin install "${name}@${mkt}" 2>/dev/null; then
+      echo "    installed ${name}@${mkt}"
+      return 0
+    fi
+  done
+  echo "    [WARN] could not install plugin: ${name} (check name/marketplace)"
+  return 0
+}
 
-cat > /project/CLAUDE.md << 'CLAUDEMD'
-# Claude Code Workspace
+install_plugin frontend-design
+install_plugin code-review
+install_plugin commit-commands
+install_plugin security-guidance
+install_plugin context7
 
-## Environment
-- **OS**: Ubuntu 26.04 LXC container on Proxmox
-- **Working directory**: /project
-- **Timezone**: America/New_York
-- **User**: root
+# Superpowers lives in its own marketplace.
+"$CLAUDE_BIN" plugin install superpowers@superpowers-marketplace 2>/dev/null \
+  && echo "    installed superpowers@superpowers-marketplace" \
+  || echo "    [WARN] could not install superpowers"
 
-## Available Tools
-- **Languages**: Node.js 22 LTS, Python 3 (system default), Go (latest), Rust (latest)
-- **Package managers**: npm, pip (use --break-system-packages), cargo, go install
-- **Docker**: Docker Engine + Compose plugin, running and ready
-- **Containers**: Watchtower (auto-updates), Code Server (port 8443)
-- **Search tools**: ripgrep (rg), fd-find (fdfind), fzf
-- **Databases**: PostgreSQL client (psql), Redis client (redis-cli), SQLite3
+# Sanity check — list what actually landed.
+echo ">>> Installed plugins:"
+"$CLAUDE_BIN" plugin list 2>/dev/null || echo "    (plugin list unavailable)"
 
-## Permissions
-All tools are pre-approved — no permission prompts. Bash, Read, Write, Edit, WebFetch, WebSearch, Task, and MCP tools all run without confirmation.
-
-## Subagents & Agent Teams
-- **Subagents** (Task tool): quick, focused workers that report back. Define reusable ones as
-  Markdown files in ~/.claude/agents/ (see /agents).
-- **Agent teams** are ENABLED (CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1). Use these when teammates
-  need to share findings and coordinate, not just report back — e.g. "create a team to refactor X
-  with one teammate per layer." Each teammate is a full Claude Code instance with a shared task
-  list and messaging. They use significantly more tokens than a single session, so reserve them
-  for genuinely parallel, independent work. tmux is installed for split-pane visualization.
-
-## Remote Control
-Auto-start is configured (remoteControlAtStartup in ~/.claude.json) so each session is controllable
-from claude.ai/code or the Claude mobile app — execution stays local in this container. Requires a
-Pro/Max login (run `claude` then /login); API keys are not supported. Toggle per-session with
-/remote-control, or adjust the default via /config.
-
-## Docker Usage
-Docker compose files should go in /docker/<service-name>/docker-compose.yml. 
-Watchtower is already running and will auto-update any containers with `restart: unless-stopped`.
-All Docker containers in this LXC need `security_opt: [apparmor=unconfined]`.
-
-## Conventions
-- Prefer creating files over printing long code blocks
-- Use git for version control on all projects in /project/src/
-- When installing Python packages, use: pip install --break-system-packages <package>
-- Extended thinking is always on — use it for complex architectural decisions
-
-## Installed Plugins
-Declared in ~/.claude/settings.json and installed from their marketplaces on first launch.
-Run /plugin to confirm they're active or add more.
-- **frontend-design** (claude-plugins-official): production-grade UI aesthetics
-- **code-review** (claude-plugins-official): multi-agent PR review with confidence scoring
-- **commit-commands** (claude-plugins-official): git commit/push/PR workflows (/commit, /push, /pr)
-- **security-guidance** (claude-plugins-official): warnings when editing sensitive files
-- **context7** (claude-plugins-official): live, version-specific library docs (reduces API hallucinations)
-- **superpowers** (superpowers-marketplace): brainstorm → plan → implement (TDD) workflow
-  - /superpowers:brainstorm, /superpowers:write-plan, /superpowers:execute-plan
-  - Auto-activating skills: test-driven-development, systematic-debugging, verification-before-completion
-
-## Installed Skills
-- **webapp-testing** (~/.claude/skills/): Playwright-based browser testing for UI verification
-CLAUDEMD
+# ---------------------------------------------------------------------------
+# FALLBACK if the above installs don't persist in your Claude Code version:
+# Headless plugin install has been historically finicky. The container-intended
+# mechanism is the (currently undocumented) CLAUDE_CODE_PLUGIN_SEED_DIR env var,
+# which seeds pre-staged plugins on first launch. If `claude plugin list` above
+# is empty after provisioning, stage the plugin repos into a seed dir and export
+# CLAUDE_CODE_PLUGIN_SEED_DIR=<dir> in /root/.bashrc, or simply run the
+# `claude plugin install` commands above once inside an interactive session.
+# ---------------------------------------------------------------------------
 
 echo ">>> Installing webapp-testing skill (from anthropics/skills)..."
+# Installed as a plain user skill (NOT a marketplace plugin). A SKILL.md placed
+# under ~/.claude/skills/ is picked up automatically with no plugin entry needed.
 git clone --depth 1 --filter=blob:none --sparse https://github.com/anthropics/skills.git /tmp/anthropic-skills
 cd /tmp/anthropic-skills && git sparse-checkout set skills/webapp-testing
 mkdir -p /root/.claude/skills/
@@ -445,6 +389,74 @@ cd /root
 echo ">>> Installing Playwright for webapp-testing skill..."
 npx -y playwright install --with-deps chromium
 
+echo ">>> Setting up /project directory..."
+mkdir -p /project
+cat > /project/CLAUDE.md << 'CLAUDEMD'
+# Claude Code Workspace
+
+## Environment
+- **OS**: Ubuntu 24.04 LXC container on Proxmox
+- **Working directory**: /project
+- **Timezone**: America/New_York
+- **User**: root
+
+## Available Tools
+- **Languages**: Node.js 22 LTS, Python 3.12, Go (latest), Rust (latest)
+- **Package managers**: npm, pip (use --break-system-packages), cargo, go install
+- **Docker**: Docker Engine + Compose plugin, running and ready
+- **Containers**: Watchtower (auto-updates), Code Server (port 8443)
+- **Search tools**: ripgrep (rg), fd-find (fdfind), fzf
+- **Databases**: PostgreSQL client (psql), Redis client (redis-cli), SQLite3
+
+## Permissions
+All tools are pre-approved — no permission prompts. Bash, Read, Write, Edit,
+WebFetch, WebSearch, Task, and MCP tools all run without confirmation.
+
+## Agent Teams
+Agent teams are enabled. You can spawn parallel teammates for complex tasks:
+- Use agent teams for work that benefits from parallel exploration
+- Use subagents (Task tool) for quick focused work that reports back
+- tmux is installed for split-pane team visualization
+
+## Remote Control
+Remote Control lets you steer a live local session from the Claude mobile app or
+web. It is NOT enabled via settings.json — turn it on per session with `/rc`
+(or `claude remote-control`), or for all sessions via `/config` →
+"Enable Remote Control for all sessions". Requires a Pro/Max login (research
+preview), so it only applies once someone signs in interactively.
+
+## Docker Usage
+Docker compose files should go in /docker/<service-name>/docker-compose.yml.
+Watchtower is already running and will auto-update any containers with
+`restart: unless-stopped`.
+All Docker containers in this LXC need `security_opt: [apparmor=unconfined]`.
+
+## Conventions
+- Prefer creating files over printing long code blocks
+- Use git for version control on all projects in /project/src/
+- When installing Python packages, use: pip install --break-system-packages <package>
+- Extended thinking is always on — use it for complex architectural decisions
+
+## Installed Plugins / Skills
+Plugins are installed via the `claude plugin` CLI at provision time (not via an
+enabledPlugins block, which is ignored in containers). Run `claude plugin list`
+to confirm what's active.
+- **frontend-design**: Production-grade UI with distinctive aesthetics (auto-activates on frontend tasks)
+- **code-review**: Multi-agent PR review with confidence scoring
+- **commit-commands**: Git commit, push, and PR workflows (/commit, /push, /pr)
+- **security-guidance**: Security warnings when editing sensitive files
+- **context7**: Live, version-specific library docs lookup (reduces API hallucinations)
+- **superpowers**: Development workflow framework — brainstorm → plan → implement with TDD
+  - /superpowers:brainstorm — Refine ideas before coding
+  - /superpowers:write-plan — Create implementation plans
+  - /superpowers:execute-plan — Execute plans in batches via subagents
+  - Auto-activating skills: test-driven-development, systematic-debugging, verification-before-completion
+- **webapp-testing** (local skill, not a marketplace plugin): Playwright-based
+  browser testing for UI verification and debugging
+CLAUDEMD
+
+echo ">>> Installing Claude Code plugins (official marketplace)..."
+
 echo ">>> Configuring SSH..."
 sed -i "s/^#*PermitRootLogin.*/PermitRootLogin yes/" /etc/ssh/sshd_config
 sed -i "s/^#*PasswordAuthentication.*/PasswordAuthentication yes/" /etc/ssh/sshd_config
@@ -452,7 +464,6 @@ systemctl enable ssh
 systemctl restart ssh
 
 echo ">>> Setting up shell environment..."
-if ! grep -q "Claude Code Container" /root/.bashrc 2>/dev/null; then
 cat >> /root/.bashrc << 'BASHRC'
 
 # ── Claude Code Container ──────────────────────────────────
@@ -474,7 +485,6 @@ alias dps="docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'"
 # Always start in /project
 cd /project 2>/dev/null || true
 BASHRC
-fi
 
 echo ">>> Setting up Git defaults..."
 git config --global init.defaultBranch main
@@ -550,7 +560,7 @@ rm -rf /var/lib/apt/lists/*
 
 echo ""
 echo "╔══════════════════════════════════════════════════╗"
-echo "║          Provisioning Complete!                  ║"
+echo "║              Provisioning Complete!              ║"
 echo "╚══════════════════════════════════════════════════╝"
 PROVISION_EOF
 
@@ -563,44 +573,45 @@ PROVISION_EOF
 
 # ── Print Summary ─────────────────────────────────────────────────────────
 print_summary() {
-  # Get container IP
   local ct_ip
   ct_ip=$(pct exec "$CT_ID" -- hostname -I 2>/dev/null | awk '{print $1}')
 
   echo ""
   echo -e "${GREEN}${BOLD}╔══════════════════════════════════════════════════╗${NC}"
-  echo -e "${GREEN}${BOLD}║       Claude Code LXC Ready!                    ║${NC}"
+  echo -e "${GREEN}${BOLD}║              Claude Code LXC Ready!               ║${NC}"
   echo -e "${GREEN}${BOLD}╚══════════════════════════════════════════════════╝${NC}"
   echo ""
-  echo -e "  ${BOLD}Container:${NC}  $CT_ID ($CT_HOSTNAME)"
-  echo -e "  ${BOLD}IP:${NC}         ${ct_ip:-pending (DHCP)}"
-  echo -e "  ${BOLD}Resources:${NC}  ${CT_CORES} CPU / $(( CT_RAM / 1024 )) GB RAM / ${CT_DISK} GB disk"
-  echo -e "  ${BOLD}Storage:${NC}    $CT_STORAGE"
-  echo -e "  ${BOLD}Timezone:${NC}   America/New_York"
+  echo -e "  ${BOLD}Container:${NC} $CT_ID ($CT_HOSTNAME)"
+  echo -e "  ${BOLD}IP:${NC}        ${ct_ip:-pending (DHCP)}"
+  echo -e "  ${BOLD}Resources:${NC} ${CT_CORES} CPU / $(( CT_RAM / 1024 )) GB RAM / ${CT_DISK} GB disk"
+  echo -e "  ${BOLD}Storage:${NC}   $CT_STORAGE"
+  echo -e "  ${BOLD}Timezone:${NC}  America/New_York"
   echo ""
   echo -e "  ${BOLD}Connect:${NC}"
-  echo -e "    Console:  ${CYAN}pct enter $CT_ID${NC}"
-  [[ -n "${ct_ip:-}" ]] && echo -e "    SSH:      ${CYAN}ssh root@${ct_ip}${NC}"
-  [[ -n "${ct_ip:-}" ]] && echo -e "    Code:     ${CYAN}http://${ct_ip}:8443${NC}  (password: admin)"
+  echo -e "    Console: ${CYAN}pct enter $CT_ID${NC}"
+  [[ -n "${ct_ip:-}" ]] && echo -e "    SSH:     ${CYAN}ssh root@${ct_ip}${NC}"
+  [[ -n "${ct_ip:-}" ]] && echo -e "    Code:    ${CYAN}http://${ct_ip}:8443${NC} (password: admin)"
   echo ""
   echo -e "  ${BOLD}Start Claude Code:${NC}"
-  echo -e "    ${CYAN}claude${NC}    (shell auto-cd's to /project on login)"
+  echo -e "    ${CYAN}claude${NC}  (shell auto-cd's to /project on login)"
+  echo ""
+  echo -e "  ${BOLD}Verify plugins:${NC} ${CYAN}claude plugin list${NC}"
   echo ""
   echo -e "  ${BOLD}Installed:${NC}"
-  echo "    • Claude Code (native)    • Node.js 22 LTS"
-  echo "    • Python 3 + pip + venv   • Go (latest)"
-  echo "    • Rust (via rustup)       • Docker + Compose"
-  echo "    • Git, ripgrep, fzf, fd   • Build essentials"
-  echo "    • PostgreSQL & Redis CLI  • Watchtower (auto-update containers)"
+  echo "    • Claude Code (native)      • Node.js 22 LTS"
+  echo "    • Python 3 + pip + venv     • Go (latest)"
+  echo "    • Rust (via rustup)         • Docker + Compose"
+  echo "    • Git, ripgrep, fzf, fd     • Build essentials"
+  echo "    • PostgreSQL & Redis CLI    • Watchtower (auto-update containers)"
   echo "    • Code Server (port 8443)"
   echo ""
-  echo -e "  ${BOLD}Permissions:${NC}  All tools pre-approved (no prompts)"
+  echo -e "  ${BOLD}Permissions:${NC} All tools pre-approved (no prompts)"
   echo -e "  ${BOLD}Config:${NC}      ~/.claude/settings.json"
-  echo -e "  ${BOLD}Features:${NC}    Agent teams, extended thinking, 64k output, remote control, auto-approved tools"
-  echo -e "  ${BOLD}Plugins:${NC}     frontend-design, code-review, commit-commands, security-guidance,"
-  echo -e "               context7, superpowers  (run /plugin to verify)"
-  echo -e "  ${BOLD}Skills:${NC}      webapp-testing"
-  echo -e "  ${BOLD}Remote Control:${NC} auto-start on (claude.ai/code or mobile app) — needs Pro/Max /login"
+  echo -e "  ${BOLD}Features:${NC}    Agent teams (experimental), extended thinking, 64k output tokens"
+  echo -e "  ${BOLD}Remote Control:${NC} enable per-session with ${CYAN}/rc${NC} or all sessions via ${CYAN}/config${NC} (Pro/Max)"
+  echo -e "  ${BOLD}Plugins:${NC}     frontend-design, code-review, commit-commands,"
+  echo -e "               security-guidance, context7, superpowers"
+  echo -e "  ${BOLD}Skills:${NC}      webapp-testing (local, Playwright)"
   echo -e "  ${BOLD}Auto-updates:${NC} Sundays 3 AM ET (system) / Daily 4 AM ET (Docker)"
   echo ""
 }
