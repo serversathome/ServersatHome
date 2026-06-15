@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================================
 # Claude Code LXC Deployer for Proxmox
-# Creates a fully provisioned Ubuntu 24.04 LXC container ready for Claude Code
+# Creates a fully provisioned Ubuntu 26.04 LXC container ready for Claude Code
 #
 # Run on your Proxmox host:
 #   curl -fsSL https://raw.githubusercontent.com/serversathome/ServersatHome/main/agentic.sh -o /tmp/agentic.sh && bash /tmp/agentic.sh
@@ -39,14 +39,33 @@ preflight() {
   command -v pveam &>/dev/null || error "pveam not found. Are you running this on a Proxmox host?"
 }
 
+# ── Template Resolution ─────────────────────────────────────────────────────
+resolve_template() {
+  info "Resolving latest Ubuntu 26.04 LXC template from catalog..."
+  pveam update >/dev/null 2>&1 || true
+  local found
+  found=$(pveam available --section system 2>/dev/null \
+            | awk '{print $NF}' \
+            | grep -E '^ubuntu-26\.04-standard' \
+            | sort -V | tail -n1)
+  if [[ -n "$found" ]]; then
+    TEMPLATE="$found"
+    success "Using template: $TEMPLATE"
+  else
+    TEMPLATE="ubuntu-26.04-standard_26.04-1_amd64.tar.zst"
+    warn "No 26.04 template found in catalog; using fallback name: $TEMPLATE"
+    warn "Verify with: pveam available --section system | grep ubuntu-26.04"
+  fi
+}
+
 # ── Configuration ───────────────────────────────────────────────────────────
 get_config() {
   # Find next available CT ID
   local next_id
   next_id=$(pvesh get /cluster/nextid 2>/dev/null || echo "100")
 
-  # Template
-  TEMPLATE="ubuntu-24.04-standard_24.04-2_amd64.tar.zst"
+  # Resolve newest Ubuntu 26.04 template (sets $TEMPLATE)
+  resolve_template
 
   echo -e "${BOLD}Container Configuration${NC}"
   echo "─────────────────────────────────────────────────"
@@ -110,7 +129,7 @@ get_config() {
   [[ "$confirm" =~ ^[Yy]$ ]] || { echo "Aborted."; exit 0; }
 }
 
-# ── Download Ubuntu 24.04 Template ─────────────────────────────────────────
+# ── Download Ubuntu 26.04 Template ─────────────────────────────────────────
 get_template() {
   info "Checking for template: $TEMPLATE"
   if ! pveam list local 2>/dev/null | grep -q "$TEMPLATE"; then
@@ -395,13 +414,13 @@ cat > /project/CLAUDE.md << 'CLAUDEMD'
 # Claude Code Workspace
 
 ## Environment
-- **OS**: Ubuntu 24.04 LXC container on Proxmox
+- **OS**: Ubuntu 26.04 LXC container on Proxmox
 - **Working directory**: /project
 - **Timezone**: America/New_York
 - **User**: root
 
 ## Available Tools
-- **Languages**: Node.js 22 LTS, Python 3.12, Go (latest), Rust (latest)
+- **Languages**: Node.js 22 LTS, Python 3 (system default), Go (latest), Rust (latest)
 - **Package managers**: npm, pip (use --break-system-packages), cargo, go install
 - **Docker**: Docker Engine + Compose plugin, running and ready
 - **Containers**: Watchtower (auto-updates), Code Server (port 8443)
