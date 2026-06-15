@@ -405,8 +405,26 @@ cp -r /tmp/anthropic-skills/skills/webapp-testing /root/.claude/skills/webapp-te
 rm -rf /tmp/anthropic-skills
 cd /root
 
-echo ">>> Installing Playwright for webapp-testing skill..."
-npx -y playwright install --with-deps chromium
+echo ">>> Installing Playwright browser for webapp-testing skill..."
+# Playwright doesn't support Ubuntu 26.04 yet (microsoft/playwright#40117) and
+# hard-errors instead of falling back. Force the ubuntu24.04 build, which runs
+# fine on 26.04's newer glibc. This whole block is non-fatal: a browser-install
+# failure must NEVER abort provisioning (it previously killed everything after
+# it — Docker services, SSH, cron — because the script runs under `set -e`).
+set +e
+export PLAYWRIGHT_HOST_PLATFORM_OVERRIDE="ubuntu24.04"
+if npx -y playwright install --with-deps chromium; then
+  echo "    Playwright chromium installed (ubuntu24.04 build, running on 26.04)"
+elif npx -y playwright install chromium; then
+  echo "    Playwright chromium installed (browser only; some OS deps may be missing)"
+else
+  echo "    [WARN] Playwright browser install failed."
+  echo "    Ubuntu 26.04 isn't supported by Playwright yet (microsoft/playwright#40117)."
+  echo "    Re-run this once support lands, or to retry the 24.04-build workaround:"
+  echo "      PLAYWRIGHT_HOST_PLATFORM_OVERRIDE=ubuntu24.04 npx playwright install --with-deps chromium"
+fi
+unset PLAYWRIGHT_HOST_PLATFORM_OVERRIDE
+set -e
 
 echo ">>> Setting up /project directory..."
 mkdir -p /project
@@ -473,8 +491,6 @@ to confirm what's active.
 - **webapp-testing** (local skill, not a marketplace plugin): Playwright-based
   browser testing for UI verification and debugging
 CLAUDEMD
-
-echo ">>> Installing Claude Code plugins (official marketplace)..."
 
 echo ">>> Configuring SSH..."
 sed -i "s/^#*PermitRootLogin.*/PermitRootLogin yes/" /etc/ssh/sshd_config
