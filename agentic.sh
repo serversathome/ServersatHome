@@ -412,16 +412,18 @@ echo ">>> Installing Playwright browser for webapp-testing skill..."
 # failure must NEVER abort provisioning (it previously killed everything after
 # it — Docker services, SSH, cron — because the script runs under `set -e`).
 set +e
-export PLAYWRIGHT_HOST_PLATFORM_OVERRIDE="ubuntu24.04"
+# The override MUST include the arch suffix — Playwright's build keys are
+# "ubuntu24.04-x64", not "ubuntu24.04". Without "-x64" it can't find a build.
+export PLAYWRIGHT_HOST_PLATFORM_OVERRIDE="ubuntu24.04-x64"
 if npx -y playwright install --with-deps chromium; then
-  echo "    Playwright chromium installed (ubuntu24.04 build, running on 26.04)"
+  echo "    Playwright chromium installed (ubuntu24.04-x64 build, running on 26.04)"
 elif npx -y playwright install chromium; then
   echo "    Playwright chromium installed (browser only; some OS deps may be missing)"
 else
   echo "    [WARN] Playwright browser install failed."
   echo "    Ubuntu 26.04 isn't supported by Playwright yet (microsoft/playwright#40117)."
   echo "    Re-run this once support lands, or to retry the 24.04-build workaround:"
-  echo "      PLAYWRIGHT_HOST_PLATFORM_OVERRIDE=ubuntu24.04 npx playwright install --with-deps chromium"
+  echo "      PLAYWRIGHT_HOST_PLATFORM_OVERRIDE=ubuntu24.04-x64 npx playwright install --with-deps chromium"
 fi
 unset PLAYWRIGHT_HOST_PLATFORM_OVERRIDE
 set -e
