@@ -587,6 +587,16 @@ Wants=network-online.target
 Type=simple
 User=root
 Environment=NODE_ENV=production
+# NODE_ENV=production makes child 'npm install' omit devDependencies, which
+# breaks CloudCLI's in-app plugin installs (their 'npm run build' is 'tsc' and
+# needs typescript/@types/node). Force npm to include dev deps so plugin builds
+# succeed.
+Environment=NPM_CONFIG_INCLUDE=dev
+# CloudCLI's "Install Runtime" (Playwright/Chromium for the Browser feature)
+# hard-fails on Ubuntu 26.04, which Playwright doesn't officially support yet
+# (microsoft/playwright#40117). Same override we use for the webapp-testing
+# skill: force the ubuntu24.04-x64 fallback build, which runs on 26.04's glibc.
+Environment=PLAYWRIGHT_HOST_PLATFORM_OVERRIDE=ubuntu24.04-x64
 Environment=HOME=/root
 Environment=HOST=0.0.0.0
 Environment=SERVER_PORT=3001
