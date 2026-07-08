@@ -631,11 +631,14 @@ cat > /usr/local/bin/agentic-doctor << 'DOCTOR'
 LOG_TAG="[doctor]"
 rc=0
 check() { if eval "$2" >/dev/null 2>&1; then echo "  OK   $1"; else echo "  FAIL $1"; rc=1; fi; }
+# note() is informational only — it never fails the health check. Used for
+# user-actionable states (like "not logged in yet") that aren't container faults.
+note()  { if eval "$2" >/dev/null 2>&1; then echo "  OK   $1"; else echo "  WARN $1"; fi; }
 
 echo "$LOG_TAG $(date '+%Y-%m-%d %H:%M:%S %Z')"
 check "claude binary present"       "command -v claude"
 check "claude reports a version"    "claude --version"
-check "claude credentials present"  "test -s /root/.claude/.credentials.json"
+note  "claude logged in (creds on disk; run 'claude' /login if WARN)" "test -s /root/.claude/.credentials.json"
 check "cloudcli service active"     "systemctl is-active --quiet cloudcli"
 check "UI listening on :3001"       "ss -ltn | grep -q ':3001'"
 check "docker daemon running"       "systemctl is-active --quiet docker"
