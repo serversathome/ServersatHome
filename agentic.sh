@@ -255,13 +255,27 @@ echo ">>> Installing database clients..."
 apt-get install -y -qq \
   postgresql-client redis-tools
 
-echo ">>> Installing Node.js 22.x LTS..."
-curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
+echo ">>> Installing Node.js (latest LTS via NodeSource)..."
+# setup_lts.x tracks the current LTS line, so fresh deploys get the newest
+# *safe* Node automatically (Node 24 today; it rolls to the next LTS on its own
+# when one lands — no script edit needed). We deliberately track LTS, not the
+# odd/Current line (short-lived, not recommended here). apt upgrades keep it
+# patched within the line; a major-version jump stays a deliberate rebuild
+# rather than an unattended 4 a.m. surprise.
+curl -fsSL https://deb.nodesource.com/setup_lts.x | bash -
 apt-get install -y -qq nodejs
+# Quiet flags reused for every provisioning npm install: drop the funding/audit
+# lines and the deprecation warnings that come from these packages' upstream
+# transitive deps (not fixable from here). Scoped to provisioning only — your
+# own installs under /project behave normally.
+NPM_QUIET=(--no-fund --no-audit --loglevel=error)
+# Take npm to its own latest release — the bundled npm lags behind and otherwise
+# prints an "update available" notice on every install.
+npm install -g "${NPM_QUIET[@]}" npm@latest || echo "    [WARN] npm self-update failed; using bundled npm"
 echo "    Node.js $(node --version) / npm $(npm --version)"
 
 echo ">>> Installing global npm packages..."
-npm install -g typescript ts-node eslint prettier
+npm install -g "${NPM_QUIET[@]}" typescript ts-node eslint prettier
 
 echo ">>> Installing Go..."
 GO_VERSION=$(curl -fsSL "https://go.dev/VERSION?m=text" | head -1)
@@ -450,7 +464,7 @@ cat > /project/CLAUDE.md << 'CLAUDEMD'
 - **User**: root
 
 ## Available Tools
-- **Languages**: Node.js 22 LTS, Python 3 (system default), Go (latest), Rust (latest)
+- **Languages**: Node.js (latest LTS), Python 3 (system default), Go (latest), Rust (latest)
 - **Package managers**: npm, pip (use --break-system-packages), cargo, go install
 - **Docker**: Docker Engine + Compose plugin, running and ready
 - **Web UI**: CloudCLI UI (claudecodeui) on port 3001 — chat, file explorer/editor, git, shell
@@ -556,7 +570,7 @@ echo ">>> Installing CloudCLI UI (claudecodeui web front end)..."
 # It ships with its own login/auth (first-run account setup on the login page).
 # Installed from the published npm package (latest, unpinned); the package
 # includes a prebuilt server, so there is no client/server build step here.
-npm install -g @cloudcli-ai/cloudcli \
+npm install -g "${NPM_QUIET[@]}" @cloudcli-ai/cloudcli \
   || echo "    [WARN] CloudCLI UI install failed (needs Node 22+ and build tools for node-pty)"
 CCUI_BIN="$(command -v cloudcli || echo /usr/bin/cloudcli)"
 mkdir -p /root/.cloudcli
@@ -635,17 +649,20 @@ exec >>"$LOG" 2>&1
 echo "==================================================================="
 echo ">>> agentic-update starting: $(date '+%Y-%m-%d %H:%M:%S %Z')"
 
-echo ">>> [1/5] OS packages..."
+echo ">>> [1/6] OS packages (includes Node.js patches within its LTS line)..."
 apt-get update -qq && apt-get upgrade -y -qq && apt-get autoremove -y -qq && apt-get clean -qq
 
-echo ">>> [2/5] Claude Code..."
+echo ">>> [2/6] npm (latest)..."
+npm install -g --no-fund --no-audit --loglevel=error npm@latest || echo "    [WARN] npm self-update failed"
+
+echo ">>> [3/6] Claude Code..."
 curl -fsSL https://claude.ai/install.sh | bash || echo "    [WARN] Claude Code update failed"
 
-echo ">>> [3/5] CloudCLI UI (claudecodeui)..."
-npm install -g @cloudcli-ai/cloudcli@latest || echo "    [WARN] CloudCLI UI update failed"
+echo ">>> [4/6] CloudCLI UI (claudecodeui)..."
+npm install -g --no-fund --no-audit --loglevel=error @cloudcli-ai/cloudcli@latest || echo "    [WARN] CloudCLI UI update failed"
 systemctl restart cloudcli || echo "    [WARN] cloudcli restart failed"
 
-echo ">>> [4/5] Docker images (one-shot Watchtower)..."
+echo ">>> [5/6] Docker images (one-shot Watchtower)..."
 if command -v docker >/dev/null 2>&1 && [ -n "$(docker ps -q 2>/dev/null)" ]; then
   docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
     containrrr/watchtower --run-once --cleanup \
@@ -654,7 +671,7 @@ else
   echo "    (no running containers; skipped)"
 fi
 
-echo ">>> [5/5] Health check..."
+echo ">>> [6/6] Health check..."
 if agentic-doctor; then
   echo ">>> agentic-update finished OK: $(date '+%Y-%m-%d %H:%M:%S %Z')"
 else
@@ -701,6 +718,48 @@ PROVISION_EOF
   rm -f /tmp/provision-${CT_ID}.sh
 }
 
+# ── Write Proxmox Notes ─────────────────────────────────────────────────────
+# Drops a Markdown "card" into the container's Notes panel in the Proxmox UI
+# (rendered as Markdown on PVE 7+). Uses placeholders so the heredoc can stay
+# single-quoted (no accidental expansion of backticks/$ in the Markdown).
+write_notes() {
+  local ct_ip
+  ct_ip=$(pct exec "$CT_ID" -- hostname -I 2>/dev/null | awk '{print $1}')
+  ct_ip="${ct_ip:-<container-ip>}"
+
+  local notes
+  notes=$(cat <<'EOF'
+# 🤖 Claude Code Container
+
+**Web UI (CloudCLI UI):** http://__IP__:3001 — _create a login on first visit_
+**SSH:** `ssh root@__IP__`   |   **Console:** `pct enter __CTID__`
+
+## Start Claude Code
+Log in, then run `claude` (the shell auto-cd's to `/project`).
+
+## Update & health
+- `agentic-update` — one coordinated pass: OS → Claude Code → Web UI → container images → health check
+- `agentic-doctor` — run the health check on its own
+- Auto-runs weekly (Sunday 4 AM ET). Log: `/var/log/agentic-update.log`
+
+## Service & config
+- `systemctl status cloudcli` — the Web UI service (`journalctl -u cloudcli` for logs)
+- Permissions: **auto mode** + secret deny-floor — `/root/.claude/settings.json`
+
+---
+_IP above is the address at deploy time; on DHCP it may change (check with `pct exec __CTID__ -- hostname -I`)._
+EOF
+)
+  notes=${notes//__IP__/$ct_ip}
+  notes=${notes//__CTID__/$CT_ID}
+
+  if pct set "$CT_ID" --description "$notes" >/dev/null 2>&1; then
+    success "Wrote container notes to the Proxmox UI."
+  else
+    warn "Could not set container notes (non-fatal)."
+  fi
+}
+
 # ── Print Summary ─────────────────────────────────────────────────────────
 print_summary() {
   local ct_ip
@@ -728,7 +787,7 @@ print_summary() {
   echo -e "  ${BOLD}Verify plugins:${NC} ${CYAN}claude plugin list${NC}"
   echo ""
   echo -e "  ${BOLD}Installed:${NC}"
-  echo "    • Claude Code (native)      • Node.js 22 LTS"
+  echo "    • Claude Code (native)      • Node.js (latest LTS)"
   echo "    • Python 3 + pip + venv     • Go (latest)"
   echo "    • Rust (via rustup)         • Docker + Compose"
   echo "    • Git, ripgrep, fzf, fd     • Build essentials"
@@ -755,6 +814,7 @@ main() {
   create_container
   start_container
   provision_container
+  write_notes
   print_summary
 }
 
