@@ -1,6 +1,6 @@
 <!-- Banner image -->
 <p align="center">
-  <img src="https://raw.githubusercontent.com/serversathome/ServersatHome/main/serverbanner.jpg" alt="Servers@Home Banner" />
+  <img src="https://raw.githubusercontent.com/serversathome/ServersatHome/main/servers-at-home-github-preview.png" alt="Servers@Home Banner" />
 </p>
 
 <h1 align="center">Servers@Home</h1>
