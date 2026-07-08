@@ -576,6 +576,20 @@ CCUI_BIN="$(command -v cloudcli || echo /usr/bin/cloudcli)"
 mkdir -p /root/.cloudcli
 echo "    CloudCLI UI installed: $("$CCUI_BIN" version 2>/dev/null || echo 'version unknown')"
 
+# Browser feature runtime. CloudCLI detects Playwright via require('playwright')
+# from its GLOBAL package dir, but its in-app "Install Runtime" button installs
+# into the server's cwd (/project) — which require() can't resolve, so the button
+# silently never takes effect. Fix: install Playwright GLOBALLY (resolvable) plus
+# its Chromium using the ubuntu24.04-x64 fallback build (26.04 isn't officially
+# supported by Playwright yet), so the Browser tab is ready with no button click.
+echo ">>> Installing Playwright runtime for CloudCLI Browser feature..."
+export PLAYWRIGHT_HOST_PLATFORM_OVERRIDE=ubuntu24.04-x64
+npm install -g "${NPM_QUIET[@]}" playwright \
+  || echo "    [WARN] global Playwright install failed (CloudCLI Browser feature won't work)"
+playwright install chromium \
+  || echo "    [WARN] Chromium download failed; retry later with: PLAYWRIGHT_HOST_PLATFORM_OVERRIDE=ubuntu24.04-x64 playwright install chromium"
+unset PLAYWRIGHT_HOST_PLATFORM_OVERRIDE
+
 # systemd unit so the UI survives reboots and restarts on failure.
 cat > /etc/systemd/system/cloudcli.service << EOF
 [Unit]
