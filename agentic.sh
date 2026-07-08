@@ -429,9 +429,14 @@ cp -r /tmp/anthropic-skills/skills/webapp-testing /root/.claude/skills/webapp-te
 rm -rf /tmp/anthropic-skills
 cd /root
 
-echo ">>> Installing Playwright browser for webapp-testing skill..."
+echo ">>> Installing Playwright (Python) for the webapp-testing skill..."
+# The webapp-testing skill imports the PYTHON playwright package
+# ("from playwright.sync_api import ..."), so the Node playwright we install for
+# CloudCLI's Browser feature is NOT enough — the pip package must be present too,
+# or the skill dies at import. Both share the same browser cache
+# (~/.cache/ms-playwright), so Chromium is downloaded once for both.
 # Playwright doesn't support Ubuntu 26.04 yet (microsoft/playwright#40117) and
-# hard-errors instead of falling back. Force the ubuntu24.04 build, which runs
+# hard-errors instead of falling back, so force the ubuntu24.04 build, which runs
 # fine on 26.04's newer glibc. This whole block is non-fatal: a browser-install
 # failure must NEVER abort provisioning (it previously killed everything after
 # it — Docker services, SSH, cron — because the script runs under `set -e`).
@@ -439,15 +444,23 @@ set +e
 # The override MUST include the arch suffix — Playwright's build keys are
 # "ubuntu24.04-x64", not "ubuntu24.04". Without "-x64" it can't find a build.
 export PLAYWRIGHT_HOST_PLATFORM_OVERRIDE="ubuntu24.04-x64"
-if npx -y playwright install --with-deps chromium; then
-  echo "    Playwright chromium installed (ubuntu24.04-x64 build, running on 26.04)"
-elif npx -y playwright install chromium; then
+# Make the override durable for interactive sessions too (systemd services read
+# their own Environment=, but 'claude' launched over SSH reads /etc/environment),
+# so the skill can re-install browsers on 26.04 later without hitting the error.
+grep -q PLAYWRIGHT_HOST_PLATFORM_OVERRIDE /etc/environment 2>/dev/null \
+  || echo 'PLAYWRIGHT_HOST_PLATFORM_OVERRIDE=ubuntu24.04-x64' >> /etc/environment
+pip install --break-system-packages -q playwright \
+  && echo "    python playwright package installed" \
+  || echo "    [WARN] pip install playwright failed (webapp-testing skill will error on import)"
+if python3 -m playwright install --with-deps chromium; then
+  echo "    Playwright chromium + OS deps installed (ubuntu24.04-x64 build, running on 26.04)"
+elif python3 -m playwright install chromium; then
   echo "    Playwright chromium installed (browser only; some OS deps may be missing)"
 else
   echo "    [WARN] Playwright browser install failed."
   echo "    Ubuntu 26.04 isn't supported by Playwright yet (microsoft/playwright#40117)."
   echo "    Re-run this once support lands, or to retry the 24.04-build workaround:"
-  echo "      PLAYWRIGHT_HOST_PLATFORM_OVERRIDE=ubuntu24.04-x64 npx playwright install --with-deps chromium"
+  echo "      PLAYWRIGHT_HOST_PLATFORM_OVERRIDE=ubuntu24.04-x64 python3 -m playwright install --with-deps chromium"
 fi
 unset PLAYWRIGHT_HOST_PLATFORM_OVERRIDE
 set -e
