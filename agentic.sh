@@ -311,28 +311,38 @@ echo ">>> Configuring Claude Code settings (permissions + env)..."
 # Remote Control is enabled per-session with /rc or for all sessions via /config
 # (Pro/Max feature), so it can't be pre-baked here.
 mkdir -p /root/.claude
+# Permissions model: auto mode instead of a blanket allow-list.
+#   defaultMode "auto" auto-approves actions but routes them through a
+#   background safety classifier (still blocks rm -rf / , rm -rf ~ , etc.).
+#   Unlike bypassPermissions, auto mode is NOT refused when running as root,
+#   and defaultMode is honored from user settings (~/.claude/settings.json).
+#   The "deny" list applies in EVERY mode (including auto) — it's the hard
+#   floor protecting credentials/secrets and a few destructive commands.
+#   CLAUDE_CODE_ENABLE_AUTO_MODE=1 is required to enable auto mode on Bedrock/
+#   Vertex/Foundry and is a harmless no-op on the Anthropic API (auto is
+#   already the default there).
 cat > /root/.claude/settings.json << 'SETTINGS'
 {
   "$schema": "https://json.schemastore.org/claude-code-settings.json",
   "permissions": {
-    "allow": [
-      "Bash(*)",
-      "Read(*)",
-      "Write(*)",
-      "Edit(*)",
-      "MultiEdit(*)",
-      "WebFetch(*)",
-      "WebSearch(*)",
-      "TodoRead(*)",
-      "TodoWrite(*)",
-      "Grep(*)",
-      "Glob(*)",
-      "LS(*)",
-      "Task(*)",
-      "mcp__*"
+    "defaultMode": "auto",
+    "deny": [
+      "Read(**/.env)",
+      "Read(**/.env.*)",
+      "Read(**/.credentials.json)",
+      "Read(/root/.claude/.credentials.json)",
+      "Read(**/secrets/**)",
+      "Read(**/*.pem)",
+      "Read(**/id_rsa)",
+      "Read(**/id_ed25519)",
+      "Bash(dd:*)",
+      "Bash(mkfs:*)",
+      "Bash(rm -rf /:*)",
+      "Bash(rm -rf ~:*)"
     ]
   },
   "env": {
+    "CLAUDE_CODE_ENABLE_AUTO_MODE": "1",
     "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1",
     "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "64000",
     "MAX_THINKING_TOKENS": "31999"
@@ -443,13 +453,16 @@ cat > /project/CLAUDE.md << 'CLAUDEMD'
 - **Languages**: Node.js 22 LTS, Python 3 (system default), Go (latest), Rust (latest)
 - **Package managers**: npm, pip (use --break-system-packages), cargo, go install
 - **Docker**: Docker Engine + Compose plugin, running and ready
-- **Containers**: Watchtower (auto-updates), Code Server (port 8443)
+- **Web UI**: CloudCLI UI (claudecodeui) on port 3001 — chat, file explorer/editor, git, shell
 - **Search tools**: ripgrep (rg), fd-find (fdfind), fzf
 - **Databases**: PostgreSQL client (psql), Redis client (redis-cli), SQLite3
 
 ## Permissions
-All tools are pre-approved — no permission prompts. Bash, Read, Write, Edit,
-WebFetch, WebSearch, Task, and MCP tools all run without confirmation.
+Permission mode is "auto" (permissions.defaultMode). Actions are auto-approved
+but pass through a background safety classifier that still blocks catastrophic
+commands (rm -rf /, rm -rf ~). A deny floor in ~/.claude/settings.json applies in
+every mode and blocks reading credentials/secrets (.env, *.pem, id_rsa,
+.credentials.json) — do not try to work around it.
 
 ## Agent Teams
 Agent teams are enabled. You can spawn parallel teammates for complex tasks:
@@ -466,8 +479,9 @@ preview), so it only applies once someone signs in interactively.
 
 ## Docker Usage
 Docker compose files should go in /docker/<service-name>/docker-compose.yml.
-Watchtower is already running and will auto-update any containers with
-`restart: unless-stopped`.
+There is no always-on Watchtower daemon. Container images are refreshed one-shot
+by the weekly `agentic-update` run (or on demand: `agentic-update`), so give
+containers you want updated the usual `restart: unless-stopped`.
 All Docker containers in this LXC need `security_opt: [apparmor=unconfined]`.
 
 ## Conventions
@@ -528,60 +542,139 @@ git config --global init.defaultBranch main
 git config --global core.editor nano
 git config --global pull.rebase false
 
-echo ">>> Setting up Docker services..."
-mkdir -p /docker/watchtower
-cat > /docker/watchtower/docker-compose.yml << 'DCOMPOSE'
-services:
-  watchtower:
-    image: containrrr/watchtower
-    container_name: watchtower
-    restart: unless-stopped
-    environment:
-      TZ: America/New_York
-      WATCHTOWER_CLEANUP: "true"
-      WATCHTOWER_INCLUDE_STOPPED: "true"
-      WATCHTOWER_SCHEDULE: "0 0 4 * * *"
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-    security_opt:
-      - apparmor=unconfined
-DCOMPOSE
+echo ">>> Docker ready (no always-on service containers)..."
+# code-server was removed — CloudCLI UI (below) already provides a file
+# explorer/editor, so it was redundant (and dropped its :8443 + hardcoded
+# 'admin' password surface). Watchtower is no longer a scheduled daemon; image
+# updates for any containers YOU create now run one-shot from the coordinated
+# 'agentic-update' script (see below).
 
-mkdir -p /docker/code-server
-cat > /docker/code-server/docker-compose.yml << 'DCOMPOSE2'
-services:
-  code-server:
-    image: lscr.io/linuxserver/code-server:latest
-    container_name: code-server
-    restart: unless-stopped
-    environment:
-      PUID: "0"
-      PGID: "0"
-      TZ: America/New_York
-      PASSWORD: admin
-    volumes:
-      - ./config:/config
-      - /:/config/workspace
-    ports:
-      - 8443:8443
-    security_opt:
-      - apparmor=unconfined
-DCOMPOSE2
+echo ">>> Installing CloudCLI UI (claudecodeui web front end)..."
+# Web front end for Claude Code: chat UI, file explorer/editor, git panel, and a
+# built-in shell, served on :3001. It drives the same `claude` CLI and reads
+# /root/.claude, so it inherits this container's login and auto-mode settings.
+# It ships with its own login/auth (first-run account setup on the login page).
+# Installed from the published npm package (latest, unpinned); the package
+# includes a prebuilt server, so there is no client/server build step here.
+npm install -g @cloudcli-ai/cloudcli \
+  || echo "    [WARN] CloudCLI UI install failed (needs Node 22+ and build tools for node-pty)"
+CCUI_BIN="$(command -v cloudcli || echo /usr/bin/cloudcli)"
+mkdir -p /root/.cloudcli
+echo "    CloudCLI UI installed: $("$CCUI_BIN" version 2>/dev/null || echo 'version unknown')"
 
-cd /docker/watchtower && docker compose up -d
-cd /docker/code-server && docker compose up -d
+# systemd unit so the UI survives reboots and restarts on failure.
+cat > /etc/systemd/system/cloudcli.service << EOF
+[Unit]
+Description=CloudCLI UI (claudecodeui) - web front end for Claude Code
+After=network-online.target docker.service
+Wants=network-online.target
 
-echo ">>> Setting up auto-update cron..."
-cat > /etc/cron.d/system-update << 'CRON'
-# Weekly system update - Sunday 3:00 AM ET
+[Service]
+Type=simple
+User=root
+Environment=NODE_ENV=production
+Environment=HOME=/root
+Environment=HOST=0.0.0.0
+Environment=SERVER_PORT=3001
+Environment=CLAUDE_CLI_PATH=/usr/local/bin/claude
+Environment=DATABASE_PATH=/root/.cloudcli/auth.db
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/root/.local/bin
+WorkingDirectory=/project
+ExecStart=${CCUI_BIN} start
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable cloudcli >/dev/null 2>&1 || true
+systemctl start cloudcli \
+  || echo "    [WARN] cloudcli service failed to start; check 'journalctl -u cloudcli'"
+
+echo ">>> Installing coordinated update tooling (agentic-update / agentic-doctor)..."
+# Single coordinated update pass, modeled on homelabhero's hh-update + hh doctor:
+# OS packages -> Claude Code -> CloudCLI UI -> one-shot Watchtower for any Docker
+# containers -> restart UI -> health check -> log. Re-runnable on demand
+# ('agentic-update'), no container recreation required. Everything tracks latest
+# (unpinned); the post-update health check is the safety net, and results land
+# in /var/log/agentic-update.log.
+
+cat > /usr/local/bin/agentic-doctor << 'DOCTOR'
+#!/usr/bin/env bash
+# Health check for the Claude Code container. Exit 0 = healthy, non-zero = problems.
+LOG_TAG="[doctor]"
+rc=0
+check() { if eval "$2" >/dev/null 2>&1; then echo "  OK   $1"; else echo "  FAIL $1"; rc=1; fi; }
+
+echo "$LOG_TAG $(date '+%Y-%m-%d %H:%M:%S %Z')"
+check "claude binary present"       "command -v claude"
+check "claude reports a version"    "claude --version"
+check "claude credentials present"  "test -s /root/.claude/.credentials.json"
+check "cloudcli service active"     "systemctl is-active --quiet cloudcli"
+check "UI listening on :3001"       "ss -ltn | grep -q ':3001'"
+check "docker daemon running"       "systemctl is-active --quiet docker"
+check "disk under 90% on /"         "test $(df --output=pcent / | tail -1 | tr -dc 0-9) -lt 90"
+
+if [ $rc -eq 0 ]; then echo "$LOG_TAG all checks passed"; else echo "$LOG_TAG one or more checks FAILED"; fi
+exit $rc
+DOCTOR
+chmod +x /usr/local/bin/agentic-doctor
+
+cat > /usr/local/bin/agentic-update << 'UPDATE'
+#!/usr/bin/env bash
+# Coordinated update pass for the Claude Code container.
+#   Run on demand:  agentic-update
+#   Runs weekly via /etc/cron.d/agentic-update. Log: /var/log/agentic-update.log
+# Deliberately NOT 'set -e': one component failing must not abort the rest.
+set -uo pipefail
+export DEBIAN_FRONTEND=noninteractive
+LOG=/var/log/agentic-update.log
+exec >>"$LOG" 2>&1
+echo "==================================================================="
+echo ">>> agentic-update starting: $(date '+%Y-%m-%d %H:%M:%S %Z')"
+
+echo ">>> [1/5] OS packages..."
+apt-get update -qq && apt-get upgrade -y -qq && apt-get autoremove -y -qq && apt-get clean -qq
+
+echo ">>> [2/5] Claude Code..."
+curl -fsSL https://claude.ai/install.sh | bash || echo "    [WARN] Claude Code update failed"
+
+echo ">>> [3/5] CloudCLI UI (claudecodeui)..."
+npm install -g @cloudcli-ai/cloudcli@latest || echo "    [WARN] CloudCLI UI update failed"
+systemctl restart cloudcli || echo "    [WARN] cloudcli restart failed"
+
+echo ">>> [4/5] Docker images (one-shot Watchtower)..."
+if command -v docker >/dev/null 2>&1 && [ -n "$(docker ps -q 2>/dev/null)" ]; then
+  docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+    containrrr/watchtower --run-once --cleanup \
+    || echo "    [WARN] Watchtower one-shot run failed"
+else
+  echo "    (no running containers; skipped)"
+fi
+
+echo ">>> [5/5] Health check..."
+if agentic-doctor; then
+  echo ">>> agentic-update finished OK: $(date '+%Y-%m-%d %H:%M:%S %Z')"
+else
+  echo ">>> agentic-update finished WITH HEALTH-CHECK FAILURES: $(date '+%Y-%m-%d %H:%M:%S %Z')"
+fi
+echo ""
+UPDATE
+chmod +x /usr/local/bin/agentic-update
+
+cat > /etc/cron.d/agentic-update << 'CRON'
+# Weekly coordinated update - Sunday 4:00 AM ET
+# (OS + Claude Code + CloudCLI UI + container images, then a health check)
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
-0 3 * * 0 root apt-get update -qq && apt-get upgrade -y -qq && apt-get autoremove -y -qq && apt-get clean -qq >> /var/log/auto-update.log 2>&1
+0 4 * * 0 root /usr/local/bin/agentic-update
 CRON
-chmod 0644 /etc/cron.d/system-update
+chmod 0644 /etc/cron.d/agentic-update
 
-cat > /etc/logrotate.d/auto-update << 'LOGROTATE'
-/var/log/auto-update.log {
+cat > /etc/logrotate.d/agentic-update << 'LOGROTATE'
+/var/log/agentic-update.log {
     monthly
     rotate 3
     compress
@@ -627,7 +720,7 @@ print_summary() {
   echo -e "  ${BOLD}Connect:${NC}"
   echo -e "    Console: ${CYAN}pct enter $CT_ID${NC}"
   [[ -n "${ct_ip:-}" ]] && echo -e "    SSH:     ${CYAN}ssh root@${ct_ip}${NC}"
-  [[ -n "${ct_ip:-}" ]] && echo -e "    Code:    ${CYAN}http://${ct_ip}:8443${NC} (password: admin)"
+  [[ -n "${ct_ip:-}" ]] && echo -e "    Web UI:  ${CYAN}http://${ct_ip}:3001${NC} (CloudCLI UI — create a login on first visit)"
   echo ""
   echo -e "  ${BOLD}Start Claude Code:${NC}"
   echo -e "    ${CYAN}claude${NC}  (shell auto-cd's to /project on login)"
@@ -639,17 +732,17 @@ print_summary() {
   echo "    • Python 3 + pip + venv     • Go (latest)"
   echo "    • Rust (via rustup)         • Docker + Compose"
   echo "    • Git, ripgrep, fzf, fd     • Build essentials"
-  echo "    • PostgreSQL & Redis CLI    • Watchtower (auto-update containers)"
-  echo "    • Code Server (port 8443)"
+  echo "    • PostgreSQL & Redis CLI    • CloudCLI UI web front end (port 3001)"
   echo ""
-  echo -e "  ${BOLD}Permissions:${NC} All tools pre-approved (no prompts)"
+  echo -e "  ${BOLD}Permissions:${NC} Auto mode (classifier-guarded) + deny floor for secrets"
   echo -e "  ${BOLD}Config:${NC}      ~/.claude/settings.json"
   echo -e "  ${BOLD}Features:${NC}    Agent teams (experimental), extended thinking, 64k output tokens"
   echo -e "  ${BOLD}Remote Control:${NC} enable per-session with ${CYAN}/rc${NC} or all sessions via ${CYAN}/config${NC} (Pro/Max)"
   echo -e "  ${BOLD}Plugins:${NC}     frontend-design, code-review, commit-commands,"
   echo -e "               security-guidance, context7, superpowers"
   echo -e "  ${BOLD}Skills:${NC}      webapp-testing (local, Playwright)"
-  echo -e "  ${BOLD}Auto-updates:${NC} Sundays 3 AM ET (system) / Daily 4 AM ET (Docker)"
+  echo -e "  ${BOLD}Updates:${NC}     Sundays 4 AM ET — coordinated (OS + Claude + UI + containers)"
+  echo -e "               then a health check. Run anytime: ${CYAN}agentic-update${NC} / ${CYAN}agentic-doctor${NC}"
   echo ""
 }
 
