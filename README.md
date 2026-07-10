@@ -103,8 +103,15 @@ If Servers@Home has saved you time or helped your homelab, here's how to give ba
 ---
 
 ## 🌟 Star History
-https://www.star-history.com/?repos=serversathome%2FServersatHome&type=date&legend=top-left
-[![Star History Chart](https://api.star-history.com/svg?repos=serversathome/serversathome&type=Date)](https://www.star-history.com/#serversathome/serversathome&Date)
+## Star History
+
+<a href="https://www.star-history.com/?repos=serversathome%2FServersatHome&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=serversathome/ServersatHome&type=date&theme=dark&legend=top-left&sealed_token=SQiJx_9gJ7JW2kaJWchjUicOsFzszDY6vGI0_5esFCJDwuJgVYlQlNjDljlrLF-ysT1CtrS1IaM-32AVSsN4t9zBjbk5vhL2RblOsqVKablRW5GTo6vM6VkQyXMnuRPIr_TqqYdPNpXWqU2nQ2H1ErGbYa--anWnYtg4I5oXl12zIl5OdupmQnpHWpSg" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=serversathome/ServersatHome&type=date&legend=top-left&sealed_token=SQiJx_9gJ7JW2kaJWchjUicOsFzszDY6vGI0_5esFCJDwuJgVYlQlNjDljlrLF-ysT1CtrS1IaM-32AVSsN4t9zBjbk5vhL2RblOsqVKablRW5GTo6vM6VkQyXMnuRPIr_TqqYdPNpXWqU2nQ2H1ErGbYa--anWnYtg4I5oXl12zIl5OdupmQnpHWpSg" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=serversathome/ServersatHome&type=date&legend=top-left&sealed_token=SQiJx_9gJ7JW2kaJWchjUicOsFzszDY6vGI0_5esFCJDwuJgVYlQlNjDljlrLF-ysT1CtrS1IaM-32AVSsN4t9zBjbk5vhL2RblOsqVKablRW5GTo6vM6VkQyXMnuRPIr_TqqYdPNpXWqU2nQ2H1ErGbYa--anWnYtg4I5oXl12zIl5OdupmQnpHWpSg" />
+ </picture>
+</a>
 
 ---
 
