@@ -103,7 +103,7 @@ If Servers@Home has saved you time or helped your homelab, here's how to give ba
 ---
 
 ## 🌟 Star History
-
+https://www.star-history.com/?repos=serversathome%2FServersatHome&type=date&legend=top-left
 [![Star History Chart](https://api.star-history.com/svg?repos=serversathome/serversathome&type=Date)](https://www.star-history.com/#serversathome/serversathome&Date)
 
 ---
