@@ -312,18 +312,23 @@ CLAUDE_BIN="$(command -v claude || echo /usr/local/bin/claude)"
 echo "    Claude Code installed: $("$CLAUDE_BIN" --version 2>/dev/null || echo 'version unknown')"
 
 echo ">>> Configuring Claude Code settings (permissions + env)..."
-# NOTE: We intentionally do NOT use an "enabledPlugins" block here.
-# In non-interactive / container contexts, plugin auto-install from
-# enabledPlugins is gated behind the interactive trust dialog and is
-# silently ignored. Plugins are installed explicitly below via the
-# `claude plugin` CLI instead.
+# NOTE on enabledPlugins: we DO declare it here. Earlier belief was that
+# enabledPlugins is ignored in non-interactive/container contexts — that's
+# wrong. `claude plugin install X@mkt` installs the plugin but leaves it
+# Status: disabled; the enabled-state lives in enabledPlugins in THIS file
+# (user settings, ~/.claude/settings.json), which IS honored. Without this
+# block every plugin below (including the LSP servers) stays disabled and
+# CloudCLI's /project chat shows only the 1 local skill. Enabled skills show
+# up live after the cloudcli restart — no fresh session needed.
 #
-# Verified keys: alwaysThinkingEnabled (top-level bool) and the three env
-# vars below are all valid current settings. CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS
+# Verified keys (checked against code.claude.com/docs, 2026-07): the env vars
+# below are all valid current settings. CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS
 # must live inside "env" (it's an environment variable, not a top-level key).
-# The old "enableRemoteControl" key was removed — it is NOT a real settings key;
-# Remote Control is enabled per-session with /rc or for all sessions via /config
-# (Pro/Max feature), so it can't be pre-baked here.
+# Removed: CLAUDE_CODE_ENABLE_AUTO_MODE (dead no-op since Claude Code v2.1.207 —
+# auto mode works from permissions.defaultMode alone) and alwaysThinkingEnabled
+# (current models use adaptive thinking; MAX_THINKING_TOKENS still caps the
+# budget). The old "enableRemoteControl" key was never real — Remote Control is
+# enabled per-session with /rc or for all sessions via /config (Pro/Max).
 mkdir -p /root/.claude
 # Permissions model: auto mode instead of a blanket allow-list.
 #   defaultMode "auto" auto-approves actions but routes them through a
@@ -332,9 +337,11 @@ mkdir -p /root/.claude
 #   and defaultMode is honored from user settings (~/.claude/settings.json).
 #   The "deny" list applies in EVERY mode (including auto) — it's the hard
 #   floor protecting credentials/secrets and a few destructive commands.
-#   CLAUDE_CODE_ENABLE_AUTO_MODE=1 is required to enable auto mode on Bedrock/
-#   Vertex/Foundry and is a harmless no-op on the Anthropic API (auto is
-#   already the default there).
+# Env extras: DISABLE_AUTOUPDATER stops Claude's background auto-updater (we
+# self-manage the version via agentic-update, so the background check just
+# risks version drift/races); CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC is the
+# umbrella that silences telemetry/error-reporting/feedback/surveys for a quiet
+# headless box (trade-off: also disables error reporting).
 cat > /root/.claude/settings.json << 'SETTINGS'
 {
   "$schema": "https://json.schemastore.org/claude-code-settings.json",
@@ -356,41 +363,54 @@ cat > /root/.claude/settings.json << 'SETTINGS'
     ]
   },
   "env": {
-    "CLAUDE_CODE_ENABLE_AUTO_MODE": "1",
     "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1",
     "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "64000",
-    "MAX_THINKING_TOKENS": "31999"
+    "MAX_THINKING_TOKENS": "31999",
+    "DISABLE_AUTOUPDATER": "1",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"
   },
-  "alwaysThinkingEnabled": true
+  "enabledPlugins": {
+    "code-review@claude-plugins-official": true,
+    "commit-commands@claude-plugins-official": true,
+    "context7@claude-plugins-official": true,
+    "frontend-design@claude-plugins-official": true,
+    "security-guidance@claude-plugins-official": true,
+    "typescript-lsp@claude-plugins-official": true,
+    "pyright-lsp@claude-plugins-official": true,
+    "gopls-lsp@claude-plugins-official": true,
+    "rust-analyzer-lsp@claude-plugins-official": true,
+    "superpowers@superpowers-marketplace": true
+  }
 }
 SETTINGS
 
 echo ">>> Adding plugin marketplaces..."
 # The official marketplace is auto-registered on first INTERACTIVE launch only,
-# so a non-interactive provisioning run must add it explicitly.
+# so a non-interactive provisioning run must add it explicitly. We use ONLY the
+# first-party marketplace now — the old 'anthropics/claude-code' demo repo
+# (registers as 'claude-code-plugins') ships same-named example copies that
+# shadow the official ones, and boxes were silently landing on those.
 "$CLAUDE_BIN" plugin marketplace add anthropics/claude-plugins-official \
   || echo "    [WARN] could not add claude-plugins-official"
-# Demo/example marketplace (registers as 'claude-code-plugins') — source for
-# frontend-design, code-review, commit-commands, security-guidance examples.
-"$CLAUDE_BIN" plugin marketplace add anthropics/claude-code \
-  || echo "    [WARN] could not add claude-code (demo) marketplace"
+# Refresh the index BEFORE installing — a stale cache makes name@official
+# silently fall through, which is how boxes ended up on demo copies.
+"$CLAUDE_BIN" plugin marketplace update claude-plugins-official \
+  || echo "    [WARN] could not update claude-plugins-official index"
 # Third-party marketplace for Superpowers.
 "$CLAUDE_BIN" plugin marketplace add obra/superpowers-marketplace \
   || echo "    [WARN] could not add superpowers-marketplace"
 
 echo ">>> Installing Claude Code plugins (official CLI)..."
-# Resilient installer: tries the official marketplace first, then the demo
-# marketplace. Non-fatal — a single failed plugin won't abort provisioning.
+# Install pinned to the official marketplace only (no demo fallthrough).
+# Non-fatal — a single failed plugin won't abort provisioning. Enabled-state is
+# declared in settings.json above (enabledPlugins); install just stages files.
 install_plugin() {
   local name="$1"
-  local mkt
-  for mkt in claude-plugins-official claude-code-plugins; do
-    if "$CLAUDE_BIN" plugin install "${name}@${mkt}" 2>/dev/null; then
-      echo "    installed ${name}@${mkt}"
-      return 0
-    fi
-  done
-  echo "    [WARN] could not install plugin: ${name} (check name/marketplace)"
+  if "$CLAUDE_BIN" plugin install "${name}@claude-plugins-official" 2>/dev/null; then
+    echo "    installed ${name}@claude-plugins-official"
+  else
+    echo "    [WARN] could not install plugin: ${name}@claude-plugins-official"
+  fi
   return 0
 }
 
@@ -399,6 +419,12 @@ install_plugin code-review
 install_plugin commit-commands
 install_plugin security-guidance
 install_plugin context7
+# LSP plugins — real-time diagnostics + navigation. Thin wrappers around the
+# language servers installed below; they need the server binary on PATH.
+install_plugin typescript-lsp
+install_plugin pyright-lsp
+install_plugin gopls-lsp
+install_plugin rust-analyzer-lsp
 
 # Superpowers lives in its own marketplace.
 "$CLAUDE_BIN" plugin install superpowers@superpowers-marketplace 2>/dev/null \
@@ -408,6 +434,26 @@ install_plugin context7
 # Sanity check — list what actually landed.
 echo ">>> Installed plugins:"
 "$CLAUDE_BIN" plugin list 2>/dev/null || echo "    (plugin list unavailable)"
+
+echo ">>> Installing language servers (backends for the *-lsp plugins)..."
+# The *-lsp plugins are thin wrappers that shell out to a language server on
+# PATH — they do NOT self-install the binary. Toolchains (Node/Go/Rust) are
+# already installed above, so this just adds the servers. All non-fatal.
+command -v typescript-language-server >/dev/null 2>&1 \
+  || npm install -g "${NPM_QUIET[@]}" typescript-language-server typescript \
+  || echo "    [WARN] typescript-language-server install failed"
+command -v pyright-langserver >/dev/null 2>&1 \
+  || npm install -g "${NPM_QUIET[@]}" pyright \
+  || echo "    [WARN] pyright install failed"
+if [ ! -x /usr/local/bin/gopls ] && [ -x /usr/local/go/bin/go ]; then
+  GOBIN=/usr/local/bin /usr/local/go/bin/go install golang.org/x/tools/gopls@latest \
+    || echo "    [WARN] gopls install failed"
+fi
+if ! command -v rust-analyzer >/dev/null 2>&1 && [ -x "$HOME/.cargo/bin/rustup" ]; then
+  "$HOME/.cargo/bin/rustup" component add rust-analyzer >/dev/null 2>&1 \
+    && ln -sf "$("$HOME/.cargo/bin/rustup" which rust-analyzer 2>/dev/null)" /usr/local/bin/rust-analyzer \
+    || echo "    [WARN] rust-analyzer install failed"
+fi
 
 # ---------------------------------------------------------------------------
 # FALLBACK if the above installs don't persist in your Claude Code version:
@@ -515,17 +561,19 @@ All Docker containers in this LXC need `security_opt: [apparmor=unconfined]`.
 - Prefer creating files over printing long code blocks
 - Use git for version control on all projects in /project/src/
 - When installing Python packages, use: pip install --break-system-packages <package>
-- Extended thinking is always on — use it for complex architectural decisions
+- Thinking is adaptive — the model decides when to think; lean into it for complex work
 
 ## Installed Plugins / Skills
-Plugins are installed via the `claude plugin` CLI at provision time (not via an
-enabledPlugins block, which is ignored in containers). Run `claude plugin list`
+Plugins are staged via the `claude plugin` CLI at provision time and enabled via
+the `enabledPlugins` block in ~/.claude/settings.json. Run `claude plugin list`
 to confirm what's active.
 - **frontend-design**: Production-grade UI with distinctive aesthetics (auto-activates on frontend tasks)
 - **code-review**: Multi-agent PR review with confidence scoring
 - **commit-commands**: Git commit, push, and PR workflows (/commit, /push, /pr)
 - **security-guidance**: Security warnings when editing sensitive files
 - **context7**: Live, version-specific library docs lookup (reduces API hallucinations)
+- **typescript-lsp / pyright-lsp / gopls-lsp / rust-analyzer-lsp**: real-time
+  diagnostics + navigation (backed by the language servers on PATH)
 - **superpowers**: Development workflow framework — brainstorm → plan → implement with TDD
   - /superpowers:brainstorm — Refine ideas before coding
   - /superpowers:write-plan — Create implementation plans
@@ -835,10 +883,10 @@ print_summary() {
   echo ""
   echo -e "  ${BOLD}Permissions:${NC} Auto mode (classifier-guarded) + deny floor for secrets"
   echo -e "  ${BOLD}Config:${NC}      ~/.claude/settings.json"
-  echo -e "  ${BOLD}Features:${NC}    Agent teams (experimental), extended thinking, 64k output tokens"
+  echo -e "  ${BOLD}Features:${NC}    Agent teams (experimental), adaptive thinking, 64k output tokens"
   echo -e "  ${BOLD}Remote Control:${NC} enable per-session with ${CYAN}/rc${NC} or all sessions via ${CYAN}/config${NC} (Pro/Max)"
-  echo -e "  ${BOLD}Plugins:${NC}     frontend-design, code-review, commit-commands,"
-  echo -e "               security-guidance, context7, superpowers"
+  echo -e "  ${BOLD}Plugins:${NC}     frontend-design, code-review, commit-commands, security-guidance,"
+  echo -e "               context7, superpowers, + LSP (typescript/pyright/gopls/rust-analyzer)"
   echo -e "  ${BOLD}Skills:${NC}      webapp-testing (local, Playwright)"
   echo -e "  ${BOLD}Updates:${NC}     Sundays 4 AM ET — coordinated (OS + Claude + UI + containers)"
   echo -e "               then a health check. Run anytime: ${CYAN}agentic-update${NC} / ${CYAN}agentic-doctor${NC}"
