@@ -273,6 +273,13 @@ NPM_QUIET=(--no-fund --no-audit --loglevel=error)
 # prints an "update available" notice on every install.
 npm install -g "${NPM_QUIET[@]}" npm@latest || echo "    [WARN] npm self-update failed; using bundled npm"
 echo "    Node.js $(node --version) / npm $(npm --version)"
+# npm 12+ blocks dependencies' install scripts behind an allowlist (separate from
+# ignore-scripts), so native modules like CloudCLI's better-sqlite3/node-pty/
+# bcrypt never compile and the service crash-loops with no bind on :3001. We just
+# took npm to latest (>=12), so set the allowlist NOW, before any native install
+# below (CloudCLI, Playwright, the language servers). It persists to /root/.npmrc
+# under npm 12+; harmless if npm is still <12.
+npm config set dangerously-allow-all-scripts true 2>/dev/null || true
 
 echo ">>> Installing global npm packages..."
 npm install -g "${NPM_QUIET[@]}" typescript ts-node eslint prettier
@@ -633,6 +640,14 @@ echo ">>> Installing CloudCLI UI (claudecodeui web front end)..."
 # includes a prebuilt server, so there is no client/server build step here.
 npm install -g "${NPM_QUIET[@]}" @cloudcli-ai/cloudcli \
   || echo "    [WARN] CloudCLI UI install failed (needs Node 22+ and build tools for node-pty)"
+# Self-heal in case the native build was still skipped (better-sqlite3 binding
+# missing) — rebuild in place so the service can bind :3001. Gated by the
+# allowlist set right after the npm self-update above.
+CCUI_PKG="$(npm root -g 2>/dev/null)/@cloudcli-ai/cloudcli"
+if [ -d "$CCUI_PKG/node_modules/better-sqlite3" ] && ! ls "$CCUI_PKG/node_modules/better-sqlite3/build/Release/"*.node >/dev/null 2>&1; then
+  echo "    rebuilding CloudCLI native modules (better-sqlite3/node-pty/bcrypt)"
+  ( cd "$CCUI_PKG" && npm rebuild >/dev/null 2>&1 ) || echo "    [WARN] CloudCLI native rebuild failed"
+fi
 CCUI_BIN="$(command -v cloudcli || echo /usr/bin/cloudcli)"
 mkdir -p /root/.cloudcli
 echo "    CloudCLI UI installed: $("$CCUI_BIN" version 2>/dev/null || echo 'version unknown')"
@@ -742,12 +757,27 @@ apt-get update -qq && apt-get upgrade -y -qq && apt-get autoremove -y -qq && apt
 
 echo ">>> [2/6] npm (latest)..."
 npm install -g --no-fund --no-audit --loglevel=error npm@latest || echo "    [WARN] npm self-update failed"
+# npm 12+ blocks dependencies' install scripts behind an allowlist (separate
+# from ignore-scripts), so CloudCLI's native deps (better-sqlite3/node-pty/
+# bcrypt) never compile -> cloudcli crash-loops and nothing binds :3001. Boxes
+# deploy on npm 10 (builds fine) but this weekly run upgrades npm above, so the
+# config MUST be set here -- AFTER npm@latest lands (it only persists to
+# /root/.npmrc under npm 12+) and BEFORE the cloudcli reinstall/rebuild below.
+npm config set dangerously-allow-all-scripts true 2>/dev/null || true
 
 echo ">>> [3/6] Claude Code..."
 curl -fsSL https://claude.ai/install.sh | bash || echo "    [WARN] Claude Code update failed"
 
 echo ">>> [4/6] CloudCLI UI (claudecodeui)..."
 npm install -g --no-fund --no-audit --loglevel=error @cloudcli-ai/cloudcli@latest || echo "    [WARN] CloudCLI UI update failed"
+# Self-heal: if the native build was skipped (better-sqlite3 binding missing),
+# rebuild in place before restart -- else cloudcli loops on "Could not locate
+# the bindings file". npm rebuild is itself gated by the config set above.
+CCUI_PKG="$(npm root -g 2>/dev/null)/@cloudcli-ai/cloudcli"
+if [ -d "$CCUI_PKG/node_modules/better-sqlite3" ] && ! ls "$CCUI_PKG/node_modules/better-sqlite3/build/Release/"*.node >/dev/null 2>&1; then
+  echo "    rebuilding CloudCLI native modules (better-sqlite3/node-pty/bcrypt)"
+  ( cd "$CCUI_PKG" && npm rebuild >/dev/null 2>&1 ) || echo "    [WARN] CloudCLI native rebuild failed"
+fi
 systemctl restart cloudcli || echo "    [WARN] cloudcli restart failed"
 
 echo ">>> [5/6] Docker images (one-shot Watchtower)..."
