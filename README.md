@@ -51,7 +51,6 @@ Topics we cover:
 | 📖 [**Blog**](https://blog.serversatho.me) | Long-form articles and write-ups |
 | 📚 [**Wiki**](https://wiki.serversatho.me) | Quick reference guides and project documentation |
 | 💬 [**Discord**](https://discord.gg/syvCPcRJnR) | Community chat, help, and homelab show-and-tell |
-| 🪐 [**Matrix**](https://chat.serversatho.me/) | Federated chat — Spaces mirror our Discord structure |
 | 💼 [**LinkedIn**](https://www.linkedin.com/company/serversathome/) | Professional updates and homelab tips |
 
 ---
