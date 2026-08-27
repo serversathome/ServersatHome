@@ -19,10 +19,7 @@
     <img src="https://img.shields.io/discord/1120465621554040942?style=social&logo=discord&label=Discord" alt="Discord">
   </a>
   &nbsp;
-  <a href="https://chat.serversatho.me/">
-    <img src="https://img.shields.io/badge/Matrix-Chat-0DBD8B?logo=matrix&logoColor=white" alt="Matrix">
-  </a>
-  &nbsp;
+
   <a href="https://github.com/serversathome">
     <img src="https://img.shields.io/github/stars/serversathome?style=social" alt="GitHub Stars">
   </a>
