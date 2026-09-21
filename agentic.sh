@@ -193,7 +193,7 @@ start_container() {
   info "Waiting for network..."
   local attempts=0
   while ! pct exec "$CT_ID" -- ping -c1 -W2 1.1.1.1 &>/dev/null; do
-    ((attempts++))
+    (( ++attempts ))
     [[ $attempts -lt 30 ]] || error "Container failed to get network after 60s."
     sleep 2
   done
