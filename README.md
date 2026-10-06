@@ -11,18 +11,10 @@
 </p>
 
 <p align="center">
-  <a href="https://youtube.com/@Serversathome">
-    <img src="https://img.shields.io/youtube/channel/subscribers/UCx0ObGO7YJZpPPf6tbHpqPQ?style=social&label=Subscribe" alt="YouTube">
-  </a>
-  &nbsp;
-  <a href="https://discord.gg/syvCPcRJnR">
-    <img src="https://img.shields.io/discord/1120465621554040942?style=social&logo=discord&label=Discord" alt="Discord">
-  </a>
-  &nbsp;
-
-  <a href="https://github.com/serversathome">
-    <img src="https://img.shields.io/github/stars/serversathome?style=social" alt="GitHub Stars">
-  </a>
+  <a href="https://youtube.com/@Serversathome"><img src="https://img.shields.io/badge/YouTube-Subscribe-FF0000?style=for-the-badge&labelColor=1F2328&logo=youtube&logoColor=white" alt="Subscribe on YouTube"></a>
+  <a href="https://discord.gg/syvCPcRJnR"><img src="https://img.shields.io/discord/1120465621554040942?style=for-the-badge&labelColor=1F2328&logo=discord&logoColor=white&label=Discord&color=5865F2" alt="Join the Discord"></a>
+  <a href="https://github.com/serversathome/ServersatHome/stargazers"><img src="https://img.shields.io/github/stars/serversathome/ServersatHome?style=for-the-badge&labelColor=1F2328&logo=github&logoColor=white&label=Stars&color=DAA520" alt="GitHub Stars"></a>
+  <a href="https://wiki.serversatho.me"><img src="https://img.shields.io/badge/Wiki-Docs-1E90FF?style=for-the-badge&labelColor=1F2328&logo=wikidotjs&logoColor=white" alt="Wiki"></a>
 </p>
 
 ---
@@ -68,7 +60,7 @@ Need a hand with your homelab, a TrueNAS or Proxmox migration, container deploym
 
 <p align="center">
   <a href="https://serversatho.me/hire">
-    <img src="https://img.shields.io/badge/Available%20for%20Hire-Get%20in%20Touch-2EA44F?style=for-the-badge" alt="Available for Hire">
+    <img src="https://img.shields.io/badge/Available%20for%20Hire-Get%20in%20Touch-2EA44F?style=for-the-badge&labelColor=1F2328&logo=gmail&logoColor=white" alt="Available for Hire">
   </a>
 </p>
 
@@ -83,17 +75,9 @@ If Servers@Home has saved you time or helped your homelab, here's how to give ba
 - 🛒 [**Shop**](https://buymeacoffee.com/serversathome/extras) — T-shirts and homelab swag
 
 <p align="center">
-  <a href="https://www.patreon.com/serversathome">
-    <img src="https://img.shields.io/badge/Patreon-Support-FF424D?logo=patreon&logoColor=white" alt="Patreon">
-  </a>
-  &nbsp;
-  <a href="https://www.buymeacoffee.com/serversathome">
-    <img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Support-FFDD00?logo=buy-me-a-coffee&logoColor=black" alt="Buy Me A Coffee">
-  </a>
-  &nbsp;
-  <a href="https://buymeacoffee.com/serversathome/extras">
-    <img src="https://img.shields.io/badge/Shop-Swag-1E90FF" alt="Shop">
-  </a>
+  <a href="https://www.patreon.com/serversathome"><img src="https://img.shields.io/badge/Patreon-Support-FF424D?style=for-the-badge&labelColor=1F2328&logo=patreon&logoColor=white" alt="Support on Patreon"></a>
+  <a href="https://www.buymeacoffee.com/serversathome"><img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Donate-FFDD00?style=for-the-badge&labelColor=1F2328&logo=buymeacoffee&logoColor=white" alt="Buy Me a Coffee"></a>
+  <a href="https://buymeacoffee.com/serversathome/extras"><img src="https://img.shields.io/badge/Shop-Swag-1E90FF?style=for-the-badge&labelColor=1F2328&logo=shopify&logoColor=white" alt="Shop"></a>
 </p>
 
 ---
