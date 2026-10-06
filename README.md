@@ -60,7 +60,7 @@ Need a hand with your homelab, a TrueNAS or Proxmox migration, container deploym
 
 <p align="center">
   <a href="https://serversatho.me/hire">
-    <img src="https://img.shields.io/badge/Available%20for%20Hire-Get%20in%20Touch-2EA44F?style=for-the-badge" alt="Available for Hire">
+    <img src="https://img.shields.io/badge/Available%20for%20Hire-Get%20in%20Touch-2EA44F?style=for-the-badge&labelColor=1F2328&logo=gmail&logoColor=white" alt="Available for Hire">
   </a>
 </p>
 
@@ -75,17 +75,9 @@ If Servers@Home has saved you time or helped your homelab, here's how to give ba
 - 🛒 [**Shop**](https://buymeacoffee.com/serversathome/extras) — T-shirts and homelab swag
 
 <p align="center">
-  <a href="https://www.patreon.com/serversathome">
-    <img src="https://img.shields.io/badge/Patreon-Support-FF424D?logo=patreon&logoColor=white" alt="Patreon">
-  </a>
-  &nbsp;
-  <a href="https://www.buymeacoffee.com/serversathome">
-    <img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Support-FFDD00?logo=buy-me-a-coffee&logoColor=black" alt="Buy Me A Coffee">
-  </a>
-  &nbsp;
-  <a href="https://buymeacoffee.com/serversathome/extras">
-    <img src="https://img.shields.io/badge/Shop-Swag-1E90FF" alt="Shop">
-  </a>
+  <a href="https://www.patreon.com/serversathome"><img src="https://img.shields.io/badge/Patreon-Support-FF424D?style=for-the-badge&labelColor=1F2328&logo=patreon&logoColor=white" alt="Support on Patreon"></a>
+  <a href="https://www.buymeacoffee.com/serversathome"><img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Donate-FFDD00?style=for-the-badge&labelColor=1F2328&logo=buymeacoffee&logoColor=white" alt="Buy Me a Coffee"></a>
+  <a href="https://buymeacoffee.com/serversathome/extras"><img src="https://img.shields.io/badge/Shop-Swag-1E90FF?style=for-the-badge&labelColor=1F2328&logo=shopify&logoColor=white" alt="Shop"></a>
 </p>
 
 ---
