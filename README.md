@@ -11,18 +11,10 @@
 </p>
 
 <p align="center">
-  <a href="https://youtube.com/@Serversathome">
-    <img src="https://img.shields.io/youtube/channel/subscribers/UCx0ObGO7YJZpPPf6tbHpqPQ?style=social&label=Subscribe" alt="YouTube">
-  </a>
-  &nbsp;
-  <a href="https://discord.gg/syvCPcRJnR">
-    <img src="https://img.shields.io/discord/1120465621554040942?style=social&logo=discord&label=Discord" alt="Discord">
-  </a>
-  &nbsp;
-
-  <a href="https://github.com/serversathome">
-    <img src="https://img.shields.io/github/stars/serversathome?style=social" alt="GitHub Stars">
-  </a>
+  <a href="https://youtube.com/@Serversathome"><img src="https://img.shields.io/badge/YouTube-Subscribe-FF0000?style=for-the-badge&labelColor=1F2328&logo=youtube&logoColor=white" alt="Subscribe on YouTube"></a>
+  <a href="https://discord.gg/syvCPcRJnR"><img src="https://img.shields.io/discord/1120465621554040942?style=for-the-badge&labelColor=1F2328&logo=discord&logoColor=white&label=Discord&color=5865F2" alt="Join the Discord"></a>
+  <a href="https://github.com/serversathome/ServersatHome/stargazers"><img src="https://img.shields.io/github/stars/serversathome/ServersatHome?style=for-the-badge&labelColor=1F2328&logo=github&logoColor=white&label=Stars&color=DAA520" alt="GitHub Stars"></a>
+  <a href="https://wiki.serversatho.me"><img src="https://img.shields.io/badge/Wiki-Docs-1E90FF?style=for-the-badge&labelColor=1F2328&logo=wikidotjs&logoColor=white" alt="Wiki"></a>
 </p>
 
 ---
