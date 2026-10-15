@@ -1428,5 +1428,5 @@ if [ "${#TODO_LIST[@]}" -gt 0 ]; then
 fi
 echo ""
 echo "  Still manual by design: Prowlarr indexers (your trackers), Bazarr languages"
-echo "  and providers, Qui library scan, and enabling the imported Qui automations."
+echo "  and providers, and the one-time Qui library scan."
 echo "Script completed."
