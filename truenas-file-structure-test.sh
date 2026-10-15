@@ -57,21 +57,37 @@ wait_for() {
 # Prints the response body. The HTTP status goes to a temp file (not a
 # variable) so it survives `x=$(http ...)` command substitutions; read it with
 # http_code / http_ok. Never aborts the script.
+# The body travels through a file (--data-binary @file), never as an argument:
+# the *arr schema bodies run to tens of KB and must reach curl byte for byte.
+# curl's stderr is kept so a transport failure shows up as "no response:
+# curl: (7) ..." instead of a blank status in the messages below.
 HTTP_STATUS_FILE=$(mktemp)
+HTTP_BODY_FILE=$(mktemp)
+HTTP_ERR_FILE=$(mktemp)
 http() {
     local method="$1" url="$2" body="${3-}"
     shift $(( $# < 3 ? $# : 3 ))
     local out
+    : > "$HTTP_ERR_FILE"
     if [ -n "$body" ]; then
-        out=$(curl -sS -m 60 -X "$method" "$url" --data-binary "$body" "$@" -w $'\n%{http_code}' 2>/dev/null)
+        printf '%s' "$body" > "$HTTP_BODY_FILE"
+        out=$(curl -sS -m 120 -X "$method" "$url" --data-binary "@$HTTP_BODY_FILE" "$@" -w $'\n%{http_code}' 2>"$HTTP_ERR_FILE")
     else
-        out=$(curl -sS -m 60 -X "$method" "$url" "$@" -w $'\n%{http_code}' 2>/dev/null)
+        out=$(curl -sS -m 120 -X "$method" "$url" "$@" -w $'\n%{http_code}' 2>"$HTTP_ERR_FILE")
     fi
     printf '%s' "${out##*$'\n'}" > "$HTTP_STATUS_FILE"
     printf '%s' "${out%$'\n'*}"
 }
-http_code() { cat "$HTTP_STATUS_FILE" 2>/dev/null; }
-http_ok()   { [[ "$(http_code)" =~ ^2[0-9][0-9]$ ]]; }
+# http_code prints the status; with no usable status it prints the curl error
+# so the messages read "HTTP no response: curl: (28) Connection timed out".
+http_code() {
+    local code err
+    code=$(cat "$HTTP_STATUS_FILE" 2>/dev/null)
+    if [[ "$code" =~ ^[1-5][0-9][0-9]$ ]]; then printf '%s' "$code"; return; fi
+    err=$(tr -d '\r' < "$HTTP_ERR_FILE" 2>/dev/null | grep -v '^$' | head -1 | cut -c1-160)
+    printf 'no response: %s' "${err:-curl produced no output (status [${code}])}"
+}
+http_ok()   { [[ "$(cat "$HTTP_STATUS_FILE" 2>/dev/null)" =~ ^2[0-9][0-9]$ ]]; }
 
 # jpy '<python expression over d>'  — evaluate against JSON on stdin.
 # Scalars print raw; dicts/lists print as JSON. Empty/invalid input -> "".
@@ -527,7 +543,7 @@ QUI_URL="http://localhost:7476"
 QB_INT="http://qbittorrent:8080"
 
 COOKIE_DIR=$(mktemp -d)
-trap 'rm -rf "$COOKIE_DIR" "$HTTP_STATUS_FILE"' EXIT
+trap 'rm -rf "$COOKIE_DIR" "$HTTP_STATUS_FILE" "$HTTP_BODY_FILE" "$HTTP_ERR_FILE"' EXIT
 
 # ── Shared *arr helpers (Radarr / Sonarr / Prowlarr share one API shape) ────
 # arr_api <base-url> <api-key> <method> <path> [json-body]
@@ -592,9 +608,12 @@ t.update(name="qBittorrent", enable=True, protocol="torrent", priority=1,
          removeCompletedDownloads=True, removeFailedDownloads=True, tags=[])
 t.pop("id", None)
 print(json.dumps(t))') || { todo "$app: qBittorrent not found in the download client schema."; return 1; }
+    # The test is informational. The save uses forceSave so the client lands
+    # even when the test does not pass right now (e.g. the VPN is still up and
+    # coming); the *arr re-tests it on first use.
     arr_api "$base" "$key" POST /api/v3/downloadclient/test "$body" >/dev/null
     http_ok || warn "$app: qBittorrent connection test failed (HTTP $(http_code)); saving anyway, check Settings > Download Clients."
-    arr_api "$base" "$key" POST /api/v3/downloadclient "$body" >/dev/null
+    arr_api "$base" "$key" POST '/api/v3/downloadclient?forceSave=true' "$body" >/dev/null
     if http_ok; then ok "$app: qBittorrent download client added (category '$category')"; else
         todo "$app: could not add the qBittorrent download client (HTTP $(http_code))."; fi
 }
@@ -706,7 +725,7 @@ t.pop("id", None)
 print(json.dumps(t))') || { todo "Prowlarr: $impl not in the applications schema."; return 1; }
     arr_api "$PROWLARR_URL" "$PROWLARR_API_KEY" POST /api/v1/applications/test "$body" >/dev/null
     http_ok || warn "Prowlarr: $impl connection test failed (HTTP $(http_code)); saving anyway."
-    arr_api "$PROWLARR_URL" "$PROWLARR_API_KEY" POST /api/v1/applications "$body" >/dev/null
+    arr_api "$PROWLARR_URL" "$PROWLARR_API_KEY" POST '/api/v1/applications?forceSave=true' "$body" >/dev/null
     if http_ok; then ok "Prowlarr: $impl app added (full sync)"; else todo "Prowlarr: could not add $impl (HTTP $(http_code))."; fi
 }
 
@@ -732,7 +751,7 @@ for f in t["fields"]:
 t.update(name="FlareSolverr", tags=[int(os.environ["TAG_ID"])] if int(os.environ["TAG_ID"]) else [])
 t.pop("id", None)
 print(json.dumps(t))')
-        arr_api "$PROWLARR_URL" "$PROWLARR_API_KEY" POST /api/v1/indexerproxy "$body" >/dev/null
+        arr_api "$PROWLARR_URL" "$PROWLARR_API_KEY" POST '/api/v1/indexerproxy?forceSave=true' "$body" >/dev/null
         if http_ok; then ok "Prowlarr: FlareSolverr proxy added (tag 'flaresolverr')"; else todo "Prowlarr: could not add the FlareSolverr proxy (HTTP $(http_code))."; fi
     fi
 
@@ -799,10 +818,28 @@ configure_profilarr() {
 # profilarr_action <instance-id> <action> <form args...> -> prints JSON result; status via http_code
 # SvelteKit form action, called the way the UI's JS does (x-sveltekit-action)
 # so the answer is JSON ({"type":"success"|"failure"|...}) instead of HTML.
+# Form actions insist on a form-encoded body ("Form actions expect
+# form-encoded data", HTTP 415 otherwise), so even a no-argument action such
+# as syncQualityProfiles sends an empty urlencoded body.
+profilarr_post() {  # profilarr_post <path?/action> <form args...>
+    local path="$1"; shift
+    [ $# -gt 0 ] || set -- --data-raw ''
+    http POST "$PROFILARR_URL$path" "" -b "$PROFILARR_COOKIE" -c "$PROFILARR_COOKIE" \
+        -H "Origin: $PROFILARR_URL" -H 'x-sveltekit-action: true' \
+        -H 'Content-Type: application/x-www-form-urlencoded' "$@"
+}
 profilarr_action() {
     local id="$1" action="$2"; shift 2
-    http POST "$PROFILARR_URL/arr/$id/sync?/$action" "" -b "$PROFILARR_COOKIE" -c "$PROFILARR_COOKIE" \
-        -H "Origin: $PROFILARR_URL" -H 'x-sveltekit-action: true' "$@"
+    profilarr_post "/arr/$id/sync?/$action" "$@"
+}
+# profilarr_automation <instance-name> <what> <path?/action> <form args...>
+# Saves one of the per-Arr automations (drift detection, renames, cleanup)
+# and reports the outcome; the JSON answer carries "type":"success"|"failure".
+profilarr_automation() {
+    local name="$1" what="$2" path="$3" res; shift 3
+    res=$(profilarr_post "$path" "$@")
+    if http_ok && [[ "$res" == *'"type":"success"'* ]]; then ok "Profilarr: $name $what enabled"
+    else warn "Profilarr: could not enable $what for $name (HTTP $(http_code)): $(printf '%s' "$res" | head -c 160)"; fi
 }
 
 # profilarr_sync_wait <instance-name> <section>  (section: qualityProfiles|delayProfiles|mediaManagement)
@@ -830,15 +867,19 @@ else:
 # Sync everything from the auto-linked Dictionarry database to one Arr:
 # all quality profiles (their custom formats come along), the first delay
 # profile, and the first naming / quality-definition / media-settings configs.
+profilarr_instance_id() {  # profilarr_instance_id <Radarr|Sonarr> -> id ("" if not linked)
+    http GET "$PROFILARR_URL/api/v1/arr" "" -b "$PROFILARR_COOKIE" | jpy "next((a['id'] for a in d if a['name']=='$1'), None)"
+}
+
 profilarr_sync_instance() {  # profilarr_sync_instance <Radarr|Sonarr>
     local name="$1" id lists res
-    id=$(http GET "$PROFILARR_URL/api/v1/arr" "" -b "$PROFILARR_COOKIE" | jpy "next((a['id'] for a in d if a['name']=='$name'), None)")
+    id=$(profilarr_instance_id "$name")
     [ -n "$id" ] || { todo "Profilarr: $name is not linked; sync it in the UI."; return 1; }
 
     # The profile/config names live only in the sync page's load data
     # (SvelteKit __data.json, devalue-encoded). Decode it generically.
-    lists=$(http GET "$PROFILARR_URL/arr/$id/sync/__data.json" "" -b "$PROFILARR_COOKIE" | python3 -c '
-import json, sys
+    lists=$(http GET "$PROFILARR_URL/arr/$id/sync/__data.json" "" -b "$PROFILARR_COOKIE" | NAME="$name" python3 -c '
+import json, os, sys
 raw = json.load(sys.stdin)
 SPECIAL = {-1: None, -2: None, -3: float("nan"), -4: float("inf"), -5: float("-inf"), -6: -0.0}
 def hydrate(values, i, memo):
@@ -865,16 +906,22 @@ for node in raw.get("nodes") or []:
 if not found: sys.exit(1)
 db = found[0]
 names = lambda key: [x["name"] for x in (db.get(key) or []) if isinstance(x, dict) and x.get("name")]
-print(json.dumps({"dbId": db["id"], "db": db.get("name"), "qp": names("qualityProfiles"), "dp": names("delayProfiles"),
-                  "naming": names("namingConfigs"), "qdef": names("qualityDefinitionsConfigs"), "media": names("mediaSettingsConfigs")}))' 2>/dev/null)
+# The database ships one delay/naming/etc. config per app ("Radarr", "Sonarr").
+# Prefer the one named after this instance; fall back to the first listed.
+app = os.environ["NAME"].lower()
+def pick(key):
+    xs = names(key)
+    return next((n for n in xs if app in n.lower()), xs[0] if xs else "")
+print(json.dumps({"dbId": db["id"], "db": db.get("name"), "qp": names("qualityProfiles"), "dp": pick("delayProfiles"),
+                  "naming": pick("namingConfigs"), "qdef": pick("qualityDefinitionsConfigs"), "media": pick("mediaSettingsConfigs")}))' 2>/dev/null)
     [ -n "$lists" ] || { todo "Profilarr: could not read the Dictionarry profile list for $name; pick profiles under Arrs > $name > Sync."; return 1; }
     local db_id qp_sel dp_name naming qdef media
     db_id=$(printf '%s' "$lists" | jpy "d['dbId']")
     qp_sel=$(printf '%s' "$lists" | jpy "[{'databaseId': d['dbId'], 'profileName': n} for n in d['qp']]")
-    dp_name=$(printf '%s' "$lists" | jpy "(d['dp'] or [''])[0]")
-    naming=$(printf '%s' "$lists" | jpy "(d['naming'] or [''])[0]")
-    qdef=$(printf '%s' "$lists" | jpy "(d['qdef'] or [''])[0]")
-    media=$(printf '%s' "$lists" | jpy "(d['media'] or [''])[0]")
+    dp_name=$(printf '%s' "$lists" | jpy "d['dp']")
+    naming=$(printf '%s' "$lists" | jpy "d['naming']")
+    qdef=$(printf '%s' "$lists" | jpy "d['qdef']")
+    media=$(printf '%s' "$lists" | jpy "d['media']")
     echo "    Profilarr/$name: $(printf '%s' "$lists" | jpy "len(d['qp'])") quality profiles from '$(printf '%s' "$lists" | jpy "d['db']")', delay '$dp_name', naming '$naming', quality defs '$qdef', media settings '$media'"
 
     # Save selections (scheduled daily at 04:00 so later database updates flow through).
@@ -906,11 +953,31 @@ print(json.dumps({"dbId": db["id"], "db": db.get("name"), "qp": names("qualityPr
             *) warn "Profilarr: $name ${section#sync} still running after 10 min; carrying on" ;;
         esac
     done
+
+}
+
+# Per-Arr automations (wiki sections 4.3 and 4.5), all switched on: drift
+# detection daily after the 04:00 sync, renames (files and folders) daily
+# after that, cleanup weekly. Each page's `save` upserts, so re-runs are safe.
+profilarr_enable_automations() {  # profilarr_enable_automations <Radarr|Sonarr>
+    local name="$1" id
+    id=$(profilarr_instance_id "$name")
+    [ -n "$id" ] || return 1
+    profilarr_automation "$name" "drift detection" "/arr/$id/drift?/save" \
+        --data-urlencode 'enabled=true' --data-urlencode 'cron=0 5 * * *'
+    profilarr_automation "$name" "renames" "/arr/$id/rename?/save" \
+        --data-urlencode 'enabled=true' --data-urlencode 'renameFolders=true' --data-urlencode 'ignoreTag=' \
+        --data-urlencode 'cron=0 6 * * *' --data-urlencode 'summaryNotifications=false'
+    profilarr_automation "$name" "cleanup" "/arr/$id/settings?/updateCleanup" \
+        --data-urlencode 'enabled=1' --data-urlencode 'cron=0 0 * * 0'
 }
 
 profilarr_sync_all() {
     local app
-    for app in Radarr Sonarr; do profilarr_sync_instance "$app"; done
+    for app in Radarr Sonarr; do
+        profilarr_sync_instance "$app"
+        profilarr_enable_automations "$app"
+    done
 }
 
 # ── 7. Jellyfin ─────────────────────────────────────────────────────────────
@@ -1141,7 +1208,10 @@ configure_qui() {
     fi
 
     # Reflink cross-seed mode (ZFS), flat layout, plus reannounce. One PUT.
-    qui_api PUT "/api/instances/$inst" "$(jbuild '{"name": "qbittorrent", "host": "http://qbittorrent:8080", "hasLocalFilesystemAccess": True, "useReflinks": True, "useHardlinks": False, "hardlinkBaseDir": "/media/downloads/crossseed", "hardlinkDirPreset": "flat", "fallbackToRegularMode": False, "reannounceSettings": {"enabled": True, "initialWaitSeconds": 15, "reannounceIntervalSeconds": 7, "maxAgeSeconds": 600, "maxRetries": 50, "aggressive": False, "monitorAll": True, "excludeCategories": False, "categories": [], "excludeTags": False, "tags": [], "excludeTrackers": False, "trackers": []}}')" >/dev/null
+    # The update must carry the login again: Qui stores whatever username the
+    # PUT holds, and an empty one switches the instance to "no login", after
+    # which qBittorrent answers 403 and Qui backs off forever.
+    qui_api PUT "/api/instances/$inst" "$(jbuild '{"name": "qbittorrent", "host": "http://qbittorrent:8080", "username": os.environ["ADMIN_USER"], "password": os.environ["ADMIN_PASS"], "hasLocalFilesystemAccess": True, "useReflinks": True, "useHardlinks": False, "hardlinkBaseDir": "/media/downloads/crossseed", "hardlinkDirPreset": "flat", "fallbackToRegularMode": False, "reannounceSettings": {"enabled": True, "initialWaitSeconds": 15, "reannounceIntervalSeconds": 7, "maxAgeSeconds": 600, "maxRetries": 50, "aggressive": False, "monitorAll": True, "excludeCategories": False, "categories": [], "excludeTags": False, "tags": [], "excludeTrackers": False, "trackers": []}}')" >/dev/null
     http_ok && ok "Qui: reflink cross-seed mode (/media/downloads/crossseed, flat) + reannounce enabled" \
             || warn "Qui: instance settings update returned HTTP $(http_code)"
 
