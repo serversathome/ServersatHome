@@ -190,11 +190,14 @@ start_container() {
   pct start "$CT_ID"
   sleep 3
 
-  info "Waiting for network..."
+  info "Waiting for network (DNS + outbound HTTPS to github.com)..."
+  # Test what provisioning actually needs — name resolution and an outbound TCP
+  # connection — rather than ICMP, which some networks block and which proves
+  # nothing about DNS. bash's /dev/tcp needs no extra packages in the template.
   local attempts=0
-  while ! pct exec "$CT_ID" -- ping -c1 -W2 1.1.1.1 &>/dev/null; do
+  while ! pct exec "$CT_ID" -- bash -c 'getent hosts github.com >/dev/null && timeout 5 bash -c "exec 3<>/dev/tcp/github.com/443"' &>/dev/null; do
     (( ++attempts ))
-    [[ $attempts -lt 30 ]] || error "Container failed to get network after 60s."
+    [[ $attempts -lt 30 ]] || error "Container failed to get network after 60s (check DNS '$CT_DNS', the gateway, and bridge vmbr0)."
     sleep 2
   done
   success "Container is online."
@@ -286,7 +289,9 @@ npm install -g "${NPM_QUIET[@]}" typescript ts-node eslint prettier
 
 echo ">>> Installing Go..."
 GO_VERSION=$(curl -fsSL "https://go.dev/VERSION?m=text" | head -1)
-curl -fsSL "https://go.dev/dl/${GO_VERSION}.linux-amd64.tar.gz" -o /tmp/go.tar.gz
+# Go's tarballs are per-architecture; the host arch decides (amd64 or arm64).
+GO_ARCH=$(dpkg --print-architecture 2>/dev/null || echo amd64)
+curl -fsSL "https://go.dev/dl/${GO_VERSION}.linux-${GO_ARCH}.tar.gz" -o /tmp/go.tar.gz
 rm -rf /usr/local/go
 tar -C /usr/local -xzf /tmp/go.tar.gz
 rm /tmp/go.tar.gz
@@ -328,27 +333,40 @@ echo ">>> Configuring Claude Code settings (permissions + env)..."
 # CloudCLI's /project chat shows only the 1 local skill. Enabled skills show
 # up live after the cloudcli restart — no fresh session needed.
 #
-# Verified keys (checked against code.claude.com/docs, 2026-07): the env vars
-# below are all valid current settings. CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS
-# must live inside "env" (it's an environment variable, not a top-level key).
-# Removed: CLAUDE_CODE_ENABLE_AUTO_MODE (dead no-op since Claude Code v2.1.207 —
-# auto mode works from permissions.defaultMode alone) and alwaysThinkingEnabled
-# (current models use adaptive thinking; MAX_THINKING_TOKENS still caps the
-# budget). The old "enableRemoteControl" key was never real — Remote Control is
-# enabled per-session with /rc or for all sessions via /config (Pro/Max).
+# Verified keys (checked against code.claude.com/docs, 2026-10): everything
+# below is current. CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS must live inside "env"
+# (it's an environment variable, not a top-level key) and agent teams are still
+# experimental/opt-in. Dropped on purpose:
+#   - CLAUDE_CODE_ENABLE_AUTO_MODE: documented as "accepted for compatibility,
+#     no effect" — auto mode works from permissions.defaultMode alone.
+#   - MAX_THINKING_TOKENS / alwaysThinkingEnabled: current models (Fable,
+#     Opus/Sonnet/Haiku 5.x) use adaptive reasoning; a fixed thinking budget has
+#     no effect on them. Use /effort (or "effortLevel") to tune a session.
+#   - CLAUDE_CODE_MAX_OUTPUT_TOKENS: per-model defaults beat a blanket cap.
+#   - CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: it also turns off feature-flag
+#     fetching, which makes Remote Control (/rc) unavailable and stops the
+#     background runs of plugin command sources. Not worth it for quiet logs.
+#   - "enableRemoteControl": never a real key. Remote Control is enabled with
+#     /rc (per session), `claude --rc`, or remoteControlAtStartup via /config.
 mkdir -p /root/.claude
 # Permissions model: auto mode instead of a blanket allow-list.
 #   defaultMode "auto" auto-approves actions but routes them through a
 #   background safety classifier (still blocks rm -rf / , rm -rf ~ , etc.).
-#   Unlike bypassPermissions, auto mode is NOT refused when running as root,
-#   and defaultMode is honored from user settings (~/.claude/settings.json).
-#   The "deny" list applies in EVERY mode (including auto) — it's the hard
-#   floor protecting credentials/secrets and a few destructive commands.
-# Env extras: DISABLE_AUTOUPDATER stops Claude's background auto-updater (we
-# self-manage the version via agentic-update, so the background check just
-# risks version drift/races); CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC is the
-# umbrella that silences telemetry/error-reporting/feedback/surveys for a quiet
-# headless box (trade-off: also disables error reporting).
+#   Unlike bypassPermissions, auto mode is not documented as refused for root,
+#   and defaultMode is honored from USER settings (~/.claude/settings.json) —
+#   it is silently ignored if set in a project .claude/settings.json.
+#   The "deny" list applies in EVERY mode (including auto) and is evaluated
+#   before the classifier — it's the hard floor for credentials/secrets.
+# Deny-rule syntax (permissions docs):
+#   - Read paths: "~/x" = home, "//x" = absolute, "/x" = RELATIVE TO THE
+#     SETTINGS FILE'S DIRECTORY (so a single-slash /root/... never matched the
+#     real credentials file — that's why the home-anchored forms are used).
+#   - Bash: "cmd *" matches the command and its args; "cmd*" (no space) is a
+#     prefix match, so "mkfs*" also catches mkfs.ext4 & friends. ("cmd:*" is an
+#     accepted alias for "cmd *".) Deny rules don't follow a binary by full path
+#     or through `sh -c`; they're a floor, not a sandbox.
+# DISABLE_AUTOUPDATER stops Claude's background auto-updater only; we update
+# deliberately via `claude update` in agentic-update, which still works.
 cat > /root/.claude/settings.json << 'SETTINGS'
 {
   "$schema": "https://json.schemastore.org/claude-code-settings.json",
@@ -358,23 +376,22 @@ cat > /root/.claude/settings.json << 'SETTINGS'
       "Read(**/.env)",
       "Read(**/.env.*)",
       "Read(**/.credentials.json)",
-      "Read(/root/.claude/.credentials.json)",
+      "Read(~/.claude/.credentials.json)",
+      "Read(~/.claude.json)",
+      "Read(~/.cloudcli/auth.db)",
       "Read(**/secrets/**)",
       "Read(**/*.pem)",
       "Read(**/id_rsa)",
       "Read(**/id_ed25519)",
-      "Bash(dd:*)",
-      "Bash(mkfs:*)",
-      "Bash(rm -rf /:*)",
-      "Bash(rm -rf ~:*)"
+      "Bash(dd *)",
+      "Bash(mkfs*)",
+      "Bash(rm -rf / *)",
+      "Bash(rm -rf ~ *)"
     ]
   },
   "env": {
     "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1",
-    "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "64000",
-    "MAX_THINKING_TOKENS": "31999",
-    "DISABLE_AUTOUPDATER": "1",
-    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"
+    "DISABLE_AUTOUPDATER": "1"
   },
   "enabledPlugins": {
     "code-review@claude-plugins-official": true,
@@ -382,11 +399,15 @@ cat > /root/.claude/settings.json << 'SETTINGS'
     "context7@claude-plugins-official": true,
     "frontend-design@claude-plugins-official": true,
     "security-guidance@claude-plugins-official": true,
+    "claude-security@claude-plugins-official": true,
+    "modern-web-guidance@claude-plugins-official": true,
     "typescript-lsp@claude-plugins-official": true,
     "pyright-lsp@claude-plugins-official": true,
     "gopls-lsp@claude-plugins-official": true,
     "rust-analyzer-lsp@claude-plugins-official": true,
-    "superpowers@superpowers-marketplace": true
+    "clangd-lsp@claude-plugins-official": true,
+    "superpowers@superpowers-marketplace": true,
+    "elements-of-style@superpowers-marketplace": true
   }
 }
 SETTINGS
@@ -411,32 +432,35 @@ echo ">>> Installing Claude Code plugins (official CLI)..."
 # Install pinned to the official marketplace only (no demo fallthrough).
 # Non-fatal — a single failed plugin won't abort provisioning. Enabled-state is
 # declared in settings.json above (enabledPlugins); install just stages files.
-install_plugin() {
-  local name="$1"
-  if "$CLAUDE_BIN" plugin install "${name}@claude-plugins-official" 2>/dev/null; then
-    echo "    installed ${name}@claude-plugins-official"
+# --yes: a plugin with a marketplace-declared install command would otherwise
+# wait on a y/n prompt that this non-interactive run can never answer.
+install_plugin() {  # install_plugin <name> <marketplace>
+  local ref="$1@$2"
+  if "$CLAUDE_BIN" plugin install "$ref" --yes 2>/dev/null; then
+    echo "    installed $ref"
   else
-    echo "    [WARN] could not install plugin: ${name}@claude-plugins-official"
+    echo "    [WARN] could not install plugin: $ref"
   fi
   return 0
 }
 
-install_plugin frontend-design
-install_plugin code-review
-install_plugin commit-commands
-install_plugin security-guidance
-install_plugin context7
-# LSP plugins — real-time diagnostics + navigation. Thin wrappers around the
-# language servers installed below; they need the server binary on PATH.
-install_plugin typescript-lsp
-install_plugin pyright-lsp
-install_plugin gopls-lsp
-install_plugin rust-analyzer-lsp
+# Curated plugins. modern-web-guidance fetches its guides via npx at query time,
+# so it needs outbound npm access. LSP plugins give real-time diagnostics +
+# navigation; they are thin wrappers around the language servers installed below
+# and need the server binary on PATH (one per toolchain this box ships, incl.
+# C/C++ via build-essential).
+for p in frontend-design code-review commit-commands security-guidance context7 \
+         claude-security modern-web-guidance \
+         typescript-lsp pyright-lsp gopls-lsp rust-analyzer-lsp clangd-lsp; do
+  install_plugin "$p" claude-plugins-official
+done
 
-# Superpowers lives in its own marketplace.
-"$CLAUDE_BIN" plugin install superpowers@superpowers-marketplace 2>/dev/null \
-  && echo "    installed superpowers@superpowers-marketplace" \
-  || echo "    [WARN] could not install superpowers"
+# Superpowers also appears in the official marketplace, but pinned to a SHA that
+# lags upstream — install from Jesse Vincent's own marketplace so the box tracks
+# current releases. elements-of-style lives only there (pure markdown).
+for p in superpowers elements-of-style; do
+  install_plugin "$p" superpowers-marketplace
+done
 
 # Sanity check — list what actually landed.
 echo ">>> Installed plugins:"
@@ -452,6 +476,9 @@ command -v typescript-language-server >/dev/null 2>&1 \
 command -v pyright-langserver >/dev/null 2>&1 \
   || npm install -g "${NPM_QUIET[@]}" pyright \
   || echo "    [WARN] pyright install failed"
+command -v clangd >/dev/null 2>&1 \
+  || apt-get install -y -qq clangd \
+  || echo "    [WARN] clangd install failed"
 if [ ! -x /usr/local/bin/gopls ] && [ -x /usr/local/go/bin/go ]; then
   GOBIN=/usr/local/bin /usr/local/go/bin/go install golang.org/x/tools/gopls@latest \
     || echo "    [WARN] gopls install failed"
@@ -464,12 +491,13 @@ fi
 
 # ---------------------------------------------------------------------------
 # FALLBACK if the above installs don't persist in your Claude Code version:
-# Headless plugin install has been historically finicky. The container-intended
-# mechanism is the (currently undocumented) CLAUDE_CODE_PLUGIN_SEED_DIR env var,
-# which seeds pre-staged plugins on first launch. If `claude plugin list` above
-# is empty after provisioning, stage the plugin repos into a seed dir and export
-# CLAUDE_CODE_PLUGIN_SEED_DIR=<dir> in /root/.bashrc, or simply run the
-# `claude plugin install` commands above once inside an interactive session.
+# The documented container mechanism is CLAUDE_CODE_PLUGIN_SEED_DIR (env-vars
+# docs): a read-only directory (":"-separated list) whose marketplaces are
+# registered at startup and whose cached plugins are used without re-cloning.
+# If `claude plugin list` above is empty after provisioning, stage the plugin
+# repos into a seed dir and export CLAUDE_CODE_PLUGIN_SEED_DIR=<dir> in
+# /root/.bashrc, or simply run the `claude plugin install` commands above once
+# inside an interactive session.
 # ---------------------------------------------------------------------------
 
 echo ">>> Installing webapp-testing skill (from anthropics/skills)..."
@@ -488,34 +516,25 @@ echo ">>> Installing Playwright (Python) for the webapp-testing skill..."
 # CloudCLI's Browser feature is NOT enough — the pip package must be present too,
 # or the skill dies at import. Both share the same browser cache
 # (~/.cache/ms-playwright), so Chromium is downloaded once for both.
-# Playwright doesn't support Ubuntu 26.04 yet (microsoft/playwright#40117) and
-# hard-errors instead of falling back, so force the ubuntu24.04 build, which runs
-# fine on 26.04's newer glibc. This whole block is non-fatal: a browser-install
-# failure must NEVER abort provisioning (it previously killed everything after
-# it — Docker services, SSH, cron — because the script runs under `set -e`).
+# Playwright supports Ubuntu 26.04 natively since 1.61 (microsoft/playwright#40117
+# is closed), so the old PLAYWRIGHT_HOST_PLATFORM_OVERRIDE=ubuntu24.04-x64 hack
+# is gone and must not be set — it would pull the wrong browser build. This whole
+# block is non-fatal: a browser-install failure must NEVER abort provisioning
+# (it previously killed everything after it — Docker services, SSH, cron —
+# because the script runs under `set -e`).
 set +e
-# The override MUST include the arch suffix — Playwright's build keys are
-# "ubuntu24.04-x64", not "ubuntu24.04". Without "-x64" it can't find a build.
-export PLAYWRIGHT_HOST_PLATFORM_OVERRIDE="ubuntu24.04-x64"
-# Make the override durable for interactive sessions too (systemd services read
-# their own Environment=, but 'claude' launched over SSH reads /etc/environment),
-# so the skill can re-install browsers on 26.04 later without hitting the error.
-grep -q PLAYWRIGHT_HOST_PLATFORM_OVERRIDE /etc/environment 2>/dev/null \
-  || echo 'PLAYWRIGHT_HOST_PLATFORM_OVERRIDE=ubuntu24.04-x64' >> /etc/environment
+unset PLAYWRIGHT_HOST_PLATFORM_OVERRIDE
 pip install --break-system-packages -q playwright \
   && echo "    python playwright package installed" \
   || echo "    [WARN] pip install playwright failed (webapp-testing skill will error on import)"
 if python3 -m playwright install --with-deps chromium; then
-  echo "    Playwright chromium + OS deps installed (ubuntu24.04-x64 build, running on 26.04)"
+  echo "    Playwright chromium + OS deps installed"
 elif python3 -m playwright install chromium; then
   echo "    Playwright chromium installed (browser only; some OS deps may be missing)"
 else
-  echo "    [WARN] Playwright browser install failed."
-  echo "    Ubuntu 26.04 isn't supported by Playwright yet (microsoft/playwright#40117)."
-  echo "    Re-run this once support lands, or to retry the 24.04-build workaround:"
-  echo "      PLAYWRIGHT_HOST_PLATFORM_OVERRIDE=ubuntu24.04-x64 python3 -m playwright install --with-deps chromium"
+  echo "    [WARN] Playwright browser install failed. Retry later with:"
+  echo "      python3 -m playwright install --with-deps chromium"
 fi
-unset PLAYWRIGHT_HOST_PLATFORM_OVERRIDE
 set -e
 
 echo ">>> Setting up /project directory..."
@@ -538,24 +557,32 @@ cat > /project/CLAUDE.md << 'CLAUDEMD'
 - **Databases**: PostgreSQL client (psql), Redis client (redis-cli), SQLite3
 
 ## Permissions
-Permission mode is "auto" (permissions.defaultMode). Actions are auto-approved
-but pass through a background safety classifier that still blocks catastrophic
-commands (rm -rf /, rm -rf ~). A deny floor in ~/.claude/settings.json applies in
-every mode and blocks reading credentials/secrets (.env, *.pem, id_rsa,
-.credentials.json) — do not try to work around it.
+Permission mode is "auto" (permissions.defaultMode in ~/.claude/settings.json).
+Actions are auto-approved but pass through a background safety classifier that
+still blocks catastrophic commands (rm -rf /, rm -rf ~). A deny floor in
+~/.claude/settings.json applies in every mode and blocks reading
+credentials/secrets (.env, *.pem, id_rsa, .credentials.json, ~/.claude.json,
+the CloudCLI auth DB) — do not try to work around it.
 
 ## Agent Teams
-Agent teams are enabled. You can spawn parallel teammates for complex tasks:
+Agent teams are enabled (CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1; still
+experimental). You can spawn parallel teammates for complex tasks:
 - Use agent teams for work that benefits from parallel exploration
-- Use subagents (Task tool) for quick focused work that reports back
-- tmux is installed for split-pane team visualization
+- Use subagents (the Agent tool) for quick focused work that reports back
+- While teams are enabled, a *named* subagent launches as a teammate — leave
+  subagents unnamed when you just want a worker that reports back
+- Teammates run in-process by default; tmux is installed, so set
+  `"teammateMode": "auto"` in ~/.claude/settings.json for split panes
 
 ## Remote Control
-Remote Control lets you steer a live local session from the Claude mobile app or
-web. It is NOT enabled via settings.json — turn it on per session with `/rc`
-(or `claude remote-control`), or for all sessions via `/config` →
-"Enable Remote Control for all sessions". Requires a Pro/Max login (research
-preview), so it only applies once someone signs in interactively.
+Remote Control lets you continue a session running on this box from the Claude
+mobile app or claude.ai/code. Turn it on inside a session with `/remote-control`
+(`/rc`), start a session with `claude --rc`, or run `claude remote-control` as a
+headless server. To connect every session automatically, use `/config` →
+"Enable Remote Control for all sessions" (it saves `remoteControlAtStartup` in
+~/.claude/settings.json). Requires a claude.ai login (Pro/Max/Team/Enterprise;
+API keys don't work), and the first use asks a one-time y/n confirmation, so do
+it from an interactive shell.
 
 ## Docker Usage
 Docker compose files should go in /docker/<service-name>/docker-compose.yml.
@@ -568,7 +595,8 @@ All Docker containers in this LXC need `security_opt: [apparmor=unconfined]`.
 - Prefer creating files over printing long code blocks
 - Use git for version control on all projects in /project/src/
 - When installing Python packages, use: pip install --break-system-packages <package>
-- Thinking is adaptive — the model decides when to think; lean into it for complex work
+- Thinking is adaptive on current models (no fixed budget is configured); use
+  `/effort` to raise or lower effort for a session
 
 ## Installed Plugins / Skills
 Plugins are staged via the `claude plugin` CLI at provision time and enabled via
@@ -578,23 +606,46 @@ to confirm what's active.
 - **code-review**: Multi-agent PR review with confidence scoring
 - **commit-commands**: Git commit, push, and PR workflows (/commit, /push, /pr)
 - **security-guidance**: Security warnings when editing sensitive files
+- **claude-security**: Deeper security review (/security-review style audits)
 - **context7**: Live, version-specific library docs lookup (reduces API hallucinations)
-- **typescript-lsp / pyright-lsp / gopls-lsp / rust-analyzer-lsp**: real-time
-  diagnostics + navigation (backed by the language servers on PATH)
+- **modern-web-guidance**: Current web-platform best practices (fetched via npx at query time)
+- **typescript-lsp / pyright-lsp / gopls-lsp / rust-analyzer-lsp / clangd-lsp**:
+  real-time diagnostics + navigation (backed by the language servers on PATH)
 - **superpowers**: Development workflow framework — brainstorm → plan → implement with TDD
   - /superpowers:brainstorm — Refine ideas before coding
   - /superpowers:write-plan — Create implementation plans
   - /superpowers:execute-plan — Execute plans in batches via subagents
   - Auto-activating skills: test-driven-development, systematic-debugging, verification-before-completion
+- **elements-of-style**: Writing-style guidance for prose, docs, and commit messages
 - **webapp-testing** (local skill, not a marketplace plugin): Playwright-based
   browser testing for UI verification and debugging
 CLAUDEMD
 
 echo ">>> Configuring SSH..."
+# Ubuntu's sshd_config Includes /etc/ssh/sshd_config.d/*.conf from the TOP of the
+# file and the FIRST value of a keyword wins, so a drop-in (cloud-init ships one
+# with PasswordAuthentication no) silently outranks any edit to the main file.
+# Own a drop-in that sorts first instead, and keep the main-file edit for images
+# that predate the Include.
 sed -i "s/^#*PermitRootLogin.*/PermitRootLogin yes/" /etc/ssh/sshd_config
 sed -i "s/^#*PasswordAuthentication.*/PasswordAuthentication yes/" /etc/ssh/sshd_config
-systemctl enable ssh
-systemctl restart ssh
+if grep -qE '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/' /etc/ssh/sshd_config; then
+  mkdir -p /etc/ssh/sshd_config.d
+  cat > /etc/ssh/sshd_config.d/00-agentic.conf <<'SSHD'
+# Managed by agentic.sh. Sorts before any other drop-in, and sshd keeps the first
+# value it sees, so these win over cloud-init's defaults.
+PermitRootLogin yes
+PasswordAuthentication yes
+SSHD
+  chmod 0644 /etc/ssh/sshd_config.d/00-agentic.conf
+fi
+# Never restart into a config sshd rejects — that locks the box out of SSH.
+if sshd -t 2>/dev/null || /usr/sbin/sshd -t 2>/dev/null; then
+  systemctl enable ssh
+  systemctl restart ssh || echo "    [WARN] ssh restart failed (check 'journalctl -u ssh')"
+else
+  echo "    [WARN] sshd config test failed; leaving the running sshd untouched"
+fi
 
 echo ">>> Setting up shell environment..."
 cat >> /root/.bashrc << 'BASHRC'
@@ -655,16 +706,15 @@ echo "    CloudCLI UI installed: $("$CCUI_BIN" version 2>/dev/null || echo 'vers
 # Browser feature runtime. CloudCLI detects Playwright via require('playwright')
 # from its GLOBAL package dir, but its in-app "Install Runtime" button installs
 # into the server's cwd (/project) — which require() can't resolve, so the button
-# silently never takes effect. Fix: install Playwright GLOBALLY (resolvable) plus
-# its Chromium using the ubuntu24.04-x64 fallback build (26.04 isn't officially
-# supported by Playwright yet), so the Browser tab is ready with no button click.
+# silently never takes effect. Fix: install Playwright GLOBALLY (resolvable). The
+# Chromium build is shared with the Python install above (~/.cache/ms-playwright),
+# so this only downloads if that step failed.
 echo ">>> Installing Playwright runtime for CloudCLI Browser feature..."
-export PLAYWRIGHT_HOST_PLATFORM_OVERRIDE=ubuntu24.04-x64
 npm install -g "${NPM_QUIET[@]}" playwright \
   || echo "    [WARN] global Playwright install failed (CloudCLI Browser feature won't work)"
-playwright install chromium \
-  || echo "    [WARN] Chromium download failed; retry later with: PLAYWRIGHT_HOST_PLATFORM_OVERRIDE=ubuntu24.04-x64 playwright install chromium"
-unset PLAYWRIGHT_HOST_PLATFORM_OVERRIDE
+ls -d /root/.cache/ms-playwright/chromium-* >/dev/null 2>&1 \
+  || playwright install chromium \
+  || echo "    [WARN] Chromium download failed; retry later with: playwright install chromium"
 
 # systemd unit so the UI survives reboots and restarts on failure.
 cat > /etc/systemd/system/cloudcli.service << EOF
@@ -682,11 +732,6 @@ Environment=NODE_ENV=production
 # needs typescript/@types/node). Force npm to include dev deps so plugin builds
 # succeed.
 Environment=NPM_CONFIG_INCLUDE=dev
-# CloudCLI's "Install Runtime" (Playwright/Chromium for the Browser feature)
-# hard-fails on Ubuntu 26.04, which Playwright doesn't officially support yet
-# (microsoft/playwright#40117). Same override we use for the webapp-testing
-# skill: force the ubuntu24.04-x64 fallback build, which runs on 26.04's glibc.
-Environment=PLAYWRIGHT_HOST_PLATFORM_OVERRIDE=ubuntu24.04-x64
 Environment=HOME=/root
 Environment=HOST=0.0.0.0
 Environment=SERVER_PORT=3001
@@ -728,11 +773,18 @@ note()  { if eval "$2" >/dev/null 2>&1; then echo "  OK   $1"; else echo "  WARN
 echo "$LOG_TAG $(date '+%Y-%m-%d %H:%M:%S %Z')"
 check "claude binary present"       "command -v claude"
 check "claude reports a version"    "claude --version"
+check "settings.json is valid JSON" "python3 -m json.tool /root/.claude/settings.json"
 note  "claude logged in (creds on disk; run 'claude' /login if WARN)" "test -s /root/.claude/.credentials.json"
 check "cloudcli service active"     "systemctl is-active --quiet cloudcli"
 check "UI listening on :3001"       "ss -ltn | grep -q ':3001'"
 check "docker daemon running"       "systemctl is-active --quiet docker"
-check "disk under 90% on /"         "test $(df --output=pcent / | tail -1 | tr -dc 0-9) -lt 90"
+# Parse df once; an unreadable df is a "can't tell", not a failed box.
+DISK_PCT=$(df --output=pcent / 2>/dev/null | tail -1 | tr -dc 0-9)
+if [ -n "$DISK_PCT" ]; then
+  check "disk under 90% on /"       "[ $DISK_PCT -lt 90 ]"
+else
+  echo "  WARN could not read disk usage for /"
+fi
 
 if [ $rc -eq 0 ]; then echo "$LOG_TAG all checks passed"; else echo "$LOG_TAG one or more checks FAILED"; fi
 exit $rc
@@ -766,7 +818,15 @@ npm install -g --no-fund --no-audit --loglevel=error npm@latest || echo "    [WA
 npm config set dangerously-allow-all-scripts true 2>/dev/null || true
 
 echo ">>> [3/6] Claude Code..."
-curl -fsSL https://claude.ai/install.sh | bash || echo "    [WARN] Claude Code update failed"
+# `claude update` is the documented manual update path for a native install
+# (DISABLE_AUTOUPDATER only stops the background check; `update` still works and
+# honors the autoUpdatesChannel / minimumVersion settings). Fall back to
+# re-running the installer when claude is missing or too old to have `update`.
+if command -v claude >/dev/null 2>&1 && claude update; then
+  echo "    Claude Code: $(claude --version 2>/dev/null || echo 'version unknown')"
+else
+  curl -fsSL https://claude.ai/install.sh | bash || echo "    [WARN] Claude Code update failed"
+fi
 
 echo ">>> [4/6] CloudCLI UI (claudecodeui)..."
 npm install -g --no-fund --no-audit --loglevel=error @cloudcli-ai/cloudcli@latest || echo "    [WARN] CloudCLI UI update failed"
@@ -913,10 +973,11 @@ print_summary() {
   echo ""
   echo -e "  ${BOLD}Permissions:${NC} Auto mode (classifier-guarded) + deny floor for secrets"
   echo -e "  ${BOLD}Config:${NC}      ~/.claude/settings.json"
-  echo -e "  ${BOLD}Features:${NC}    Agent teams (experimental), adaptive thinking, 64k output tokens"
-  echo -e "  ${BOLD}Remote Control:${NC} enable per-session with ${CYAN}/rc${NC} or all sessions via ${CYAN}/config${NC} (Pro/Max)"
-  echo -e "  ${BOLD}Plugins:${NC}     frontend-design, code-review, commit-commands, security-guidance,"
-  echo -e "               context7, superpowers, + LSP (typescript/pyright/gopls/rust-analyzer)"
+  echo -e "  ${BOLD}Features:${NC}    Agent teams (experimental), adaptive thinking/effort (tune with ${CYAN}/effort${NC})"
+  echo -e "  ${BOLD}Remote Control:${NC} ${CYAN}/rc${NC} in a session, ${CYAN}claude --rc${NC}, or all sessions via ${CYAN}/config${NC} (claude.ai login)"
+  echo -e "  ${BOLD}Plugins:${NC}     frontend-design, code-review, commit-commands, security-guidance, claude-security,"
+  echo -e "               context7, modern-web-guidance, superpowers, elements-of-style,"
+  echo -e "               + LSP (typescript/pyright/gopls/rust-analyzer/clangd)"
   echo -e "  ${BOLD}Skills:${NC}      webapp-testing (local, Playwright)"
   echo -e "  ${BOLD}Updates:${NC}     Sundays 4 AM ET — coordinated (OS + Claude + UI + containers)"
   echo -e "               then a health check. Run anytime: ${CYAN}agentic-update${NC} / ${CYAN}agentic-doctor${NC}"
