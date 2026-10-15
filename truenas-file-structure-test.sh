@@ -588,17 +588,62 @@ arr_add_root_folder() {
         todo "$app: could not add root folder $path (HTTP $(http_code)); add it in Settings > Media Management."; fi
 }
 
+# arr_errors — turn an *arr 400 body ([{propertyName, errorMessage}, ...])
+# into one line for the messages; anything else is shown as-is, trimmed.
+arr_errors() {
+    printf '%s' "$1" | python3 -c '
+import json, sys
+raw = sys.stdin.read()
+try:
+    d = json.loads(raw)
+    if isinstance(d, list) and d and isinstance(d[0], dict) and "errorMessage" in d[0]:
+        print("; ".join("%s: %s" % (e.get("propertyName", ""), e.get("errorMessage", "")) for e in d)); sys.exit(0)
+except Exception:
+    pass
+print(raw.strip()[:240])'
+}
+
+# qb_diagnose <app> — when <app> cannot talk to qBittorrent, show why: a reach
+# probe and ONE login probe from inside the <app> container (qBittorrent bans
+# an IP after 5 failed logins, so the login probe runs once per script run),
+# plus the WebUI lines from qBittorrent's own log.
+QB_LOGIN_PROBED=""
+qb_diagnose() {
+    local app="$1" out log
+    if docker exec "$app" curl --version >/dev/null 2>&1; then
+        out=$(docker exec "$app" curl -sS -m 10 -o /dev/null -w '%{http_code}' "$QB_INT/api/v2/app/webapiVersion" 2>&1 | tail -c 160)
+        echo "    probe: GET $QB_INT/api/v2/app/webapiVersion from inside '$app' -> $out  (403 = reachable, login needed; 000 = unreachable)"
+        if [ -z "$QB_LOGIN_PROBED" ]; then
+            QB_LOGIN_PROBED=1
+            out=$(docker exec "$app" curl -sS -m 10 -w ' [HTTP %{http_code}]' --data-urlencode "username=$ADMIN_USER" --data-urlencode "password=$ADMIN_PASS" "$QB_INT/api/v2/auth/login" 2>&1 | tail -c 160)
+            echo "    probe: login as $ADMIN_USER from inside '$app' -> $out  (Ok. = good; Fails. = wrong password; 403 = IP banned for 1h)"
+        fi
+    else
+        echo "    probe: no curl inside '$app'; cannot test the path to qBittorrent from there"
+    fi
+    log=$(find "/mnt/$CONFIG_POOL/configs/qbittorrent" -name 'qbittorrent.log' 2>/dev/null | head -1)
+    if [ -n "$log" ]; then
+        echo "    qBittorrent log, last WebUI lines:"
+        grep -iE 'webui|webapi|banned|host header' "$log" | tail -5 | sed 's/^/      /'
+    fi
+}
+
 # arr_add_qbittorrent <app> <base-url> <api-key> <category-field> <category>
 # Builds the client from the app's own schema so field names stay correct.
+# The *arr runs its connection test on save as well (forceSave only waives
+# warnings), so a client whose test fails cannot be stored: the container
+# name is tried first, then the TrueNAS LAN address through the published
+# port as a fallback, and the real error is printed either way.
 arr_add_qbittorrent() {
-    local app="$1" base="$2" key="$3" cat_field="$4" category="$5" have schema body
+    local app="$1" base="$2" key="$3" cat_field="$4" category="$5" have schema body res host
     have=$(arr_api "$base" "$key" GET /api/v3/downloadclient | jpy "[c['implementation'] for c in d]")
     if [[ "$have" == *'"QBittorrent"'* ]]; then ok "$app: qBittorrent download client already present"; return 0; fi
     schema=$(arr_api "$base" "$key" GET /api/v3/downloadclient/schema)
-    body=$(printf '%s' "$schema" | CAT_FIELD="$cat_field" CATEGORY="$category" python3 -c '
+    for host in qbittorrent "$HOST_IP"; do
+        body=$(printf '%s' "$schema" | QB_HOST="$host" CAT_FIELD="$cat_field" CATEGORY="$category" python3 -c '
 import json, os, sys
 t = next(x for x in json.load(sys.stdin) if x.get("implementation") == "QBittorrent")
-vals = {"host": "qbittorrent", "port": 8080, "useSsl": False, "urlBase": "",
+vals = {"host": os.environ["QB_HOST"], "port": 8080, "useSsl": False, "urlBase": "",
         "username": os.environ["ADMIN_USER"], "password": os.environ["ADMIN_PASS"],
         os.environ["CAT_FIELD"]: os.environ["CATEGORY"]}
 for f in t["fields"]:
@@ -608,22 +653,43 @@ t.update(name="qBittorrent", enable=True, protocol="torrent", priority=1,
          removeCompletedDownloads=True, removeFailedDownloads=True, tags=[])
 t.pop("id", None)
 print(json.dumps(t))') || { todo "$app: qBittorrent not found in the download client schema."; return 1; }
-    # The test is informational. The save uses forceSave so the client lands
-    # even when the test does not pass right now (e.g. the VPN is still up and
-    # coming); the *arr re-tests it on first use.
-    arr_api "$base" "$key" POST /api/v3/downloadclient/test "$body" >/dev/null
-    http_ok || warn "$app: qBittorrent connection test failed (HTTP $(http_code)); saving anyway, check Settings > Download Clients."
-    arr_api "$base" "$key" POST '/api/v3/downloadclient?forceSave=true' "$body" >/dev/null
-    if http_ok; then ok "$app: qBittorrent download client added (category '$category')"; else
-        todo "$app: could not add the qBittorrent download client (HTTP $(http_code))."; fi
+        res=$(arr_api "$base" "$key" POST /api/v3/downloadclient/test "$body")
+        http_ok && break
+        warn "$app: qBittorrent connection test via '$host' failed (HTTP $(http_code)): $(arr_errors "$res")"
+        [ "$host" = qbittorrent ] && qb_diagnose "$app"
+        body=""
+    done
+    if [ -z "$body" ]; then
+        todo "$app: qBittorrent download client not added: the connection test fails via the container name and via $HOST_IP (see the probes above). Add it in Settings > Download Clients once qBittorrent is reachable."
+        return 1
+    fi
+    res=$(arr_api "$base" "$key" POST '/api/v3/downloadclient?forceSave=true' "$body")
+    if http_ok; then
+        ok "$app: qBittorrent download client added (host '$host', category '$category')"
+        [ "$host" = qbittorrent ] || warn "$app: the container name 'qbittorrent' did not work from $app; the client uses the host address $host instead."
+    else
+        todo "$app: could not add the qBittorrent download client (HTTP $(http_code)): $(arr_errors "$res")"
+    fi
 }
 
 # ── 1. qBittorrent ──────────────────────────────────────────────────────────
-# hotio's VPN firewall only trusts the LAN and its own Docker network, so talk
-# to the WebUI from INSIDE the container (hotio's base image ships curl). Fall
-# back to the published port if that is not possible.
+# The setup calls go to the WebUI from INSIDE the container (hotio's image
+# ships curl), which works even while the VPN firewall is still settling; the
+# published port is the fallback.
+#
+# Two traps, both hit on real runs:
+#  * A login from loopback proves NOTHING about the password: with "bypass
+#    authentication for clients on localhost" qBittorrent answers "Ok." to any
+#    password. The login is therefore verified from the host through the
+#    published port on every run (there the source is the Docker bridge and
+#    the check is real) and set whenever that check fails.
+#  * 5 failed logins ban the client IP for an hour (in memory). After the
+#    password is (re)set the container is restarted once so Radarr, Sonarr
+#    and Qui, which may have been banned by then, start clean.
 QB_MODE="host"
-QB_COOKIE="$COOKIE_DIR/qb.cookie"
+# The cookie file must exist on the same filesystem curl runs on; /tmp is
+# present both on the host and inside the container.
+QB_COOKIE="/tmp/truenas-setup-qb.cookie"
 qb_curl() {
     if [ "$QB_MODE" = "exec" ]; then docker exec qbittorrent curl -sS -m 30 "$@"
     else curl -sS -m 30 "$@"; fi
@@ -631,6 +697,13 @@ qb_curl() {
 qb_up()    { [ "$(qb_curl -o /dev/null -w '%{http_code}' "$QB_URL/" 2>/dev/null)" = "200" ]; }
 qb_login() { [ "$(qb_curl -c "$QB_COOKIE" --data-urlencode "username=$1" --data-urlencode "password=$2" "$QB_URL/api/v2/auth/login" 2>/dev/null)" = "Ok." ]; }
 qb_post()  { qb_curl -b "$QB_COOKIE" "$@"; }   # qb_post <form args...> <url>
+qb_code()  { qb_post -o /dev/null -w '%{http_code}' "$@" 2>/dev/null; }   # HTTP status of a logged-in call
+# qb_login_from_host <user> <pass> -> "Ok." | "Fails." | "<error> [HTTP code]"
+# A real credential check: the request enters through the published port.
+qb_login_from_host() {
+    curl -sS -m 15 -w ' [HTTP %{http_code}]' --data-urlencode "username=$1" --data-urlencode "password=$2" "$QB_URL/api/v2/auth/login" 2>&1 | tail -c 120
+}
+qb_pref() { printf '%s' "$1" | jpy "d.get('$2')"; }
 
 configure_qbittorrent() {
     info "[1/10] qBittorrent"
@@ -640,36 +713,63 @@ configure_qbittorrent() {
     wait_for "qBittorrent WebUI (needs the VPN tunnel up)" 300 qb_up \
         || { todo "qBittorrent never came up. Check the VPN config: docker logs qbittorrent"; return 1; }
 
-    # Careful: 5 failed logins ban the client IP for an hour, so try at most 2.
-    if qb_login "$ADMIN_USER" "$ADMIN_PASS"; then
-        ok "qBittorrent: already using $ADMIN_USER / $ADMIN_PASS"
-    else
-        local tmp_pw
+    # 1. A session for the setup calls (loopback; may be a bypass session).
+    local tmp_pw
+    if ! qb_login "$ADMIN_USER" "$ADMIN_PASS"; then
         tmp_pw=$(docker logs qbittorrent 2>&1 | grep -oP 'temporary password is provided for this session: \K\S+' | tail -1)
         [ -n "$tmp_pw" ] || { todo "qBittorrent: no temporary password in the logs and $ADMIN_USER/$ADMIN_PASS did not work; set the WebUI password manually."; return 1; }
         qb_login "admin" "$tmp_pw" || { todo "qBittorrent: login with the temporary password failed; set the WebUI password manually."; return 1; }
-        qb_post --data-urlencode "json=$(jbuild '{"web_ui_username": os.environ["ADMIN_USER"], "web_ui_password": os.environ["ADMIN_PASS"]}')" \
-            "$QB_URL/api/v2/app/setPreferences" >/dev/null
-        qb_login "$ADMIN_USER" "$ADMIN_PASS" \
-            || { todo "qBittorrent: could not log in with the new password; check the WebUI."; return 1; }
-        ok "qBittorrent: WebUI login set to $ADMIN_USER / $ADMIN_PASS"
+    fi
+    local prefs
+    prefs=$(qb_post "$QB_URL/api/v2/app/preferences" 2>/dev/null)
+    echo "    qBittorrent WebUI settings: bypass_local_auth=$(qb_pref "$prefs" bypass_local_auth) host_header_validation=$(qb_pref "$prefs" web_ui_host_header_validation_enabled) csrf=$(qb_pref "$prefs" web_ui_csrf_protection_enabled) max_auth_fail=$(qb_pref "$prefs" web_ui_max_auth_fail_count) ban=$(qb_pref "$prefs" web_ui_ban_duration)s"
+
+    # 2. Is the login already right? One attempt from the host (counts toward
+    #    the host's 5-strike limit, so only one).
+    local verify code
+    verify=$(qb_login_from_host "$ADMIN_USER" "$ADMIN_PASS")
+    if [[ "$verify" == Ok.* ]]; then
+        ok "qBittorrent: WebUI login $ADMIN_USER / $ADMIN_PASS verified from outside the container"
+    else
+        echo "    qBittorrent: login from the host answered '$verify'; setting the WebUI login now."
+        code=$(qb_code --data-urlencode "json=$(jbuild '{"web_ui_username": os.environ["ADMIN_USER"], "web_ui_password": os.environ["ADMIN_PASS"]}')" "$QB_URL/api/v2/app/setPreferences")
+        [ "$code" = "200" ] || { todo "qBittorrent: setPreferences for the WebUI login returned HTTP $code; set $ADMIN_USER / $ADMIN_PASS in Tools > Options > WebUI."; return 1; }
+        # 3. Restart: flushes the new login to disk and clears the in-memory
+        #    IP bans earlier failed logins (Radarr, Sonarr, Qui, you) have
+        #    collected. The VPN tunnel comes back on its own.
+        sleep 5
+        echo "    qBittorrent: restarting the container to clear login bans..."
+        docker restart qbittorrent >/dev/null 2>&1
+        wait_for "qBittorrent WebUI after the restart" 300 qb_up \
+            || { todo "qBittorrent did not come back after the restart: docker logs qbittorrent"; return 1; }
+        verify=$(qb_login_from_host "$ADMIN_USER" "$ADMIN_PASS")
+        case "$verify" in
+            Ok.*)    ok "qBittorrent: WebUI login set to $ADMIN_USER / $ADMIN_PASS (verified from outside the container)" ;;
+            Fails.*) todo "qBittorrent: the WebUI still rejects $ADMIN_USER / $ADMIN_PASS from outside the container; set it in Tools > Options > WebUI. Radarr, Sonarr and Qui cannot log in until then."; return 1 ;;
+            *)       todo "qBittorrent: port 8080 not reachable from the TrueNAS host ($verify); check VPN_LAN_NETWORK and: docker logs qbittorrent"; return 1 ;;
+        esac
+        qb_login "$ADMIN_USER" "$ADMIN_PASS" || { todo "qBittorrent: could not log back in after the restart; check the WebUI."; return 1; }
     fi
 
     # Save paths per wiki.serversatho.me/en/Folder-Structure: completed downloads
     # in /media/downloads (one subfolder per category via Automatic Torrent
     # Management), incomplete ones and .torrent files in /media/downloads/torrent.
-    qb_post --data-urlencode 'json={"save_path":"/media/downloads","temp_path_enabled":true,"temp_path":"/media/downloads/torrent","export_dir":"/media/downloads/torrent","auto_tmm_enabled":true,"torrent_content_layout":"Original"}' \
-        "$QB_URL/api/v2/app/setPreferences" >/dev/null && ok "qBittorrent: save paths set (/media/downloads, incomplete in /media/downloads/torrent)"
+    code=$(qb_code --data-urlencode 'json={"save_path":"/media/downloads","temp_path_enabled":true,"temp_path":"/media/downloads/torrent","export_dir":"/media/downloads/torrent","auto_tmm_enabled":true,"torrent_content_layout":"Original"}' \
+        "$QB_URL/api/v2/app/setPreferences")
+    if [ "$code" = "200" ]; then ok "qBittorrent: save paths set (/media/downloads, incomplete in /media/downloads/torrent)"; else
+        todo "qBittorrent: could not set the save paths (HTTP $code); set them in Tools > Options > Downloads."; fi
 
-    local cat code
+    local cat
     for cat in radarr sonarr; do
-        code=$(qb_post -o /dev/null -w '%{http_code}' --data-urlencode "category=$cat" --data-urlencode "savePath=/media/downloads/$cat" "$QB_URL/api/v2/torrents/createCategory")
+        code=$(qb_code --data-urlencode "category=$cat" --data-urlencode "savePath=/media/downloads/$cat" "$QB_URL/api/v2/torrents/createCategory")
         case "$code" in
             200) ok "qBittorrent: category '$cat' -> /media/downloads/$cat" ;;
             409) ok "qBittorrent: category '$cat' already exists" ;;
             *)   warn "qBittorrent: could not create category '$cat' (HTTP $code)" ;;
         esac
     done
+    [ "$QB_MODE" = "exec" ] && docker exec qbittorrent rm -f "$QB_COOKIE" >/dev/null 2>&1
+    rm -f "$QB_COOKIE"
 }
 
 # ── 2/3. Radarr and Sonarr ──────────────────────────────────────────────────
@@ -942,18 +1042,21 @@ print(json.dumps({"dbId": db["id"], "db": db.get("name"), "qp": names("qualityPr
 
     # Run each sync now and wait; quality profiles must finish before Seerr
     # picks a profile later.
-    local section
+    local section sec
     for section in syncQualityProfiles syncDelayProfiles syncMediaManagement; do
         res=$(profilarr_action "$id" "$section")
         if ! http_ok; then warn "Profilarr: $section for $name returned HTTP $(http_code): $(printf '%s' "$res" | head -c 200)"; continue; fi
-        case $(profilarr_sync_wait "$name" "${section#sync}" ; echo $?) in
-            0) ok "Profilarr: $name ${section#sync} synced" ;;
-            1) todo "Profilarr: $name ${section#sync} sync FAILED; check Arrs > $name in the UI." ;;
-            2) warn "Profilarr: $name ${section#sync} queued (status not readable; check the UI)" ;;
-            *) warn "Profilarr: $name ${section#sync} still running after 10 min; carrying on" ;;
+        # The status API spells the sections qualityProfiles / delayProfiles /
+        # mediaManagement (lower-case first letter), and reports
+        # idle | pending | in_progress | failed.
+        sec="${section#sync}"; sec="${sec,}"
+        case $(profilarr_sync_wait "$name" "$sec" ; echo $?) in
+            0) ok "Profilarr: $name $sec synced" ;;
+            1) todo "Profilarr: $name $sec sync FAILED; check Arrs > $name in the UI." ;;
+            2) warn "Profilarr: $name $sec queued (status not readable; check the UI)" ;;
+            *) warn "Profilarr: $name $sec still running after 10 min; carrying on" ;;
         esac
     done
-
 }
 
 # Per-Arr automations (wiki sections 4.3 and 4.5), all switched on: drift
@@ -1029,37 +1132,66 @@ seerr_api() {  # seerr_api <method> <path> [json]
 }
 
 # seerr_add_arr <radarr|sonarr> <internal-host> <port> <api-key> <root>
+# Quality profile: "1080p Balanced" from Profilarr/Dictionarry, else any other
+# synced 1080p profile, else the stock HD-1080p. An entry that already exists
+# but still sits on a stock profile (Seerr configured before the Profilarr
+# sync had landed) is updated in place.
+SEERR_STOCK_PROFILES="{'Any', 'SD', 'HD-720p', 'HD-1080p', 'Ultra-HD', 'HD - 720p/1080p'}"
 seerr_add_arr() {
-    local app="$1" host="$2" port="$3" key="$4" root="$5" have test body
-    have=$(seerr_api GET "/api/v1/settings/$app" | jpy "[s['hostname'] for s in d]")
-    if [[ "$have" == *"\"$host\""* ]]; then ok "Seerr: ${app^} already configured"; return 0; fi
+    local app="$1" host="$2" port="$3" key="$4" root="$5" existing cur_profile test body id
+    existing=$(seerr_api GET "/api/v1/settings/$app" | jpy "next((s for s in d if s['hostname']=='$host'), None)")
+    if [ -n "$existing" ]; then
+        cur_profile=$(printf '%s' "$existing" | jpy "d.get('activeProfileName')")
+        if [ "$(printf '%s' "$existing" | jpy "d.get('activeProfileName') in $SEERR_STOCK_PROFILES")" != "True" ]; then
+            ok "Seerr: ${app^} already configured (profile '$cur_profile')"; return 0
+        fi
+        echo "    Seerr: ${app^} is on the stock profile '$cur_profile'; looking for a Profilarr profile..."
+    fi
     test=$(seerr_api POST "/api/v1/settings/$app/test" "$(APP_HOST="$host" APP_PORT="$port" APP_KEY="$key" jbuild '{"hostname": os.environ["APP_HOST"], "port": int(os.environ["APP_PORT"]), "apiKey": os.environ["APP_KEY"], "useSsl": False, "baseUrl": ""}')")
     http_ok || { todo "Seerr: could not reach ${app^} for its profile list (HTTP $(http_code)); add it in Settings > Services."; return 1; }
-    body=$(printf '%s' "$test" | APP="$app" APP_HOST="$host" APP_PORT="$port" APP_KEY="$key" WANT_ROOT="$root" python3 -c '
+    body=$(printf '%s' "$test" | APP="$app" APP_HOST="$host" APP_PORT="$port" APP_KEY="$key" WANT_ROOT="$root" EXISTING="$existing" python3 -c '
 import json, os, sys
 d = json.load(sys.stdin)
 stock = {"Any", "SD", "HD-720p", "HD-1080p", "Ultra-HD", "HD - 720p/1080p"}
 profiles = d.get("profiles") or []
-# Prefer a Profilarr-synced 1080p profile; fall back to the stock HD-1080p.
-pick = (next((p for p in profiles if "1080" in p["name"] and p["name"] not in stock), None)
+pick = (next((p for p in profiles if p["name"] == "1080p Balanced"), None)
+        or next((p for p in profiles if "1080" in p["name"] and p["name"] not in stock), None)
         or next((p for p in profiles if p["name"] == "HD-1080p"), None)
         or (profiles[0] if profiles else None))
 if not pick:
     sys.exit("no quality profiles")
 roots = [r["path"] for r in (d.get("rootFolders") or [])]
 root = os.environ["WANT_ROOT"] if os.environ["WANT_ROOT"] in roots else (roots[0] if roots else os.environ["WANT_ROOT"])
-body = {"name": os.environ["APP"].capitalize(), "hostname": os.environ["APP_HOST"], "port": int(os.environ["APP_PORT"]),
-        "apiKey": os.environ["APP_KEY"], "useSsl": False, "baseUrl": "", "activeProfileId": pick["id"],
-        "activeProfileName": pick["name"], "activeDirectory": root, "is4k": False, "tags": [], "isDefault": True,
-        "externalUrl": "", "syncEnabled": True, "preventSearch": False, "tagRequests": False}
-if os.environ["APP"] == "radarr":
-    body["minimumAvailability"] = "released"
+if os.environ["EXISTING"]:
+    body = json.loads(os.environ["EXISTING"])
+    body.update(activeProfileId=pick["id"], activeProfileName=pick["name"])
 else:
-    body.update(enableSeasonFolders=True, seriesType="standard", animeSeriesType="anime", animeTags=[], monitorNewItems="all")
+    body = {"name": os.environ["APP"].capitalize(), "hostname": os.environ["APP_HOST"], "port": int(os.environ["APP_PORT"]),
+            "apiKey": os.environ["APP_KEY"], "useSsl": False, "baseUrl": "", "activeProfileId": pick["id"],
+            "activeProfileName": pick["name"], "activeDirectory": root, "is4k": False, "tags": [], "isDefault": True,
+            "externalUrl": "", "syncEnabled": True, "preventSearch": False, "tagRequests": False}
+    if os.environ["APP"] == "radarr":
+        body["minimumAvailability"] = "released"
+    else:
+        body.update(enableSeasonFolders=True, seriesType="standard", animeSeriesType="anime", animeTags=[], monitorNewItems="all")
 print(json.dumps(body)); print(pick["name"], file=sys.stderr)' 2>"$COOKIE_DIR/profile.txt") \
         || { todo "Seerr: ${app^} has no quality profiles yet; add it in Settings > Services."; return 1; }
+    local picked; picked=$(cat "$COOKIE_DIR/profile.txt")
+    if [ -n "$existing" ]; then
+        if [ "$picked" = "$cur_profile" ]; then
+            warn "Seerr: ${app^} has no Profilarr profile yet (sync not finished?); staying on '$cur_profile'. Re-run after the sync."
+            return 0
+        fi
+        id=$(printf '%s' "$existing" | jpy "d['id']")
+        seerr_api PUT "/api/v1/settings/$app/$id" "$body" >/dev/null
+        if http_ok; then ok "Seerr: ${app^} profile changed to '$picked'"; else todo "Seerr: could not update ${app^} (HTTP $(http_code)); pick '$picked' in Settings > Services."; fi
+        return 0
+    fi
     seerr_api POST "/api/v1/settings/$app" "$body" >/dev/null
-    if http_ok; then ok "Seerr: ${app^} added (profile '$(cat "$COOKIE_DIR/profile.txt")', root $root)"; else
+    if http_ok; then
+        ok "Seerr: ${app^} added (profile '$picked', root $root)"
+        [[ "$picked" == "1080p Balanced" ]] || warn "Seerr: '1080p Balanced' not found in ${app^} (Profilarr sync not finished?); using '$picked'. Re-run after the sync to switch."
+    else
         todo "Seerr: could not add ${app^} (HTTP $(http_code))."; fi
 }
 
@@ -1125,13 +1257,18 @@ qui_api() {  # qui_api <method> <path> [json]
     http "$1" "$QUI_URL$2" "${3-}" -b "$QUI_COOKIE" -c "$QUI_COOKIE" -H 'Content-Type: application/json' -H 'X-Requested-With: XMLHttpRequest'
 }
 
-qui_import_automation() {  # qui_import_automation <instance-id> <json>  (disabled, like the UI's Import)
-    local inst="$1" rule="$2" name have
+qui_import_automation() {  # qui_import_automation <instance-id> <json>  (added enabled; an existing disabled copy is enabled)
+    local inst="$1" rule="$2" name existing
     name=$(printf '%s' "$rule" | jpy "d['name']")
-    have=$(qui_api GET "/api/instances/$inst/automations" | jpy "[a['name'] for a in d]")
-    if [[ "$have" == *"\"$name\""* ]]; then ok "Qui: automation '$name' already present"; return 0; fi
-    qui_api POST "/api/instances/$inst/automations" "$(printf '%s' "$rule" | jpy "dict(d, enabled=False)")" >/dev/null
-    if http_ok; then ok "Qui: automation '$name' imported (disabled; review it, then enable)"; else warn "Qui: automation '$name' rejected (HTTP $(http_code))"; fi
+    existing=$(qui_api GET "/api/instances/$inst/automations" | jpy "next((a for a in d if a['name']=='$name'), None)")
+    if [ -n "$existing" ]; then
+        if [ "$(printf '%s' "$existing" | jpy "d.get('enabled')")" = "True" ]; then ok "Qui: automation '$name' already enabled"; return 0; fi
+        qui_api PUT "/api/instances/$inst/automations/$(printf '%s' "$existing" | jpy "d['id']")" "$(printf '%s' "$existing" | jpy "dict(d, enabled=True)")" >/dev/null
+        if http_ok; then ok "Qui: automation '$name' enabled"; else warn "Qui: could not enable automation '$name' (HTTP $(http_code))"; fi
+        return 0
+    fi
+    qui_api POST "/api/instances/$inst/automations" "$(printf '%s' "$rule" | jpy "dict(d, enabled=True)")" >/dev/null
+    if http_ok; then ok "Qui: automation '$name' added and enabled"; else warn "Qui: automation '$name' rejected (HTTP $(http_code))"; fi
 }
 
 qui_add_arr() {  # qui_add_arr <radarr|sonarr> <internal-url> <api-key>
@@ -1214,6 +1351,15 @@ configure_qui() {
     qui_api PUT "/api/instances/$inst" "$(jbuild '{"name": "qbittorrent", "host": "http://qbittorrent:8080", "username": os.environ["ADMIN_USER"], "password": os.environ["ADMIN_PASS"], "hasLocalFilesystemAccess": True, "useReflinks": True, "useHardlinks": False, "hardlinkBaseDir": "/media/downloads/crossseed", "hardlinkDirPreset": "flat", "fallbackToRegularMode": False, "reannounceSettings": {"enabled": True, "initialWaitSeconds": 15, "reannounceIntervalSeconds": 7, "maxAgeSeconds": 600, "maxRetries": 50, "aggressive": False, "monitorAll": True, "excludeCategories": False, "categories": [], "excludeTags": False, "tags": [], "excludeTrackers": False, "trackers": []}}')" >/dev/null
     http_ok && ok "Qui: reflink cross-seed mode (/media/downloads/crossseed, flat) + reannounce enabled" \
             || warn "Qui: instance settings update returned HTTP $(http_code)"
+
+    # Qui backs off (up to an hour after an IP ban) when qBittorrent rejected
+    # it earlier. Re-activating the instance clears that state; the test then
+    # says right away whether Qui can log in.
+    local conn
+    qui_api PUT "/api/instances/$inst/status" '{"isActive": true}' >/dev/null
+    conn=$(qui_api POST "/api/instances/$inst/test")
+    if [ "$(printf '%s' "$conn" | jpy "d.get('connected')")" = "True" ]; then ok "Qui: connected to qBittorrent"; else
+        todo "Qui: cannot connect to qBittorrent: $(printf '%s' "$conn" | jpy "d.get('error') or d.get('message') or d")"; fi
 
     # Cross-seed rules + RSS automation (wiki sections 3.1 and 3.3).
     qui_api PATCH /api/cross-seed/settings "$(I="$inst" jbuild '{"useCrossCategoryAffix": True, "categoryAffixMode": "suffix", "categoryAffix": ".cross", "skipPieceBoundarySafetyCheck": False, "enabled": True, "runIntervalMinutes": 90, "targetInstanceIds": [int(os.environ["I"])], "targetIndexerIds": [], "rssSourceExcludeTags": ["cross-seed"]}')" >/dev/null
