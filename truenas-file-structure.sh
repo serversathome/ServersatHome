@@ -41,18 +41,52 @@ command -v zfs >/dev/null 2>&1 || die "zfs not found. Is this a TrueNAS shell?"
 command -v docker >/dev/null 2>&1 || die "docker not found. Enable the Apps service in the TrueNAS UI first."
 
 # ── Pool selection ──────────────────────────────────────────────────────────
-read -rp "Enter the pool name for configs: " CONFIG_POOL
-read -rp "Enter the pool name for media (can be same as configs): " MEDIA_POOL
+# Offer the pools that exist instead of asking the user to type a name. The
+# boot pool is never a valid target, so it is left out of the menu.
+mapfile -t POOLS < <(zpool list -H -o name | grep -vE '^(boot-pool|freenas-boot)$')
+[ "${#POOLS[@]}" -gt 0 ] || die "No data pools found. Create a pool in the TrueNAS UI first."
 
-validate_pool() {
-    local pool="$1"
-    [[ "$pool" =~ ^[a-z0-9][a-z0-9_.-]*$ ]] \
-        || die "Pool name '$pool' must be lowercase with no spaces."
-    zpool list -H -o name "$pool" >/dev/null 2>&1 \
-        || die "Pool '$pool' does not exist. Available pools: $(zpool list -H -o name | tr '\n' ' ')"
+# choose_pool <prompt> [default]  -> sets CHOSEN_POOL
+choose_pool() {
+    local prompt="$1" default="${2:-}" i choice
+    echo ""
+    echo "$prompt"
+    for i in "${!POOLS[@]}"; do
+        printf '  %d) %-20s %s\n' "$(( i + 1 ))" "${POOLS[$i]}" \
+            "$(zpool list -H -o size,free "${POOLS[$i]}" | awk '{print "size "$1", free "$2}')"
+    done
+    while true; do
+        if [ -n "$default" ]; then
+            read -rp "Select a pool [1-${#POOLS[@]}] (Enter for $default): " choice
+            [ -z "$choice" ] && { CHOSEN_POOL="$default"; return; }
+        else
+            read -rp "Select a pool [1-${#POOLS[@]}]: " choice
+        fi
+        if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#POOLS[@]}" ]; then
+            CHOSEN_POOL="${POOLS[$(( choice - 1 ))]}"
+            return
+        fi
+        echo "Please enter a number between 1 and ${#POOLS[@]}."
+    done
 }
-validate_pool "$CONFIG_POOL"
-validate_pool "$MEDIA_POOL"
+
+if [ "${#POOLS[@]}" -eq 1 ]; then
+    CONFIG_POOL="${POOLS[0]}"
+    MEDIA_POOL="${POOLS[0]}"
+    echo "Only one data pool found; using '$CONFIG_POOL' for both configs and media."
+else
+    choose_pool "Which pool should hold the app configs (SSD pool if you have one)?"
+    CONFIG_POOL="$CHOSEN_POOL"
+    choose_pool "Which pool should hold the media library (can be the same pool)?" "$CONFIG_POOL"
+    MEDIA_POOL="$CHOSEN_POOL"
+fi
+
+# Dataset names need to be lowercase with no spaces for the rest of the stack.
+for pool in "$CONFIG_POOL" "$MEDIA_POOL"; do
+    [[ "$pool" =~ ^[a-z0-9][a-z0-9_.-]*$ ]] \
+        || die "Pool name '$pool' must be lowercase with no spaces. Rename the pool or create a compliant one."
+done
+echo "Configs pool: $CONFIG_POOL    Media pool: $MEDIA_POOL"
 
 # ── Host facts ──────────────────────────────────────────────────────────────
 # LAN network for the qBittorrent VPN LAN bypass. Use the interface that
