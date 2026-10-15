@@ -40,11 +40,13 @@ die()  { echo "❌ $*" >&2; exit 1; }
 wait_for() {
     local what="$1" timeout="$2"; shift 2
     local waited=0
-    echo "Waiting for $what (up to ${timeout}s)..."
+    # Progress goes to stderr: callers like `KEY=$(arr_key radarr)` capture
+    # stdout, and a chatty wait_for would otherwise end up inside the value.
+    echo "Waiting for $what (up to ${timeout}s)..." >&2
     until "$@" >/dev/null 2>&1; do
         sleep 5; waited=$(( waited + 5 ))
         if [ "$waited" -ge "$timeout" ]; then
-            warn "Timed out waiting for $what."
+            warn "Timed out waiting for $what." >&2
             return 1
         fi
     done
@@ -538,7 +540,7 @@ arr_api() {
 arr_key() {
     local app="$1" cfg="/mnt/$CONFIG_POOL/configs/$1/config.xml"
     wait_for "$app to write config.xml" 180 bash -c "grep -q '<ApiKey>' '$cfg'" || return 1
-    grep -oP '(?<=<ApiKey>)[^<]+' "$cfg"
+    grep -oP '(?<=<ApiKey>)[^<]+' "$cfg" | head -1 | tr -d '[:space:]'
 }
 
 # arr_enable_forms_auth <app> <base-url> <api-key> <api-version>
@@ -745,37 +747,51 @@ print(json.dumps(t))')
 # cookie and SvelteKit's Origin check. The default Dictionarry database is
 # linked automatically on first boot.
 PROFILARR_COOKIE="$COOKIE_DIR/profilarr.cookie"
-profilarr_form() {  # profilarr_form <path> <form args...> -> prints HTTP code
+profilarr_form() {  # profilarr_form <path> <form args...> -> prints HTTP code; body kept for diagnostics
     local path="$1"; shift
-    curl -sS -m 60 -o /dev/null -w '%{http_code}' -b "$PROFILARR_COOKIE" -c "$PROFILARR_COOKIE" \
-        -H "Origin: $PROFILARR_URL" "$@" "$PROFILARR_URL$path"
+    curl -sS -m 60 -o "$COOKIE_DIR/profilarr.body" -w '%{http_code}' -b "$PROFILARR_COOKIE" -c "$PROFILARR_COOKIE" \
+        -H "Origin: $PROFILARR_URL" -H 'Accept: text/html' "$@" "$PROFILARR_URL$path"
+}
+profilarr_body_hint() {  # first bit of the last response, tags stripped, for error messages
+    sed 's/<[^>]*>/ /g' "$COOKIE_DIR/profilarr.body" 2>/dev/null | tr -s '[:space:]' ' ' | cut -c1-240
+}
+profilarr_needs_setup() {  # true while Profilarr still redirects to its first-run page
+    [[ "$(curl -sS -m 30 -o /dev/null -w '%{redirect_url}' "$PROFILARR_URL/")" == *"/auth/setup"* ]]
+}
+profilarr_logged_in() {  # the session cookie is accepted by the API
+    [ "$(curl -sS -m 30 -o /dev/null -w '%{http_code}' -b "$PROFILARR_COOKIE" "$PROFILARR_URL/api/v1/arr")" = "200" ]
 }
 
 configure_profilarr() {
     info "[6/10] Profilarr"
     wait_for "Profilarr" 180 bash -c "curl -fs $PROFILARR_URL/api/v1/health -o /dev/null" \
         || { todo "Profilarr did not come up; skipping."; return 1; }
-    local redirect code
-    redirect=$(curl -sS -m 30 -o /dev/null -w '%{redirect_url}' "$PROFILARR_URL/")
-    if [[ "$redirect" == *"/auth/setup"* ]]; then
+    local code
+    if profilarr_needs_setup; then
         code=$(profilarr_form /auth/setup --data-urlencode "username=$ADMIN_USER" --data-urlencode "password=$ADMIN_PASS" --data-urlencode "confirmPassword=$ADMIN_PASS")
-        [ "$code" = "303" ] && ok "Profilarr: account created ($ADMIN_USER / $ADMIN_PASS)" \
-            || { todo "Profilarr: account setup returned HTTP $code; finish it at $PROFILARR_URL."; return 1; }
-    else
-        code=$(profilarr_form /auth/login --data-urlencode "username=$ADMIN_USER" --data-urlencode "password=$ADMIN_PASS")
-        [ "$code" = "303" ] && ok "Profilarr: logged in" \
-            || { todo "Profilarr: login returned HTTP $code; link Radarr/Sonarr in the UI."; return 1; }
+        # Judge by state, not only by status: a 303 is the documented success,
+        # but the account may exist even if the form answered differently.
+        if profilarr_needs_setup; then
+            todo "Profilarr: account setup returned HTTP $code ($(profilarr_body_hint)); finish it at $PROFILARR_URL."
+            return 1
+        fi
+        ok "Profilarr: account created ($ADMIN_USER / $ADMIN_PASS) [HTTP $code]"
     fi
-    local app url key
+    if ! profilarr_logged_in; then
+        code=$(profilarr_form /auth/login --data-urlencode "username=$ADMIN_USER" --data-urlencode "password=$ADMIN_PASS")
+        profilarr_logged_in && ok "Profilarr: logged in" \
+            || { todo "Profilarr: login returned HTTP $code ($(profilarr_body_hint)); link Radarr/Sonarr in the UI."; return 1; }
+    fi
+    local app url key linked
     for app in radarr sonarr; do
         if [ "$app" = radarr ]; then url="$RADARR_INT"; key="$RADARR_API_KEY"; else url="$SONARR_INT"; key="$SONARR_API_KEY"; fi
         [ -n "$key" ] || { todo "Profilarr: no $app API key; link it in the UI."; continue; }
+        linked=$(http GET "$PROFILARR_URL/api/v1/arr" "" -b "$PROFILARR_COOKIE" | jpy "[a['name'] for a in d]")
+        if [[ "$linked" == *"\"${app^}\""* ]]; then ok "Profilarr: ${app^} already linked"; continue; fi
         code=$(profilarr_form /arr/new --data-urlencode "name=${app^}" --data-urlencode "type=$app" --data-urlencode "url=$url" --data-urlencode "api_key=$key")
-        case "$code" in
-            303) ok "Profilarr: ${app^} linked ($url)" ;;
-            400) ok "Profilarr: ${app^} already linked (or rejected as duplicate)" ;;
-            *)   todo "Profilarr: linking ${app^} returned HTTP $code; add it under Arrs." ;;
-        esac
+        linked=$(http GET "$PROFILARR_URL/api/v1/arr" "" -b "$PROFILARR_COOKIE" | jpy "[a['name'] for a in d]")
+        if [[ "$linked" == *"\"${app^}\""* ]]; then ok "Profilarr: ${app^} linked ($url) [HTTP $code]"
+        else todo "Profilarr: linking ${app^} returned HTTP $code ($(profilarr_body_hint)); add it under Arrs."; fi
     done
     profilarr_sync_all
 }
@@ -1052,7 +1068,17 @@ qui_import_automation() {  # qui_import_automation <instance-id> <json>  (disabl
 }
 
 qui_add_arr() {  # qui_add_arr <radarr|sonarr> <internal-url> <api-key>
-    local type="$1" url="$2" key="$3"
+    local type="$1" url="$2" key="$3" existing
+    # An entry from an earlier run may carry a bad key: test it, replace it if it fails.
+    existing=$(qui_api GET /api/arr/instances | jpy "next((str(a['id']) for a in d if a.get('type')=='$type' and a.get('base_url')=='$url'), None)")
+    if [ -n "$existing" ]; then
+        if [ "$(qui_api POST "/api/arr/instances/$existing/test" | jpy "d.get('success')")" = "True" ]; then
+            ok "Qui: ${type^} integration already present and working"; return 0
+        fi
+        qui_api DELETE "/api/arr/instances/$existing" >/dev/null
+        http_ok && echo "    Qui: replaced a ${type^} integration whose connection test failed" \
+                || { warn "Qui: ${type^} integration exists but fails its test and could not be replaced (HTTP $(http_code)); fix its API key in Settings > Integrations"; return 1; }
+    fi
     qui_api POST /api/arr/instances "$(T="$type" U="$url" K="$key" jbuild '{"type": os.environ["T"], "name": os.environ["T"].capitalize(), "base_url": os.environ["U"], "api_key": os.environ["K"], "enabled": True, "priority": 0, "timeout_seconds": 15}')" >/dev/null
     case "$(http_code)" in
         201) ok "Qui: ${type^} integration added" ;;
