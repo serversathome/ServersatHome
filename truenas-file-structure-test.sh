@@ -459,6 +459,7 @@ services:
       - "$DOCKER_GID"
     environment:
       - TZ=$TZ_VALUE
+      - DOZZLE_NO_ANALYTICS=true
     restart: unless-stopped
     ports:
       - '8888:8080'
@@ -560,8 +561,9 @@ arr_key() {
 }
 
 # arr_enable_forms_auth <app> <base-url> <api-key> <api-version>
-# GET the host config, set Forms login (required for all addresses), PUT back.
-# The *arr apps need the FULL object on PUT; a partial body 500s.
+# GET the host config, set Forms login (required for all addresses) and switch
+# off "Send Anonymous Usage Data", PUT back. The *arr apps need the FULL
+# object on PUT; a partial body 500s.
 arr_enable_forms_auth() {
     local app="$1" base="$2" key="$3" ver="$4" cfg body
     cfg=$(arr_api "$base" "$key" GET "/api/$ver/config/host")
@@ -571,10 +573,10 @@ import json, os, sys
 d = json.load(sys.stdin)
 d.update(authenticationMethod="forms", authenticationRequired="enabled",
          username=os.environ["ADMIN_USER"], password=os.environ["ADMIN_PASS"],
-         passwordConfirmation=os.environ["ADMIN_PASS"])
+         passwordConfirmation=os.environ["ADMIN_PASS"], analyticsEnabled=False)
 print(json.dumps(d))')
     arr_api "$base" "$key" PUT "/api/$ver/config/host/1" "$body" >/dev/null
-    if http_ok; then ok "$app: Forms login enabled ($ADMIN_USER / $ADMIN_PASS)"; else
+    if http_ok; then ok "$app: Forms login enabled ($ADMIN_USER / $ADMIN_PASS); anonymous usage data off"; else
         todo "$app: Forms login not applied (HTTP $(http_code)); set it in Settings > General."; fi
 }
 
@@ -636,8 +638,18 @@ qb_diagnose() {
 # port as a fallback, and the real error is printed either way.
 arr_add_qbittorrent() {
     local app="$1" base="$2" key="$3" cat_field="$4" category="$5" have schema body res host
-    have=$(arr_api "$base" "$key" GET /api/v3/downloadclient | jpy "[c['implementation'] for c in d]")
-    if [[ "$have" == *'"QBittorrent"'* ]]; then ok "$app: qBittorrent download client already present"; return 0; fi
+    have=$(arr_api "$base" "$key" GET /api/v3/downloadclient | jpy "next((c for c in d if c['implementation']=='QBittorrent'), None)")
+    if [ -n "$have" ]; then
+        # Present from an earlier run: make sure "Remove Completed" is off.
+        if [ "$(printf '%s' "$have" | jpy "d.get('removeCompletedDownloads')")" = "True" ]; then
+            res=$(arr_api "$base" "$key" PUT "/api/v3/downloadclient/$(printf '%s' "$have" | jpy "d['id']")?forceSave=true" "$(printf '%s' "$have" | jpy "dict(d, removeCompletedDownloads=False)")")
+            if http_ok; then ok "$app: qBittorrent download client already present; 'Remove Completed' switched off"; else
+                warn "$app: could not switch 'Remove Completed' off (HTTP $(http_code)): $(arr_errors "$res")"; fi
+        else
+            ok "$app: qBittorrent download client already present"
+        fi
+        return 0
+    fi
     schema=$(arr_api "$base" "$key" GET /api/v3/downloadclient/schema)
     for host in qbittorrent "$HOST_IP"; do
         body=$(printf '%s' "$schema" | QB_HOST="$host" CAT_FIELD="$cat_field" CATEGORY="$category" python3 -c '
@@ -649,8 +661,10 @@ vals = {"host": os.environ["QB_HOST"], "port": 8080, "useSsl": False, "urlBase":
 for f in t["fields"]:
     if f["name"] in vals:
         f["value"] = vals[f["name"]]
+# "Remove Completed" stays off: finished torrents keep seeding in qBittorrent
+# (the Qui automations decide when they go); failed ones are still removed.
 t.update(name="qBittorrent", enable=True, protocol="torrent", priority=1,
-         removeCompletedDownloads=True, removeFailedDownloads=True, tags=[])
+         removeCompletedDownloads=False, removeFailedDownloads=True, tags=[])
 t.pop("id", None)
 print(json.dumps(t))') || { todo "$app: qBittorrent not found in the download client schema."; return 1; }
         res=$(arr_api "$base" "$key" POST /api/v3/downloadclient/test "$body")
@@ -758,6 +772,15 @@ configure_qbittorrent() {
         "$QB_URL/api/v2/app/setPreferences")
     if [ "$code" = "200" ]; then ok "qBittorrent: save paths set (/media/downloads, incomplete in /media/downloads/torrent)"; else
         todo "qBittorrent: could not set the save paths (HTTP $code); set them in Tools > Options > Downloads."; fi
+
+    # Connection / BitTorrent / Advanced per wiki.serversatho.me/en/qBittorrent:
+    # no connection limits (-1 = box unchecked), no torrent queueing, more
+    # parallel checking, and all torrent traffic bound to the VPN interface
+    # on every IPv4 address.
+    code=$(qb_code --data-urlencode 'json={"max_connec":-1,"max_connec_per_torrent":-1,"max_uploads":-1,"max_uploads_per_torrent":-1,"queueing_enabled":false,"max_active_checking_torrents":3,"current_network_interface":"wg0","current_interface_address":"0.0.0.0"}' \
+        "$QB_URL/api/v2/app/setPreferences")
+    if [ "$code" = "200" ]; then ok "qBittorrent: connection limits off, queueing off, 3 checking torrents, interface wg0 / all IPv4"; else
+        todo "qBittorrent: could not apply the connection/advanced settings (HTTP $code); set them in Tools > Options."; fi
 
     local cat
     for cat in radarr sonarr; do
@@ -1073,6 +1096,11 @@ profilarr_enable_automations() {  # profilarr_enable_automations <Radarr|Sonarr>
         --data-urlencode 'cron=0 6 * * *' --data-urlencode 'summaryNotifications=false'
     profilarr_automation "$name" "cleanup" "/arr/$id/settings?/updateCleanup" \
         --data-urlencode 'enabled=1' --data-urlencode 'cron=0 0 * * 0'
+    # First cleanup pass right away (queued as a job; Profilarr runs it).
+    local res
+    res=$(profilarr_post "/arr/$id/settings?/runCleanupNow")
+    if http_ok && [[ "$res" == *'"type":"success"'* ]]; then ok "Profilarr: $name cleanup run queued"
+    else warn "Profilarr: could not queue a cleanup run for $name (HTTP $(http_code)): $(printf '%s' "$res" | head -c 160)"; fi
 }
 
 profilarr_sync_all() {
@@ -1239,6 +1267,7 @@ configure_bazarr() {
         || { todo "Bazarr: missing a Radarr/Sonarr API key; connect them in Settings."; return 1; }
     local code
     code=$(curl -sS -m 60 -o /dev/null -w '%{http_code}' -X POST -H "X-API-KEY: $BAZARR_API_KEY" "$BAZARR_URL/api/system/settings" \
+        --data-urlencode settings-analytics-enabled=false \
         --data-urlencode settings-general-use_radarr=true \
         --data-urlencode settings-radarr-ip=radarr --data-urlencode settings-radarr-port=7878 \
         --data-urlencode settings-radarr-base_url=/ --data-urlencode settings-radarr-ssl=false \
@@ -1247,7 +1276,7 @@ configure_bazarr() {
         --data-urlencode settings-sonarr-ip=sonarr --data-urlencode settings-sonarr-port=8989 \
         --data-urlencode settings-sonarr-base_url=/ --data-urlencode settings-sonarr-ssl=false \
         --data-urlencode "settings-sonarr-apikey=$SONARR_API_KEY")
-    if [ "$code" = "204" ]; then ok "Bazarr: connected to Radarr and Sonarr"; else todo "Bazarr: settings POST returned HTTP $code; connect Radarr/Sonarr in Settings."; fi
+    if [ "$code" = "204" ]; then ok "Bazarr: connected to Radarr and Sonarr; anonymous usage data off"; else todo "Bazarr: settings POST returned HTTP $code; connect Radarr/Sonarr in Settings."; fi
     echo "    Bazarr still needs a language profile and subtitle providers (Settings > Languages / Providers)."
 }
 
@@ -1428,5 +1457,5 @@ if [ "${#TODO_LIST[@]}" -gt 0 ]; then
 fi
 echo ""
 echo "  Still manual by design: Prowlarr indexers (your trackers), Bazarr languages"
-echo "  and providers, Qui library scan, and enabling the imported Qui automations."
+echo "  and providers, and the one-time Qui library scan."
 echo "Script completed."
