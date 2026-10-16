@@ -765,8 +765,8 @@ configure_qbittorrent() {
     fi
 
     # Save paths per wiki.serversatho.me/en/Folder-Structure: completed downloads
-    # in /media/downloads (one subfolder per category via Automatic Torrent
-    # Management), incomplete ones and .torrent files in /media/downloads/torrent.
+    # straight into /media/downloads (no per-category subfolders), incomplete
+    # ones and .torrent files in /media/downloads/torrent.
     code=$(qb_code --data-urlencode 'json={"save_path":"/media/downloads","temp_path_enabled":true,"temp_path":"/media/downloads/torrent","export_dir":"/media/downloads/torrent","auto_tmm_enabled":true,"torrent_content_layout":"Original"}' \
         "$QB_URL/api/v2/app/setPreferences")
     if [ "$code" = "200" ]; then ok "qBittorrent: save paths set (/media/downloads, incomplete in /media/downloads/torrent)"; else
@@ -781,14 +781,25 @@ configure_qbittorrent() {
     if [ "$code" = "200" ]; then ok "qBittorrent: connection limits off, queueing off, 3 checking torrents, interface wg0 / all IPv4"; else
         todo "qBittorrent: could not apply the connection/advanced settings (HTTP $code); set them in Tools > Options."; fi
 
-    local cat
+    # Categories for Radarr and Sonarr, both saving straight into
+    # /media/downloads. The path is set explicitly: a category with an empty
+    # save path would make qBittorrent use /media/downloads/<category>. An
+    # existing category (earlier run) is re-pointed with editCategory.
+    local cat cats cur
+    cats=$(qb_post "$QB_URL/api/v2/torrents/categories" 2>/dev/null)
     for cat in radarr sonarr; do
-        code=$(qb_code --data-urlencode "category=$cat" --data-urlencode "savePath=/media/downloads/$cat" "$QB_URL/api/v2/torrents/createCategory")
-        case "$code" in
-            200) ok "qBittorrent: category '$cat' -> /media/downloads/$cat" ;;
-            409) ok "qBittorrent: category '$cat' already exists" ;;
-            *)   warn "qBittorrent: could not create category '$cat' (HTTP $code)" ;;
-        esac
+        if [ "$(printf '%s' "$cats" | jpy "'$cat' in d")" = "True" ]; then
+            cur=$(printf '%s' "$cats" | jpy "d['$cat'].get('savePath')")
+            if [ "$cur" = "/media/downloads" ]; then ok "qBittorrent: category '$cat' already saves to /media/downloads"; continue; fi
+            # editCategory answers 409 when nothing changes, hence the check above.
+            code=$(qb_code --data-urlencode "category=$cat" --data-urlencode "savePath=/media/downloads" "$QB_URL/api/v2/torrents/editCategory")
+            if [ "$code" = "200" ]; then ok "qBittorrent: category '$cat' save path changed from '${cur:-<default>}' to /media/downloads"; else
+                warn "qBittorrent: could not change the save path of category '$cat' (HTTP $code); set it to /media/downloads in the WebUI"; fi
+            continue
+        fi
+        code=$(qb_code --data-urlencode "category=$cat" --data-urlencode "savePath=/media/downloads" "$QB_URL/api/v2/torrents/createCategory")
+        if [ "$code" = "200" ]; then ok "qBittorrent: category '$cat' -> /media/downloads"; else
+            warn "qBittorrent: could not create category '$cat' (HTTP $code)"; fi
     done
     [ "$QB_MODE" = "exec" ] && docker exec qbittorrent rm -f "$QB_COOKIE" >/dev/null 2>&1
     rm -f "$QB_COOKIE"
