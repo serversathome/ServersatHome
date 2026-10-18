@@ -81,6 +81,8 @@ wait_for() {
 HTTP_STATUS_FILE=$(mktemp)
 HTTP_BODY_FILE=$(mktemp)
 HTTP_ERR_FILE=$(mktemp)
+COOKIE_DIR=$(mktemp -d)   # session cookies for the apps configured below
+trap 'rm -rf "$COOKIE_DIR" "$HTTP_STATUS_FILE" "$HTTP_BODY_FILE" "$HTTP_ERR_FILE"' EXIT
 http() {
     local method="$1" url="$2" body="${3-}"
     shift $(( $# < 3 ? $# : 3 ))
@@ -198,7 +200,7 @@ echo "Configs/stacks pool: $CONFIG_POOL    Media pool: $MEDIA_POOL"
 DEFAULT_IF=$(ip -o route show default 2>/dev/null | awk '{print $5; exit}')
 HOST_CIDR=$(ip -o -4 addr show dev "${DEFAULT_IF:-lo}" scope global 2>/dev/null | awk '{print $4; exit}')
 HOST_IP="${HOST_CIDR%/*}"
-if [ -n "$HOST_CIDR" ] && command -v python3 >/dev/null 2>&1; then
+if [ -n "$HOST_CIDR" ]; then
     CIDR_NETWORK=$(python3 -c 'import ipaddress,sys; print(ipaddress.ip_interface(sys.argv[1]).network)' "$HOST_CIDR" 2>/dev/null)
 fi
 if [ -z "${CIDR_NETWORK:-}" ]; then
@@ -251,7 +253,8 @@ detect_gpu() {
     fi
     if [ "$GPU_VENDOR" != "none" ]; then
         dev=$(basename "$(readlink -f "/sys/class/drm/${GPU_RENDER##*/}/device" 2>/dev/null)" 2>/dev/null)
-        GPU_NAME=$(lspci -s "$dev" 2>/dev/null | sed 's/^[^:]*: //' | head -1)
+        GPU_NAME=$(lspci -s "$dev" 2>/dev/null | sed 's/^[0-9a-f:.]* [^:]*: //' | head -1)
+        [ -z "$GPU_NOTE" ] || GPU_NOTE="an NVIDIA GPU is also present but its driver is not loaded (Apps > Settings > Install NVIDIA Drivers); the ${GPU_VENDOR^^} GPU is used instead"
     fi
 }
 detect_gpu
@@ -266,8 +269,8 @@ echo "    Display adapters (lspci):"; echo "${GPU_DISPLAYS:-      (none listed)}
 case "$GPU_VENDOR" in
     none)
         echo "    Result: no usable GPU; Jellyfin will transcode in software."
-        if printf '%s' "$GPU_DISPLAYS" | grep -qiE '1234:1111|qemu|bochs|virtio|vmware|hyper-v|microsoft corporation|red hat'; then
-            echo "    The only display adapter is a virtual one, so TrueNAS is running in a VM and the"
+        if [ -n "$GPU_DISPLAYS" ] && ! printf '%s\n' "$GPU_DISPLAYS" | grep -viE '1234:1111|qemu|bochs|virtio|vmware|hyper-v|microsoft corporation|red hat' | grep -q .; then
+            echo "    Every display adapter is a virtual one, so TrueNAS is running in a VM and the"
             echo "    physical GPU has not been passed through. Pass it to the VM (PCI passthrough; a"
             echo "    renderD* node then appears under /dev/dri) and re-run this script."
         elif [[ "$GPU_DRI_NODES" == *card* ]]; then
@@ -285,8 +288,10 @@ esac
 # container (docker run --rm: nothing stays behind except the Jellyfin image,
 # which the stack needs anyway):
 #   Intel / AMD : vainfo lists the VA-API profiles (VLD = decode, EncSlice =
-#                 encode, EncSliceLP = Intel low-power encode); a short ffmpeg
-#                 run checks QSV (Intel) and OpenCL (HDR tone mapping).
+#                 encode, EncSliceLP = Intel low-power encode); ffmpeg then
+#                 checks QSV (Intel) and OpenCL (HDR tone mapping), runs a
+#                 real encode per codec, normal and low-power, and tries the
+#                 driver's own HDR10 tone mapping (VPP) on a generated clip.
 #   NVIDIA      : ffmpeg encodes a test pattern with h264/hevc/av1_nvenc and
 #                 decodes generated clips with the *_cuvid decoders (NVDEC),
 #                 including 10-bit HEVC and VP9.
@@ -466,7 +471,9 @@ JELLYFIN_GPU_BLOCK=""
 case "$GPU_VENDOR" in
     intel|amd)
         render_gid=$(stat -c '%g' "$GPU_RENDER")
-        video_gid=$(stat -c '%g' /dev/dri/card0 2>/dev/null || echo "$render_gid")
+        # The card node of the same device (its group is usually "video").
+        card_node=$(find "/sys/class/drm/${GPU_RENDER##*/}/device/drm" -maxdepth 1 -name 'card*' 2>/dev/null | head -1)
+        video_gid=$(stat -c '%g' "/dev/dri/${card_node##*/}" 2>/dev/null || echo "$render_gid")
         JELLYFIN_GPU_BLOCK="    devices:
       - /dev/dri:/dev/dri
     group_add:
@@ -736,7 +743,7 @@ write_stack jellyfin <<EOF
 services:
   jellyfin:
     container_name: jellyfin
-    image: lscr.io/linuxserver/jellyfin:latest
+    image: $JELLYFIN_IMAGE
     environment:
       - PUID=568
       - PGID=568
@@ -943,9 +950,9 @@ fi
 echo "Launching the stacks from $STACKS_PATH..."
 for stack in "${STACKS[@]}"; do
     docker compose -f "$STACKS_PATH/$stack/compose.yaml" up -d \
-        || die "Failed to launch the '$stack' stack. Check: docker compose -f $STACKS_PATH/$stack/compose.yaml logs"
+        || todo "The '$stack' stack did not launch. Check: docker compose -f $STACKS_PATH/$stack/compose.yaml logs"
 done
-echo "All stacks launched."
+echo "Stacks launched."
 
 # ============================================================================
 #                           AUTO-CONFIGURATION PHASE
@@ -954,7 +961,7 @@ echo "All stacks launched."
 # network (radarr, sonarr, qbittorrent, ...). This script talks to them from
 # the TrueNAS shell through the published ports on localhost.
 # ============================================================================
-export ADMIN_USER ADMIN_PASS ADMIN_EMAIL CONFIG_POOL MEDIA_POOL
+export ADMIN_USER ADMIN_PASS ADMIN_EMAIL
 
 QB_URL="http://localhost:8080"
 RADARR_URL="http://localhost:7878";   RADARR_INT="http://radarr:7878"
@@ -969,9 +976,6 @@ QUI_URL="http://localhost:7476"
 TRACEARR_URL="http://localhost:3000"
 DOCKGE_URL="http://localhost:5001"
 QB_INT="http://qbittorrent:8080"
-
-COOKIE_DIR=$(mktemp -d)
-trap 'rm -rf "$COOKIE_DIR" "$HTTP_STATUS_FILE" "$HTTP_BODY_FILE" "$HTTP_ERR_FILE"' EXIT
 
 # ── Shared *arr helpers (Radarr / Sonarr / Prowlarr share one API shape) ────
 # arr_api <base-url> <api-key> <method> <path> [json-body]
@@ -1059,10 +1063,10 @@ qb_diagnose() {
 
 # arr_add_qbittorrent <app> <base-url> <api-key> <category-field> <category>
 # Builds the client from the app's own schema so field names stay correct.
-# The *arr runs its connection test on save as well (forceSave only waives
-# warnings), so a client whose test fails cannot be stored: the container
-# name is tried first, then the TrueNAS LAN address through the published
-# port as a fallback, and the real error is printed either way.
+# The client is tested first (POST .../test) and only a passing one is
+# saved; forceSave then skips the save-time validation. The container name
+# is tried first, then the TrueNAS LAN address through the published port
+# as a fallback, and the real error is printed either way.
 arr_add_qbittorrent() {
     local app="$1" base="$2" key="$3" cat_field="$4" category="$5" have schema body res host
     have=$(arr_api "$base" "$key" GET /api/v3/downloadclient | jpy "next((c for c in d if c['implementation']=='QBittorrent'), None)")
@@ -1318,7 +1322,13 @@ print(json.dumps(t))')
 
     [ -n "$RADARR_API_KEY" ] && prowlarr_add_app Radarr "$RADARR_INT" "$RADARR_API_KEY"
     [ -n "$SONARR_API_KEY" ] && prowlarr_add_app Sonarr "$SONARR_INT" "$SONARR_API_KEY"
-    echo "    Prowlarr has no indexers yet: add your trackers in Indexers > Add Indexer (tag Cloudflare-protected ones 'flaresolverr')."
+    local n_idx
+    n_idx=$(arr_api "$PROWLARR_URL" "$PROWLARR_API_KEY" GET /api/v1/indexer | jpy "len(d)")
+    if [ "${n_idx:-0}" = "0" ]; then
+        echo "    Prowlarr has no indexers yet: add your trackers in Indexers > Add Indexer (tag Cloudflare-protected ones 'flaresolverr')."
+    else
+        ok "Prowlarr: $n_idx indexer(s) configured"
+    fi
 }
 
 # ── 6. Profilarr ────────────────────────────────────────────────────────────
@@ -1406,6 +1416,37 @@ profilarr_link_anime_db() {
         || warn "Profilarr: '$PROFILARR_ANIME_DB' has no profiles yet; the anime profile is picked up on the next run"
 }
 
+# profilarr_page_data <page path> -> that page's load data as JSON
+# (SvelteKit __data.json is devalue-encoded; decoded generically, layout and
+# page data merged).
+profilarr_page_data() {
+    http GET "$PROFILARR_URL$1/__data.json" "" -b "$PROFILARR_COOKIE" | python3 -c '
+import json, sys
+raw = json.load(sys.stdin)
+SPECIAL = {-1: None, -2: None, -3: float("nan"), -4: float("inf"), -5: float("-inf"), -6: -0.0}
+def hydrate(values, i, memo):
+    if i in SPECIAL: return SPECIAL[i]
+    if i in memo: return memo[i]
+    v = values[i]
+    if isinstance(v, list):
+        if v and isinstance(v[0], str) and v[0] in ("Date","Set","Map","RegExp","Object","BigInt","null","Symbol"):
+            out = [hydrate(values, j, memo) for j in v[1:]] if v[0] in ("Set","Map","Object") else v[1:]
+        else:
+            out = [hydrate(values, j, memo) for j in v]
+    elif isinstance(v, dict):
+        out = {k: hydrate(values, j, memo) for k, j in v.items()}
+    else:
+        out = v
+    memo[i] = out
+    return out
+merged = {}
+for node in raw.get("nodes") or []:
+    if node and node.get("type") == "data":
+        data = hydrate(node["data"], 0, {})
+        if isinstance(data, dict): merged.update(data)
+print(json.dumps(merged))' 2>/dev/null
+}
+
 # profilarr_action <instance-id> <action> <form args...> -> prints JSON result; status via http_code
 # SvelteKit form action, called the way the UI's JS does (x-sveltekit-action)
 # so the answer is JSON ({"type":"success"|"failure"|...}) instead of HTML.
@@ -1423,13 +1464,16 @@ profilarr_action() {
     local id="$1" action="$2"; shift 2
     profilarr_post "/arr/$id/sync?/$action" "$@"
 }
+profilarr_saved() {  # profilarr_saved <form action result> -> true when the action succeeded
+    http_ok && [[ "$1" == *'"type":"success"'* ]]
+}
 # profilarr_automation <instance-name> <what> <path?/action> <form args...>
 # Saves one of the per-Arr automations (drift detection, renames, cleanup)
 # and reports the outcome; the JSON answer carries "type":"success"|"failure".
 profilarr_automation() {
     local name="$1" what="$2" path="$3" res; shift 3
     res=$(profilarr_post "$path" "$@")
-    if http_ok && [[ "$res" == *'"type":"success"'* ]]; then ok "Profilarr: $name $what enabled"
+    if profilarr_saved "$res"; then ok "Profilarr: $name $what enabled"
     else warn "Profilarr: could not enable $what for $name (HTTP $(http_code)): $(printf '%s' "$res" | head -c 160)"; fi
 }
 
@@ -1446,18 +1490,19 @@ for a in d.get("arrs", []):
 else:
     print("unknown")' 2>/dev/null)
         case "$st" in
-            idle)    return 0 ;;
-            failed)  return 1 ;;
-            unknown) return 2 ;;
+            idle)       return 0 ;;
+            failed)     return 1 ;;
+            ""|unknown) return 2 ;;
         esac
         sleep 5; waited=$(( waited + 5 ))
         [ "$waited" -ge 600 ] && return 3
     done
 }
 
-# Sync everything from the auto-linked Dictionarry database to one Arr:
-# all quality profiles (their custom formats come along), the first delay
-# profile, and the first naming / quality-definition / media-settings configs.
+# Sync to one Arr: every Dictionarry quality profile (their custom formats
+# come along) plus the anime profile from the second database, the delay
+# profile and the naming / quality-definition / media-settings configs that
+# match the Arr.
 profilarr_instance_id() {  # profilarr_instance_id <Radarr|Sonarr> -> id ("" if not linked)
     http GET "$PROFILARR_URL/api/v1/arr" "" -b "$PROFILARR_COOKIE" | jpy "next((a['id'] for a in d if a['name']=='$1'), None)"
 }
@@ -1468,33 +1513,11 @@ profilarr_sync_instance() {  # profilarr_sync_instance <Radarr|Sonarr>
     [ -n "$id" ] || { todo "Profilarr: $name is not linked; sync it in the UI."; return 1; }
 
     # The profile/config names live only in the sync page's load data
-    # (SvelteKit __data.json, devalue-encoded). Decode it generically.
-    lists=$(http GET "$PROFILARR_URL/arr/$id/sync/__data.json" "" -b "$PROFILARR_COOKIE" | NAME="$name" ANIME_DB="$PROFILARR_ANIME_DB" ANIME_PROFILE="$PROFILARR_ANIME_PROFILE" python3 -c '
+    # (SvelteKit __data.json, decoded by profilarr_page_data).
+    lists=$(profilarr_page_data "/arr/$id/sync" | NAME="$name" ANIME_DB="$PROFILARR_ANIME_DB" ANIME_PROFILE="$PROFILARR_ANIME_PROFILE" python3 -c '
 import json, os, sys
-raw = json.load(sys.stdin)
-SPECIAL = {-1: None, -2: None, -3: float("nan"), -4: float("inf"), -5: float("-inf"), -6: -0.0}
-def hydrate(values, i, memo):
-    if i in SPECIAL: return SPECIAL[i]
-    if i in memo: return memo[i]
-    v = values[i]
-    if isinstance(v, list):
-        if v and isinstance(v[0], str) and v[0] in ("Date","Set","Map","RegExp","Object","BigInt","null","Symbol") and len(v) >= 1:
-            out = [hydrate(values, j, memo) for j in v[1:]] if v[0] in ("Set","Map","Object") else v[1:]
-        else:
-            out = [hydrate(values, j, memo) for j in v]
-    elif isinstance(v, dict):
-        out = {k: hydrate(values, j, memo) for k, j in v.items()}
-    else:
-        out = v
-    memo[i] = out
-    return out
-found = None
-for node in raw.get("nodes") or []:
-    if not node or node.get("type") != "data": continue
-    data = hydrate(node["data"], 0, {})
-    if isinstance(data, dict) and isinstance(data.get("databases"), list):
-        found = data["databases"]
-if not found: sys.exit(1)
+found = (json.load(sys.stdin) or {}).get("databases")
+if not isinstance(found, list) or not found: sys.exit(1)
 # Dictionarry (the stock database) supplies every profile plus the delay /
 # naming / quality-definition / media-settings configs. The anime database
 # only contributes its anime profile(s).
@@ -1531,21 +1554,23 @@ print(json.dumps({"dbId": db["id"], "db": db.get("name"), "qp": names(db, "quali
     if [ -n "$anime" ]; then echo "    Profilarr/$name: anime profile '$anime' from '$PROFILARR_ANIME_DB'"
     else warn "Profilarr/$name: no anime profile found in '$PROFILARR_ANIME_DB'; re-run once that database has finished building"; fi
 
-    # Save selections (scheduled daily at 04:00 so later database updates flow through).
-    profilarr_action "$id" saveQualityProfiles --data-urlencode "selections=$qp_sel" --data-urlencode "priorities=$qp_prio" \
-        --data-urlencode 'trigger=schedule' --data-urlencode 'cron=0 4 * * *' >/dev/null
-    http_ok || { todo "Profilarr: saving quality profiles for $name failed (HTTP $(http_code))."; return 1; }
+    # Save selections (scheduled daily at 04:00 so later database updates flow
+    # through). A form action answers 200 with "type":"failure" when it
+    # rejects the input, so the body is checked, not only the status.
+    res=$(profilarr_action "$id" saveQualityProfiles --data-urlencode "selections=$qp_sel" --data-urlencode "priorities=$qp_prio" \
+        --data-urlencode 'trigger=schedule' --data-urlencode 'cron=0 4 * * *')
+    profilarr_saved "$res" || { todo "Profilarr: saving quality profiles for $name failed (HTTP $(http_code)): $(printf '%s' "$res" | head -c 160)"; return 1; }
     if [ -n "$dp_name" ]; then
-        profilarr_action "$id" saveDelayProfiles --data-urlencode "databaseId=$db_id" --data-urlencode "profileName=$dp_name" \
-            --data-urlencode 'trigger=schedule' --data-urlencode 'cron=0 4 * * *' >/dev/null
-        http_ok || warn "Profilarr: saving the delay profile for $name failed (HTTP $(http_code))"
+        res=$(profilarr_action "$id" saveDelayProfiles --data-urlencode "databaseId=$db_id" --data-urlencode "profileName=$dp_name" \
+            --data-urlencode 'trigger=schedule' --data-urlencode 'cron=0 4 * * *')
+        profilarr_saved "$res" || warn "Profilarr: saving the delay profile for $name failed (HTTP $(http_code)): $(printf '%s' "$res" | head -c 160)"
     fi
-    profilarr_action "$id" saveMediaManagement \
+    res=$(profilarr_action "$id" saveMediaManagement \
         --data-urlencode "namingDatabaseId=${naming:+$db_id}" --data-urlencode "namingConfigName=$naming" \
         --data-urlencode "qualityDefinitionsDatabaseId=${qdef:+$db_id}" --data-urlencode "qualityDefinitionsConfigName=$qdef" \
         --data-urlencode "mediaSettingsDatabaseId=${media:+$db_id}" --data-urlencode "mediaSettingsConfigName=$media" \
-        --data-urlencode 'trigger=schedule' --data-urlencode 'cron=0 4 * * *' >/dev/null
-    http_ok || warn "Profilarr: saving media management for $name failed (HTTP $(http_code))"
+        --data-urlencode 'trigger=schedule' --data-urlencode 'cron=0 4 * * *')
+    profilarr_saved "$res" || warn "Profilarr: saving media management for $name failed (HTTP $(http_code)): $(printf '%s' "$res" | head -c 160)"
 
     # Run each sync now and wait; quality profiles must finish before Seerr
     # picks a profile later.
@@ -1578,12 +1603,13 @@ profilarr_enable_automations() {  # profilarr_enable_automations <Radarr|Sonarr>
     profilarr_automation "$name" "renames" "/arr/$id/rename?/save" \
         --data-urlencode 'enabled=true' --data-urlencode 'renameFolders=true' --data-urlencode 'ignoreTag=' \
         --data-urlencode 'cron=0 6 * * *' --data-urlencode 'summaryNotifications=false'
+    # (updateCleanup parses enabled as "1"; the drift and rename actions parse "true".)
     profilarr_automation "$name" "cleanup" "/arr/$id/settings?/updateCleanup" \
         --data-urlencode 'enabled=1' --data-urlencode 'cron=0 0 * * 0'
     # First cleanup pass right away (queued as a job; Profilarr runs it).
     local res
     res=$(profilarr_post "/arr/$id/settings?/runCleanupNow")
-    if http_ok && [[ "$res" == *'"type":"success"'* ]]; then ok "Profilarr: $name cleanup run queued"
+    if profilarr_saved "$res"; then ok "Profilarr: $name cleanup run queued"
     else warn "Profilarr: could not queue a cleanup run for $name (HTTP $(http_code)): $(printf '%s' "$res" | head -c 160)"; fi
 }
 
@@ -1631,36 +1657,6 @@ PROFILARR_UPGRADE_FILTER_SONARR='{
   "tag": ""
 }'
 
-# profilarr_page_data <page path> -> that page's load data as JSON
-# (SvelteKit __data.json is devalue-encoded; decoded generically, layout and
-# page data merged).
-profilarr_page_data() {
-    http GET "$PROFILARR_URL$1/__data.json" "" -b "$PROFILARR_COOKIE" | python3 -c '
-import json, sys
-raw = json.load(sys.stdin)
-SPECIAL = {-1: None, -2: None, -3: float("nan"), -4: float("inf"), -5: float("-inf"), -6: -0.0}
-def hydrate(values, i, memo):
-    if i in SPECIAL: return SPECIAL[i]
-    if i in memo: return memo[i]
-    v = values[i]
-    if isinstance(v, list):
-        if v and isinstance(v[0], str) and v[0] in ("Date","Set","Map","RegExp","Object","BigInt","null","Symbol") and len(v) >= 1:
-            out = [hydrate(values, j, memo) for j in v[1:]] if v[0] in ("Set","Map","Object") else v[1:]
-        else:
-            out = [hydrate(values, j, memo) for j in v]
-    elif isinstance(v, dict):
-        out = {k: hydrate(values, j, memo) for k, j in v.items()}
-    else:
-        out = v
-    memo[i] = out
-    return out
-merged = {}
-for node in raw.get("nodes") or []:
-    if node and node.get("type") == "data":
-        data = hydrate(node["data"], 0, {})
-        if isinstance(data, dict): merged.update(data)
-print(json.dumps(merged))' 2>/dev/null
-}
 
 # profilarr_enable_upgrades <Radarr|Sonarr>
 # Saves the upgrade config: enabled, every 6 hours (Profilarr's default, the
@@ -1688,7 +1684,7 @@ except Exception:
 print(json.dumps(kept + [new]))')
     res=$(profilarr_post "/arr/$id/upgrades?/save" --data-urlencode 'enabled=true' --data-urlencode 'cron=0 */6 * * *' \
         --data-urlencode 'filterMode=round_robin' --data-urlencode "filters=$filters")
-    if http_ok && [[ "$res" == *'"type":"success"'* ]]; then ok "Profilarr: $name upgrades enabled (Servers@Home Upgrade Filter, every 6 hours)"
+    if profilarr_saved "$res"; then ok "Profilarr: $name upgrades enabled (Servers@Home Upgrade Filter, every 6 hours)"
     else warn "Profilarr: could not enable upgrades for $name (HTTP $(http_code)): $(printf '%s' "$res" | head -c 200)"; fi
 }
 
@@ -1748,13 +1744,23 @@ configure_jellyfin() {
 # at the top of the script. Jellyfin keeps the whole encoding configuration
 # as one object: read it, change only the hardware fields, write it back.
 jellyfin_configure_transcoding() {
-    local cfg body
+    local cfg body accel_now
+    cfg=$(jf_api GET /System/Configuration/encoding)
+    http_ok || { todo "Jellyfin: could not read the encoding settings (HTTP $(http_code)); check Dashboard > Playback > Transcoding."; return 1; }
     if [ "$GPU_VENDOR" = "none" ]; then
-        ok "Jellyfin: no usable GPU; software transcoding left as is${GPU_NOTE:+ ($GPU_NOTE)}"
+        # The stack was just written without GPU passthrough, so hardware
+        # settings left over from an earlier run would fail every transcode.
+        accel_now=$(printf '%s' "$cfg" | jpy "d.get('HardwareAccelerationType')")
+        if [ -n "$accel_now" ] && [ "$accel_now" != "none" ]; then
+            body=$(printf '%s' "$cfg" | jpy "dict(d, HardwareAccelerationType='none', EnableHardwareEncoding=False, HardwareDecodingCodecs=[])")
+            jf_api POST /System/Configuration/encoding "$body" >/dev/null
+            if http_ok; then todo "Jellyfin: no usable GPU on this run, so the '$accel_now' transcoding settings from an earlier run were switched back to software (the container no longer has the device). Re-run once the GPU is back.${GPU_NOTE:+ ($GPU_NOTE)}"
+            else todo "Jellyfin: no usable GPU on this run, but the '$accel_now' transcoding settings from an earlier run are still active and could not be reset (HTTP $(http_code)); set Hardware acceleration to None in Dashboard > Playback > Transcoding.${GPU_NOTE:+ ($GPU_NOTE)}"; fi
+        else
+            ok "Jellyfin: no usable GPU; software transcoding${GPU_NOTE:+ ($GPU_NOTE)}"
+        fi
         return 0
     fi
-    cfg=$(jf_api GET /System/Configuration/encoding)
-    http_ok || { todo "Jellyfin: could not read the encoding settings (HTTP $(http_code)); set up $GPU_ACCEL transcoding in Dashboard > Playback."; return 1; }
     body=$(printf '%s' "$cfg" | ACCEL="$GPU_ACCEL" VENDOR="$GPU_VENDOR" RENDER="$GPU_RENDER" DEC="$GPU_DEC" ENC="$GPU_ENC" LP="$GPU_LP" \
         HEVC10="$GPU_HEVC10" VP9_10="$GPU_VP9_10" REXT10="$GPU_REXT10" REXT12="$GPU_REXT12" TONEMAP="$GPU_TONEMAP" VPP="$GPU_VPP" python3 -c '
 import json, os, sys
@@ -1786,7 +1792,7 @@ print(json.dumps(d))')
     http_ok || { todo "Jellyfin: saving the encoding settings returned HTTP $(http_code); set $GPU_ACCEL transcoding in Dashboard > Playback > Transcoding."; return 1; }
     # Read it back: the server answers 204 before anything is checked, so the
     # only proof is what it reports afterwards.
-    local readback accel_now
+    local readback
     readback=$(jf_api GET /System/Configuration/encoding)
     accel_now=$(printf '%s' "$readback" | jpy "d.get('HardwareAccelerationType')")
     if [ "$accel_now" = "$GPU_ACCEL" ]; then
@@ -1811,10 +1817,11 @@ seerr_api() {  # seerr_api <method> <path> [json]
 
 # seerr_add_arr <radarr|sonarr> <internal-host> <port> <api-key> <root>
 # Quality profile: "1080p Balanced" from Profilarr/Dictionarry, else any other
-# synced 1080p profile, else the stock HD-1080p. An entry that already exists
-# but still sits on a stock profile (Seerr configured before the Profilarr
-# sync had landed) is updated in place.
-SEERR_STOCK_PROFILES="{'Any', 'SD', 'HD-720p', 'HD-1080p', 'Ultra-HD', 'HD - 720p/1080p'}"
+# synced 1080p profile, else the stock HD-1080p. Sonarr also gets the anime
+# profile ("Anime 1080p"). An entry that already exists but still sits on a
+# stock profile (Seerr configured before the Profilarr sync had landed) is
+# updated in place.
+SEERR_STOCK_PROFILES="{'Any', 'SD', 'HD-720p', 'HD-1080p', 'Ultra-HD', 'HD - 720p/1080p'}"   # a python set literal
 seerr_add_arr() {
     local app="$1" host="$2" port="$3" key="$4" root="$5" existing cur_profile cur_anime test body id
     existing=$(seerr_api GET "/api/v1/settings/$app" | jpy "next((s for s in d if s['hostname']=='$host'), None)")
@@ -1830,10 +1837,10 @@ seerr_add_arr() {
     fi
     test=$(seerr_api POST "/api/v1/settings/$app/test" "$(APP_HOST="$host" APP_PORT="$port" APP_KEY="$key" jbuild '{"hostname": os.environ["APP_HOST"], "port": int(os.environ["APP_PORT"]), "apiKey": os.environ["APP_KEY"], "useSsl": False, "baseUrl": ""}')")
     http_ok || { todo "Seerr: could not reach ${app^} for its profile list (HTTP $(http_code)); add it in Settings > Services."; return 1; }
-    body=$(printf '%s' "$test" | APP="$app" APP_HOST="$host" APP_PORT="$port" APP_KEY="$key" WANT_ROOT="$root" EXISTING="$existing" ANIME_PROFILE="$PROFILARR_ANIME_PROFILE" python3 -c '
-import json, os, sys
+    body=$(printf '%s' "$test" | APP="$app" APP_HOST="$host" APP_PORT="$port" APP_KEY="$key" WANT_ROOT="$root" EXISTING="$existing" ANIME_PROFILE="$PROFILARR_ANIME_PROFILE" STOCK="$SEERR_STOCK_PROFILES" python3 -c '
+import ast, json, os, sys
 d = json.load(sys.stdin)
-stock = {"Any", "SD", "HD-720p", "HD-1080p", "Ultra-HD", "HD - 720p/1080p"}
+stock = ast.literal_eval(os.environ["STOCK"])
 profiles = d.get("profiles") or []
 pick = (next((p for p in profiles if p["name"] == "1080p Balanced"), None)
         or next((p for p in profiles if "1080" in p["name"] and p["name"] not in stock), None)
@@ -1875,7 +1882,11 @@ print(pick["name"], file=sys.stderr); print(anime["name"] if anime else "", file
     picked=$(sed -n 1p "$COOKIE_DIR/profile.txt"); anime_picked=$(sed -n 2p "$COOKIE_DIR/profile.txt"); changed=$(sed -n 3p "$COOKIE_DIR/profile.txt")
     if [ -n "$existing" ]; then
         if [ "$changed" != "1" ]; then
-            warn "Seerr: ${app^} has no Profilarr profile yet (sync not finished?); staying on '$cur_profile'. Re-run after the sync."
+            if [ "$picked" = "$cur_profile" ] && [ "$app" = sonarr ] && [ -z "$anime_picked" ]; then
+                warn "Seerr: Sonarr keeps '$cur_profile'; no anime profile in Sonarr yet (Profilarr '$PROFILARR_ANIME_DB' sync not finished?). Re-run after the sync."
+            else
+                warn "Seerr: ${app^} has no Profilarr profile yet (sync not finished?); staying on '$cur_profile'. Re-run after the sync."
+            fi
             return 0
         fi
         id=$(printf '%s' "$existing" | jpy "d['id']")
@@ -1907,12 +1918,16 @@ configure_seerr() {
         http_ok && ok "Seerr: connected to Jellyfin as $ADMIN_USER" \
                 || { todo "Seerr: Jellyfin sign-in failed (HTTP $(http_code)); finish setup at $SEERR_URL."; return 1; }
     fi
-    local libs id
+    local libs id n_lib=0 n_fail=0
     libs=$(seerr_api POST /api/v1/settings/jellyfin/library/sync)
+    http_ok || warn "Seerr: Jellyfin library sync returned HTTP $(http_code)"
     for id in $(printf '%s' "$libs" | jpy "' '.join(l['id'] for l in d)"); do
+        n_lib=$(( n_lib + 1 ))
         seerr_api PUT "/api/v1/settings/jellyfin/library/$id" '{"enabled": true}' >/dev/null
+        http_ok || n_fail=$(( n_fail + 1 ))
     done
-    ok "Seerr: Jellyfin libraries synced and enabled"
+    if [ "$n_lib" -gt 0 ] && [ "$n_fail" -eq 0 ]; then ok "Seerr: $n_lib Jellyfin libraries synced and enabled"
+    else todo "Seerr: Jellyfin libraries: $n_lib found, $n_fail could not be enabled; check Settings > Jellyfin."; fi
     seerr_api POST /api/v1/settings/jellyfin/sync '{"start": true}' >/dev/null
     [ -n "$RADARR_API_KEY" ] && seerr_add_arr radarr radarr 7878 "$RADARR_API_KEY" /media/movies
     [ -n "$SONARR_API_KEY" ] && seerr_add_arr sonarr sonarr 8989 "$SONARR_API_KEY" /media/tv
@@ -2007,13 +2022,13 @@ qui_import_prowlarr_indexers() {
         echo "    Qui: Prowlarr has no private torrent indexers yet; re-run this script (or use Settings > Indexers > 1-click sync) after adding trackers."
         return 0
     fi
-    discovered=$(qui_api POST /api/torznab/indexers/discover "$(jbuild '{"base_url": "http://prowlarr:9696", "api_key": os.environ["PROWLARR_API_KEY"]}')")
+    discovered=$(qui_api POST /api/torznab/indexers/discover "$(PROWLARR_API_KEY="$PROWLARR_API_KEY" jbuild '{"base_url": "http://prowlarr:9696", "api_key": os.environ["PROWLARR_API_KEY"]}')")
     http_ok || { warn "Qui: Prowlarr discovery failed (HTTP $(http_code))"; return 1; }
     have=$(qui_api GET /api/torznab/indexers | jpy "[i.get('indexer_id') for i in d]")
     local id payload
     for id in $private; do
         [[ "$have" == *"\"$id\""* ]] && continue
-        payload=$(printf '%s' "$discovered" | WANT="$id" python3 -c '
+        payload=$(printf '%s' "$discovered" | WANT="$id" PROWLARR_API_KEY="$PROWLARR_API_KEY" python3 -c '
 import json, os, sys
 d = json.load(sys.stdin)
 i = next((x for x in d.get("indexers", []) if str(x.get("id")) == os.environ["WANT"]), None)
@@ -2233,7 +2248,11 @@ configure_dockge() {
     dockge_sio_send "$sid" "422[\"login\",{\"username\":$user,\"password\":$pass}]"
     ack=$(dockge_sio_ack "$sid" 2)
     if [[ "$ack" != *'"ok":true'* ]]; then
-        todo "Dockge: login as $ADMIN_USER with the password in $DOCKGE_PASS_FILE failed ('${ack:-no answer}'); check $DOCKGE_URL."
+        if [ -s "$DOCKGE_PASS_FILE" ]; then
+            todo "Dockge: login as $ADMIN_USER with the password in $DOCKGE_PASS_FILE failed ('${ack:-no answer}'); check $DOCKGE_URL."
+        else
+            todo "Dockge: an account exists but $DOCKGE_PASS_FILE is missing, so this script cannot log in; log in at $DOCKGE_URL with the password you set and disable authentication under Settings."
+        fi
         dockge_sio_send "$sid" '41'; return 1
     fi
     dockge_sio_send "$sid" "423[\"setSettings\",{\"disableAuth\":true},$pass]"
@@ -2287,7 +2306,7 @@ done
 echo ""
 echo "  Logins (qBittorrent, Radarr, Sonarr, Prowlarr, Profilarr, Jellyfin, Seerr, Bazarr, Qui, Tracearr):"
 echo "    user: $ADMIN_USER   password: $ADMIN_PASS   email: $ADMIN_EMAIL"
-if [ -n "$DOCKGE_PASS" ]; then
+if [ -n "$DOCKGE_PASS_FILE" ] && [ -s "$DOCKGE_PASS_FILE" ]; then
     echo "  Dockge: authentication is disabled (no login needed). Its admin user is $ADMIN_USER / $DOCKGE_PASS"
     echo "    (also in $DOCKGE_PASS_FILE) should you turn authentication back on."
 fi
