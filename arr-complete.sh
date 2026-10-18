@@ -291,7 +291,7 @@ esac
 # Results feed the Jellyfin step. If the container cannot even reach the GPU
 # (missing NVIDIA runtime, odd permissions), the stack is written without GPU
 # passthrough rather than failing to start.
-GPU_ACCEL=""; GPU_DEC=""; GPU_ENC=""; GPU_HEVC10=0; GPU_VP9_10=0; GPU_REXT10=0; GPU_REXT12=0; GPU_LP=""; GPU_TONEMAP=0; GPU_DRIVER=""
+GPU_ACCEL=""; GPU_DEC=""; GPU_ENC=""; GPU_HEVC10=0; GPU_VP9_10=0; GPU_REXT10=0; GPU_REXT12=0; GPU_LP=""; GPU_TONEMAP=0; GPU_VPP=0; GPU_DRIVER=""
 JELLYFIN_IMAGE="lscr.io/linuxserver/jellyfin:latest"
 PROBE_VAAPI=$(cat <<'EOF'
 set +e
@@ -300,7 +300,18 @@ FF=/usr/lib/jellyfin-ffmpeg/ffmpeg; VI=/usr/lib/jellyfin-ffmpeg/vainfo
 timeout 60 "$VI" --display drm --device "$RENDER" 2>&1 | sed 's/^/vainfo: /'
 timeout 60 "$FF" -v error -init_hw_device vaapi=va:"$RENDER" -init_hw_device qsv=qs@va -f lavfi -i nullsrc=s=64x64:d=0.1 -f null - >/dev/null 2>&1 && echo qsv=1
 timeout 60 "$FF" -v error -init_hw_device vaapi=va:"$RENDER" -init_hw_device opencl=ocl@va -f lavfi -i nullsrc=s=64x64:d=0.1 -f null - >/dev/null 2>&1 && echo opencl=1
-exit 0
+# Driver (VPP) tone mapping: tonemap_vaapi needs a real HDR10 input with
+# mastering-display metadata, so make a tiny one with libx265 first. This is
+# the filter chain Jellyfin uses for "Enable VPP Tone mapping".
+T=$(mktemp -d)
+if timeout 90 "$FF" -v error -y -f lavfi -i "testsrc2=s=320x240:r=25:d=0.4" -pix_fmt yuv420p10le -c:v libx265 \
+     -color_primaries bt2020 -color_trc smpte2084 -colorspace bt2020nc \
+     -x265-params "log-level=none:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1):max-cll=1000,400" \
+     "$T/hdr10.mp4" >/dev/null 2>&1; then
+    timeout 60 "$FF" -v error -init_hw_device vaapi=va:"$RENDER" -hwaccel vaapi -hwaccel_device va -hwaccel_output_format vaapi \
+        -i "$T/hdr10.mp4" -vf "tonemap_vaapi=format=nv12:p=bt709:t=bt709:m=bt709" -f null - >/dev/null 2>&1 && echo vpp_tonemap=1
+else echo vpp_untested=1; fi
+rm -rf "$T"; exit 0
 EOF
 )
 PROBE_NVIDIA=$(cat <<'EOF'
@@ -324,6 +335,12 @@ else echo av1_untested=1; fi
 rm -rf "$T"; exit 0
 EOF
 )
+gpu_tonemap_summary() {
+    if [ "$GPU_TONEMAP" = 1 ] && [ "$GPU_VPP" = 1 ]; then echo "on (OpenCL, plus Intel VPP for HDR10)"
+    elif [ "$GPU_TONEMAP" = 1 ]; then echo "on (OpenCL/CUDA)"
+    elif [ "$GPU_VPP" = 1 ]; then echo "HDR10 only, via the Intel driver (VPP); no OpenCL runtime in this image, so HLG/Dolby Vision are not tone mapped"
+    else echo "off (no OpenCL runtime in this image and no driver tone mapping)"; fi
+}
 probe_gpu() {
     local out
     echo "    Measuring what the $GPU_VENDOR GPU can decode/encode with Jellyfin's ffmpeg in a throwaway container"
@@ -374,7 +391,8 @@ else:
                 if ep == "EncSliceLP": lp.append(c)
 dedupe = lambda xs: sorted(set(xs), key=["h264", "hevc", "mpeg2video", "vc1", "vp8", "vp9", "av1"].index)
 print(json.dumps({"dec": dedupe(dec), "enc": dedupe(enc), "lp": dedupe(lp), "hevc10": int(bool(hevc10)), "vp9_10": int(bool(vp9_10)),
-                  "rext10": int(bool(rext10)), "rext12": int(bool(rext12)), "qsv": flags.get("qsv", 0), "opencl": flags.get("opencl", 0), "driver": driver}))')
+                  "rext10": int(bool(rext10)), "rext12": int(bool(rext12)), "qsv": flags.get("qsv", 0), "opencl": flags.get("opencl", 0),
+                  "vpp": flags.get("vpp_tonemap", 0), "driver": driver}))')
     GPU_DEC=$(printf '%s' "$parsed" | jpy "','.join(d['dec'])")
     GPU_ENC=$(printf '%s' "$parsed" | jpy "','.join(d['enc'])")
     GPU_LP=$(printf '%s' "$parsed" | jpy "','.join(d['lp'])")
@@ -388,7 +406,7 @@ print(json.dumps({"dec": dedupe(dec), "enc": dedupe(enc), "lp": dedupe(lp), "hev
     case "$GPU_VENDOR" in
         nvidia) GPU_ACCEL="nvenc"; GPU_TONEMAP=1 ;;   # CUDA tone mapping is available wherever NVENC is
         intel)  if [ "$(printf '%s' "$parsed" | jpy "d['qsv']")" = "1" ]; then GPU_ACCEL="qsv"; else GPU_ACCEL="vaapi"; fi
-                GPU_TONEMAP=$(printf '%s' "$parsed" | jpy "d['opencl']") ;;
+                GPU_TONEMAP=$(printf '%s' "$parsed" | jpy "d['opencl']"); GPU_VPP=$(printf '%s' "$parsed" | jpy "d['vpp']") ;;
         amd)    GPU_ACCEL="vaapi"; GPU_TONEMAP=$(printf '%s' "$parsed" | jpy "d['opencl']") ;;
     esac
     local tenbit=""
@@ -401,7 +419,7 @@ print(json.dumps({"dec": dedupe(dec), "enc": dedupe(enc), "lp": dedupe(lp), "hev
     echo "      hardware decode:   ${GPU_DEC:-none}${tenbit}"
     echo "      hardware encode:   ${GPU_ENC:-none}${GPU_LP:+ (Intel low-power: $GPU_LP)}"
     echo "      acceleration:      $GPU_ACCEL"
-    echo "      HDR tone mapping:  $([ "$GPU_TONEMAP" = 1 ] && echo "on (OpenCL/CUDA available)" || echo "off (no OpenCL on this driver)")"
+    echo "      HDR tone mapping:  $(gpu_tonemap_summary)"
     echo "    These settings are applied to Jellyfin in step 7."
 }
 [ "$GPU_VENDOR" = "none" ] || probe_gpu || warn "$GPU_NOTE"
@@ -1701,7 +1719,7 @@ jellyfin_configure_transcoding() {
     cfg=$(jf_api GET /System/Configuration/encoding)
     http_ok || { todo "Jellyfin: could not read the encoding settings (HTTP $(http_code)); set up $GPU_ACCEL transcoding in Dashboard > Playback."; return 1; }
     body=$(printf '%s' "$cfg" | ACCEL="$GPU_ACCEL" VENDOR="$GPU_VENDOR" RENDER="$GPU_RENDER" DEC="$GPU_DEC" ENC="$GPU_ENC" LP="$GPU_LP" \
-        HEVC10="$GPU_HEVC10" VP9_10="$GPU_VP9_10" REXT10="$GPU_REXT10" REXT12="$GPU_REXT12" TONEMAP="$GPU_TONEMAP" python3 -c '
+        HEVC10="$GPU_HEVC10" VP9_10="$GPU_VP9_10" REXT10="$GPU_REXT10" REXT12="$GPU_REXT12" TONEMAP="$GPU_TONEMAP" VPP="$GPU_VPP" python3 -c '
 import json, os, sys
 d = json.load(sys.stdin)
 e = os.environ
@@ -1716,7 +1734,7 @@ d["EnableHardwareEncoding"] = "h264" in enc
 d["AllowHevcEncoding"] = "hevc" in enc
 d["AllowAv1Encoding"] = "av1" in enc
 d["EnableTonemapping"] = e["TONEMAP"] == "1"
-d["EnableVppTonemapping"] = False
+d["EnableVppTonemapping"] = e["VENDOR"] == "intel" and e["VPP"] == "1"
 d["PreferSystemNativeHwDecoder"] = True
 d["EnableEnhancedNvdecDecoder"] = e["VENDOR"] == "nvidia"
 d["EnableIntelLowPowerH264HwEncoder"] = e["VENDOR"] == "intel" and "h264" in lp
@@ -1735,10 +1753,14 @@ print(json.dumps(d))')
     readback=$(jf_api GET /System/Configuration/encoding)
     accel_now=$(printf '%s' "$readback" | jpy "d.get('HardwareAccelerationType')")
     if [ "$accel_now" = "$GPU_ACCEL" ]; then
-        ok "Jellyfin: hardware transcoding set to $GPU_ACCEL (${GPU_NAME:-$GPU_VENDOR}): decode [${GPU_DEC:-none}], encode [${GPU_ENC:-none}], HDR tone mapping $([ "$GPU_TONEMAP" = 1 ] && echo on || echo off)"
-        echo "    Jellyfin reports: $(printf '%s' "$readback" | jpy "f\"acceleration={d.get('HardwareAccelerationType')}, device={d.get('QsvDevice') or d.get('VaapiDevice')}, decode={','.join(d.get('HardwareDecodingCodecs') or [])}, hw encode={d.get('EnableHardwareEncoding')}, HEVC encode={d.get('AllowHevcEncoding')}, AV1 encode={d.get('AllowAv1Encoding')}, tone mapping={d.get('EnableTonemapping')}\"")"
+        ok "Jellyfin: hardware transcoding set to $GPU_ACCEL (${GPU_NAME:-$GPU_VENDOR}): decode [${GPU_DEC:-none}], encode [${GPU_ENC:-none}], HDR tone mapping $(gpu_tonemap_summary)"
+        echo "    Jellyfin reports: $(printf '%s' "$readback" | jpy "f\"acceleration={d.get('HardwareAccelerationType')}, device={d.get('QsvDevice') or d.get('VaapiDevice')}, decode={','.join(d.get('HardwareDecodingCodecs') or [])}, hw encode={d.get('EnableHardwareEncoding')}, HEVC encode={d.get('AllowHevcEncoding')}, AV1 encode={d.get('AllowAv1Encoding')}, tone mapping={d.get('EnableTonemapping')}, VPP tone mapping={d.get('EnableVppTonemapping')}\"")"
         echo "    (Dashboard > Playback > Transcoding; reload the page if it was already open.)"
-        [ "$GPU_TONEMAP" = 1 ] || warn "Jellyfin: OpenCL tone mapping is not available on this GPU/driver, so HDR video is transcoded without tone mapping (colors look washed out on SDR screens). Check Dashboard > Playback > Transcoding after the first HDR play."
+        if [ "$GPU_TONEMAP" != 1 ] && [ "$GPU_VPP" != 1 ]; then
+            warn "Jellyfin: no tone mapping is available on this GPU/driver, so HDR video is transcoded without it (colors look washed out on SDR screens)."
+        elif [ "$GPU_TONEMAP" != 1 ]; then
+            echo "    Jellyfin: HDR10 is tone mapped by the Intel driver (VPP). The image has no OpenCL runtime, so HLG and Dolby Vision content is transcoded without tone mapping."
+        fi
     else
         todo "Jellyfin: accepted the encoding settings (HTTP $(http_code)) but reads back acceleration '${accel_now:-?}' instead of '$GPU_ACCEL'; set $GPU_ACCEL transcoding in Dashboard > Playback > Transcoding. Sent: $(printf '%s' "$body" | head -c 300)"
     fi
