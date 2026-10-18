@@ -64,6 +64,8 @@ wait_for() {
             warn "Timed out waiting for $what." >&2
             return 1
         fi
+        # A sign of life every 30s, so a long wait is not mistaken for a hang.
+        [ $(( waited % 30 )) -eq 0 ] && echo "    ... still waiting (${waited}s of ${timeout}s)" >&2
     done
     return 0
 }
@@ -566,9 +568,11 @@ for subdir in "${MEDIA_SUBDIRECTORIES[@]}"; do
 done
 
 # Tracearr's all-in-one image keeps its database, Redis and app data in three
-# folders; its entrypoint re-owns them for the internal postgres/redis users.
+# folders; its entrypoint owns them for the internal postgres/redis users, so
+# they are created once and never re-owned (a running database must keep its
+# ownership).
 for subdir in postgres redis data; do
-    create_directory "$CONFIGS_PATH/tracearr/$subdir"
+    [ -d "$CONFIGS_PATH/tracearr/$subdir" ] || create_directory "$CONFIGS_PATH/tracearr/$subdir"
 done
 
 create_dataset "$CONFIG_POOL" "stacks"
@@ -2112,8 +2116,15 @@ jf_api_key() {
 
 configure_tracearr() {
     info "[11/12] Tracearr"
-    wait_for "Tracearr (its bundled database takes a minute on first start)" 300 tracearr_ready \
-        || { todo "Tracearr did not become ready; check: docker logs tracearr"; return 1; }
+    if ! wait_for "Tracearr (its bundled database takes a minute on first start)" 300 tracearr_ready; then
+        # Say what it is doing instead: the health answer carries the mode
+        # (starting / maintenance / ready) and the database and Redis state.
+        local health cstate
+        health=$(curl -sS -m 10 "$TRACEARR_URL/health" 2>&1 | head -c 300)
+        cstate=$(docker ps -a --filter name='^tracearr$' --format '{{.Status}}' 2>/dev/null)
+        todo "Tracearr did not become ready. Container: ${cstate:-not found}. /health: ${health:-no answer}. Check: docker logs --tail 50 tracearr"
+        return 1
+    fi
     local status res
     status=$(http GET "$TRACEARR_URL/api/v1/setup/status")
     if [ "$(printf '%s' "$status" | jpy "d.get('needsSetup')")" = "True" ]; then
