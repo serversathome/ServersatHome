@@ -298,8 +298,28 @@ set +e
 FF=/usr/lib/jellyfin-ffmpeg/ffmpeg; VI=/usr/lib/jellyfin-ffmpeg/vainfo
 [ -x "$VI" ] || VI=$(command -v vainfo)
 timeout 60 "$VI" --display drm --device "$RENDER" 2>&1 | sed 's/^/vainfo: /'
-timeout 60 "$FF" -v error -init_hw_device vaapi=va:"$RENDER" -init_hw_device qsv=qs@va -f lavfi -i nullsrc=s=64x64:d=0.1 -f null - >/dev/null 2>&1 && echo qsv=1
+QSV=0
+timeout 60 "$FF" -v error -init_hw_device vaapi=va:"$RENDER" -init_hw_device qsv=qs@va -f lavfi -i nullsrc=s=64x64:d=0.1 -f null - >/dev/null 2>&1 && { echo qsv=1; QSV=1; }
 timeout 60 "$FF" -v error -init_hw_device vaapi=va:"$RENDER" -init_hw_device opencl=ocl@va -f lavfi -i nullsrc=s=64x64:d=0.1 -f null - >/dev/null 2>&1 && echo opencl=1
+# Real encodes, with the rate control Jellyfin uses (VBR). vainfo lists an
+# encoder profile whether or not it works: low-power (VDEnc) encoding on
+# older Intel generations needs the i915 HuC firmware, and only an actual
+# encode shows whether it is there.
+enc_test() {  # enc_test <h264|hevc|av1> <low_power 0|1>
+    if [ "$QSV" = 1 ]; then
+        timeout 90 "$FF" -v error -init_hw_device vaapi=va:"$RENDER" -init_hw_device qsv=qs@va -filter_hw_device qs \
+            -f lavfi -i "testsrc2=s=320x240:r=25:d=0.4" -vf "format=nv12,hwupload=extra_hw_frames=64" \
+            -c:v "${1}_qsv" -preset veryfast -low_power "$2" -b:v 2M -maxrate 2M -bufsize 4M -f null - >/dev/null 2>&1
+    else
+        timeout 90 "$FF" -v error -init_hw_device vaapi=va:"$RENDER" -filter_hw_device va \
+            -f lavfi -i "testsrc2=s=320x240:r=25:d=0.4" -vf "format=nv12,hwupload" \
+            -c:v "${1}_vaapi" -low_power "$2" -b:v 2M -maxrate 2M -f null - >/dev/null 2>&1
+    fi
+}
+for c in h264 hevc av1; do
+    if enc_test "$c" 0; then echo "encok_$c=1"; else echo "encfail_$c=1"; fi
+    enc_test "$c" 1 && echo "lpok_$c=1"
+done
 # Driver (VPP) tone mapping: tonemap_vaapi needs a real HDR10 input with
 # mastering-display metadata, so make a tiny one with libx265 first. This is
 # the filter chain Jellyfin uses for "Enable VPP Tone mapping".
@@ -390,15 +410,28 @@ else:
                 enc.append(c)
                 if ep == "EncSliceLP": lp.append(c)
 dedupe = lambda xs: sorted(set(xs), key=["h264", "hevc", "mpeg2video", "vc1", "vp8", "vp9", "av1"].index)
+notes = []
+if os.environ["VENDOR"] != "nvidia":
+    # The driver lists a profile; the test encode decides.
+    for c in dedupe(enc):
+        if flags.get("encfail_" + c):
+            notes.append(c + " encode is listed by the driver but a test encode failed; hardware " + c + " encoding stays off")
+    bad_lp = [c for c in dedupe(lp) if not flags.get("lpok_" + c)]
+    if bad_lp:
+        notes.append("low-power " + "/".join(bad_lp) + " encoding is listed by the driver but a test encode failed (i915 HuC firmware not loaded?); the normal encoder is used instead")
+    enc = [c for c in enc if not flags.get("encfail_" + c)]
+    lp = [c for c in lp if flags.get("lpok_" + c)]
 print(json.dumps({"dec": dedupe(dec), "enc": dedupe(enc), "lp": dedupe(lp), "hevc10": int(bool(hevc10)), "vp9_10": int(bool(vp9_10)),
                   "rext10": int(bool(rext10)), "rext12": int(bool(rext12)), "qsv": flags.get("qsv", 0), "opencl": flags.get("opencl", 0),
-                  "vpp": flags.get("vpp_tonemap", 0), "driver": driver}))')
+                  "vpp": flags.get("vpp_tonemap", 0), "driver": driver, "notes": notes}))')
     GPU_DEC=$(printf '%s' "$parsed" | jpy "','.join(d['dec'])")
     GPU_ENC=$(printf '%s' "$parsed" | jpy "','.join(d['enc'])")
     GPU_LP=$(printf '%s' "$parsed" | jpy "','.join(d['lp'])")
     GPU_HEVC10=$(printf '%s' "$parsed" | jpy "d['hevc10']"); GPU_VP9_10=$(printf '%s' "$parsed" | jpy "d['vp9_10']")
     GPU_REXT10=$(printf '%s' "$parsed" | jpy "d['rext10']"); GPU_REXT12=$(printf '%s' "$parsed" | jpy "d['rext12']")
     GPU_DRIVER=$(printf '%s' "$parsed" | jpy "d['driver']")
+    local note
+    while IFS= read -r note; do [ -n "$note" ] && warn "GPU: $note"; done < <(printf '%s' "$parsed" | jpy "'\n'.join(d['notes'])")
     if [ -z "$GPU_DEC" ] && [ -z "$GPU_ENC" ]; then
         GPU_NOTE="The $GPU_VENDOR GPU exposed no decoders or encoders to Jellyfin's ffmpeg${GPU_DRIVER:+ (driver: $GPU_DRIVER)}; Jellyfin runs without it. Probe output: $(printf '%s' "$out" | tail -3 | tr '\n' ' ')"
         GPU_VENDOR="none"; return 1
