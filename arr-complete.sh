@@ -81,6 +81,8 @@ wait_for() {
 HTTP_STATUS_FILE=$(mktemp)
 HTTP_BODY_FILE=$(mktemp)
 HTTP_ERR_FILE=$(mktemp)
+COOKIE_DIR=$(mktemp -d)   # session cookies for the apps configured below
+trap 'rm -rf "$COOKIE_DIR" "$HTTP_STATUS_FILE" "$HTTP_BODY_FILE" "$HTTP_ERR_FILE"' EXIT
 http() {
     local method="$1" url="$2" body="${3-}"
     shift $(( $# < 3 ? $# : 3 ))
@@ -198,7 +200,7 @@ echo "Configs/stacks pool: $CONFIG_POOL    Media pool: $MEDIA_POOL"
 DEFAULT_IF=$(ip -o route show default 2>/dev/null | awk '{print $5; exit}')
 HOST_CIDR=$(ip -o -4 addr show dev "${DEFAULT_IF:-lo}" scope global 2>/dev/null | awk '{print $4; exit}')
 HOST_IP="${HOST_CIDR%/*}"
-if [ -n "$HOST_CIDR" ] && command -v python3 >/dev/null 2>&1; then
+if [ -n "$HOST_CIDR" ]; then
     CIDR_NETWORK=$(python3 -c 'import ipaddress,sys; print(ipaddress.ip_interface(sys.argv[1]).network)' "$HOST_CIDR" 2>/dev/null)
 fi
 if [ -z "${CIDR_NETWORK:-}" ]; then
@@ -251,7 +253,7 @@ detect_gpu() {
     fi
     if [ "$GPU_VENDOR" != "none" ]; then
         dev=$(basename "$(readlink -f "/sys/class/drm/${GPU_RENDER##*/}/device" 2>/dev/null)" 2>/dev/null)
-        GPU_NAME=$(lspci -s "$dev" 2>/dev/null | sed 's/^[^:]*: //' | head -1)
+        GPU_NAME=$(lspci -s "$dev" 2>/dev/null | sed 's/^[0-9a-f:.]* [^:]*: //' | head -1)
     fi
 }
 detect_gpu
@@ -266,8 +268,8 @@ echo "    Display adapters (lspci):"; echo "${GPU_DISPLAYS:-      (none listed)}
 case "$GPU_VENDOR" in
     none)
         echo "    Result: no usable GPU; Jellyfin will transcode in software."
-        if printf '%s' "$GPU_DISPLAYS" | grep -qiE '1234:1111|qemu|bochs|virtio|vmware|hyper-v|microsoft corporation|red hat'; then
-            echo "    The only display adapter is a virtual one, so TrueNAS is running in a VM and the"
+        if [ -n "$GPU_DISPLAYS" ] && ! printf '%s\n' "$GPU_DISPLAYS" | grep -viE '1234:1111|qemu|bochs|virtio|vmware|hyper-v|microsoft corporation|red hat' | grep -q .; then
+            echo "    Every display adapter is a virtual one, so TrueNAS is running in a VM and the"
             echo "    physical GPU has not been passed through. Pass it to the VM (PCI passthrough; a"
             echo "    renderD* node then appears under /dev/dri) and re-run this script."
         elif [[ "$GPU_DRI_NODES" == *card* ]]; then
@@ -285,8 +287,10 @@ esac
 # container (docker run --rm: nothing stays behind except the Jellyfin image,
 # which the stack needs anyway):
 #   Intel / AMD : vainfo lists the VA-API profiles (VLD = decode, EncSlice =
-#                 encode, EncSliceLP = Intel low-power encode); a short ffmpeg
-#                 run checks QSV (Intel) and OpenCL (HDR tone mapping).
+#                 encode, EncSliceLP = Intel low-power encode); ffmpeg then
+#                 checks QSV (Intel) and OpenCL (HDR tone mapping), runs a
+#                 real encode per codec, normal and low-power, and tries the
+#                 driver's own HDR10 tone mapping (VPP) on a generated clip.
 #   NVIDIA      : ffmpeg encodes a test pattern with h264/hevc/av1_nvenc and
 #                 decodes generated clips with the *_cuvid decoders (NVDEC),
 #                 including 10-bit HEVC and VP9.
@@ -736,7 +740,7 @@ write_stack jellyfin <<EOF
 services:
   jellyfin:
     container_name: jellyfin
-    image: lscr.io/linuxserver/jellyfin:latest
+    image: $JELLYFIN_IMAGE
     environment:
       - PUID=568
       - PGID=568
@@ -969,9 +973,6 @@ QUI_URL="http://localhost:7476"
 TRACEARR_URL="http://localhost:3000"
 DOCKGE_URL="http://localhost:5001"
 QB_INT="http://qbittorrent:8080"
-
-COOKIE_DIR=$(mktemp -d)
-trap 'rm -rf "$COOKIE_DIR" "$HTTP_STATUS_FILE" "$HTTP_BODY_FILE" "$HTTP_ERR_FILE"' EXIT
 
 # ── Shared *arr helpers (Radarr / Sonarr / Prowlarr share one API shape) ────
 # arr_api <base-url> <api-key> <method> <path> [json-body]
@@ -1455,9 +1456,10 @@ else:
     done
 }
 
-# Sync everything from the auto-linked Dictionarry database to one Arr:
-# all quality profiles (their custom formats come along), the first delay
-# profile, and the first naming / quality-definition / media-settings configs.
+# Sync to one Arr: every Dictionarry quality profile (their custom formats
+# come along) plus the anime profile from the second database, the delay
+# profile and the naming / quality-definition / media-settings configs that
+# match the Arr.
 profilarr_instance_id() {  # profilarr_instance_id <Radarr|Sonarr> -> id ("" if not linked)
     http GET "$PROFILARR_URL/api/v1/arr" "" -b "$PROFILARR_COOKIE" | jpy "next((a['id'] for a in d if a['name']=='$1'), None)"
 }
@@ -1811,9 +1813,10 @@ seerr_api() {  # seerr_api <method> <path> [json]
 
 # seerr_add_arr <radarr|sonarr> <internal-host> <port> <api-key> <root>
 # Quality profile: "1080p Balanced" from Profilarr/Dictionarry, else any other
-# synced 1080p profile, else the stock HD-1080p. An entry that already exists
-# but still sits on a stock profile (Seerr configured before the Profilarr
-# sync had landed) is updated in place.
+# synced 1080p profile, else the stock HD-1080p. Sonarr also gets the anime
+# profile ("Anime 1080p"). An entry that already exists but still sits on a
+# stock profile (Seerr configured before the Profilarr sync had landed) is
+# updated in place.
 SEERR_STOCK_PROFILES="{'Any', 'SD', 'HD-720p', 'HD-1080p', 'Ultra-HD', 'HD - 720p/1080p'}"
 seerr_add_arr() {
     local app="$1" host="$2" port="$3" key="$4" root="$5" existing cur_profile cur_anime test body id
@@ -2007,13 +2010,13 @@ qui_import_prowlarr_indexers() {
         echo "    Qui: Prowlarr has no private torrent indexers yet; re-run this script (or use Settings > Indexers > 1-click sync) after adding trackers."
         return 0
     fi
-    discovered=$(qui_api POST /api/torznab/indexers/discover "$(jbuild '{"base_url": "http://prowlarr:9696", "api_key": os.environ["PROWLARR_API_KEY"]}')")
+    discovered=$(qui_api POST /api/torznab/indexers/discover "$(PROWLARR_API_KEY="$PROWLARR_API_KEY" jbuild '{"base_url": "http://prowlarr:9696", "api_key": os.environ["PROWLARR_API_KEY"]}')")
     http_ok || { warn "Qui: Prowlarr discovery failed (HTTP $(http_code))"; return 1; }
     have=$(qui_api GET /api/torznab/indexers | jpy "[i.get('indexer_id') for i in d]")
     local id payload
     for id in $private; do
         [[ "$have" == *"\"$id\""* ]] && continue
-        payload=$(printf '%s' "$discovered" | WANT="$id" python3 -c '
+        payload=$(printf '%s' "$discovered" | WANT="$id" PROWLARR_API_KEY="$PROWLARR_API_KEY" python3 -c '
 import json, os, sys
 d = json.load(sys.stdin)
 i = next((x for x in d.get("indexers", []) if str(x.get("id")) == os.environ["WANT"]), None)
@@ -2287,7 +2290,7 @@ done
 echo ""
 echo "  Logins (qBittorrent, Radarr, Sonarr, Prowlarr, Profilarr, Jellyfin, Seerr, Bazarr, Qui, Tracearr):"
 echo "    user: $ADMIN_USER   password: $ADMIN_PASS   email: $ADMIN_EMAIL"
-if [ -n "$DOCKGE_PASS" ]; then
+if [ -n "$DOCKGE_PASS_FILE" ] && [ -s "$DOCKGE_PASS_FILE" ]; then
     echo "  Dockge: authentication is disabled (no login needed). Its admin user is $ADMIN_USER / $DOCKGE_PASS"
     echo "    (also in $DOCKGE_PASS_FILE) should you turn authentication back on."
 fi
