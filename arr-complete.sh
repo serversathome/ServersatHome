@@ -17,6 +17,12 @@
 #        qBittorrent -> Radarr -> Sonarr -> FlareSolverr -> Prowlarr
 #        -> Profilarr -> Jellyfin -> Seerr -> Bazarr -> Qui -> Tracearr -> Dockge
 #
+#   Along the way it detects a GPU (NVIDIA, Intel or AMD, dedicated or
+#   integrated), measures what it can decode and encode with Jellyfin's own
+#   ffmpeg, passes it into the Jellyfin stack and switches Jellyfin to
+#   hardware transcoding with exactly those capabilities. No GPU: software
+#   transcoding, as before.
+#
 # Every step is idempotent (safe to re-run) and isolated: a step that cannot be
 # completed prints what to finish in the UI and the rest still runs.
 #
@@ -207,6 +213,193 @@ TZ_VALUE=$(timedatectl show -p Timezone --value 2>/dev/null || true)
 # Group that owns the Docker socket (999 on a standard TrueNAS install).
 # Dozzle runs as 568:568 and must join it to see containers.
 DOCKER_GID=$(stat -c '%g' /var/run/docker.sock 2>/dev/null || echo 999)
+
+# ── GPU for Jellyfin transcoding ────────────────────────────────────────────
+# Decided here because it shapes the Jellyfin compose file. What the GPU can
+# actually decode and encode is measured right after (see below) with
+# Jellyfin's own ffmpeg in a throwaway container; the Jellyfin step applies it.
+#   NVIDIA : needs the TrueNAS NVIDIA driver (Apps > Settings) for nvidia-smi
+#            and the container runtime to exist; the card is passed with the
+#            container toolkit.
+#   Intel / AMD : the render node under /dev/dri is passed through, plus the
+#            groups that own it, since Jellyfin runs as 568.
+# Preference when several are present: NVIDIA, then Intel, then AMD.
+GPU_VENDOR="none"; GPU_NAME=""; GPU_RENDER=""; GPU_NOTE=""
+detect_gpu() {
+    local node vendor dev
+    if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
+        GPU_VENDOR="nvidia"
+        GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)
+        return 0
+    fi
+    if lspci 2>/dev/null | grep -iE 'vga|3d|display' | grep -qi nvidia; then
+        GPU_NOTE="An NVIDIA GPU is in the PCI list but its driver is not loaded: turn on 'Install NVIDIA Drivers' under Apps > Settings in the TrueNAS UI and re-run this script. Jellyfin uses software transcoding until then."
+    fi
+    for node in /sys/class/drm/renderD*; do
+        [ -r "$node/device/vendor" ] || continue
+        vendor=$(cat "$node/device/vendor")
+        case "$vendor" in
+            0x8086) GPU_VENDOR="intel"; GPU_RENDER="/dev/${node##*/}"; break ;;
+            0x1002) [ "$GPU_VENDOR" = "none" ] && { GPU_VENDOR="amd"; GPU_RENDER="/dev/${node##*/}"; } ;;
+        esac
+    done
+    if [ "$GPU_VENDOR" != "none" ]; then
+        dev=$(basename "$(readlink -f "/sys/class/drm/${GPU_RENDER##*/}/device" 2>/dev/null)" 2>/dev/null)
+        GPU_NAME=$(lspci -s "$dev" 2>/dev/null | sed 's/^[^:]*: //' | head -1)
+    fi
+}
+detect_gpu
+case "$GPU_VENDOR" in
+    none) echo "GPU: none usable for transcoding; Jellyfin will transcode in software. ${GPU_NOTE}" ;;
+    nvidia) echo "GPU: NVIDIA ${GPU_NAME:-GPU} (NVENC/NVDEC)" ;;
+    *) echo "GPU: ${GPU_VENDOR^^} ${GPU_NAME:-GPU} via $GPU_RENDER${GPU_NOTE:+ (note: $GPU_NOTE)}" ;;
+esac
+
+# What can the GPU really decode and encode? Hardware varies too much for a
+# model table, so it is measured with Jellyfin's own ffmpeg in a one-off
+# container (docker run --rm: nothing stays behind except the Jellyfin image,
+# which the stack needs anyway):
+#   Intel / AMD : vainfo lists the VA-API profiles (VLD = decode, EncSlice =
+#                 encode, EncSliceLP = Intel low-power encode); a short ffmpeg
+#                 run checks QSV (Intel) and OpenCL (HDR tone mapping).
+#   NVIDIA      : ffmpeg encodes a test pattern with h264/hevc/av1_nvenc and
+#                 decodes generated clips with the *_cuvid decoders (NVDEC),
+#                 including 10-bit HEVC and VP9.
+# Results feed the Jellyfin step. If the container cannot even reach the GPU
+# (missing NVIDIA runtime, odd permissions), the stack is written without GPU
+# passthrough rather than failing to start.
+GPU_ACCEL=""; GPU_DEC=""; GPU_ENC=""; GPU_HEVC10=0; GPU_VP9_10=0; GPU_REXT10=0; GPU_REXT12=0; GPU_LP=""; GPU_TONEMAP=0; GPU_DRIVER=""
+JELLYFIN_IMAGE="lscr.io/linuxserver/jellyfin:latest"
+PROBE_VAAPI=$(cat <<'EOF'
+set +e
+FF=/usr/lib/jellyfin-ffmpeg/ffmpeg; VI=/usr/lib/jellyfin-ffmpeg/vainfo
+[ -x "$VI" ] || VI=$(command -v vainfo)
+timeout 60 "$VI" --display drm --device "$RENDER" 2>&1 | sed 's/^/vainfo: /'
+timeout 60 "$FF" -v error -init_hw_device vaapi=va:"$RENDER" -init_hw_device qsv=qs@va -f lavfi -i nullsrc=s=64x64:d=0.1 -f null - >/dev/null 2>&1 && echo qsv=1
+timeout 60 "$FF" -v error -init_hw_device vaapi=va:"$RENDER" -init_hw_device opencl=ocl@va -f lavfi -i nullsrc=s=64x64:d=0.1 -f null - >/dev/null 2>&1 && echo opencl=1
+exit 0
+EOF
+)
+PROBE_NVIDIA=$(cat <<'EOF'
+set +e
+FF=/usr/lib/jellyfin-ffmpeg/ffmpeg; T=$(mktemp -d); cd "$T" || exit 1
+SRC="-f lavfi -i testsrc2=s=320x240:r=25:d=0.4"
+enc() { timeout 60 "$FF" -v error -y $SRC -c:v "$1" -f null - >/dev/null 2>&1; }
+mk()  { local f="$1"; shift; timeout 90 "$FF" -v error -y $SRC "$@" "$f" >/dev/null 2>&1 && [ -s "$f" ]; }
+dec() { timeout 60 "$FF" -v error -c:v "$1" -i "$2" -f null - >/dev/null 2>&1; }
+for c in h264 hevc av1; do enc "${c}_nvenc" && echo "enc_$c=1"; done
+mk h264.mp4 -c:v libx264 -pix_fmt yuv420p && dec h264_cuvid h264.mp4 && echo dec_h264=1
+mk hevc.mp4 -c:v libx265 -pix_fmt yuv420p -x265-params log-level=none && dec hevc_cuvid hevc.mp4 && echo dec_hevc=1
+mk hevc10.mp4 -c:v libx265 -pix_fmt yuv420p10le -x265-params log-level=none && dec hevc_cuvid hevc10.mp4 && echo dec_hevc10=1
+mk vp9.webm -c:v libvpx-vp9 -pix_fmt yuv420p && dec vp9_cuvid vp9.webm && echo dec_vp9=1
+mk vp9_10.webm -c:v libvpx-vp9 -pix_fmt yuv420p10le -profile:v 2 && dec vp9_cuvid vp9_10.webm && echo dec_vp9_10=1
+mk vp8.webm -c:v libvpx -pix_fmt yuv420p && dec vp8_cuvid vp8.webm && echo dec_vp8=1
+mk mpeg2.mpg -c:v mpeg2video -pix_fmt yuv420p && dec mpeg2_cuvid mpeg2.mpg && echo dec_mpeg2video=1
+if mk av1.mkv -c:v libsvtav1 -pix_fmt yuv420p -preset 12 || mk av1.mkv -c:v libaom-av1 -pix_fmt yuv420p -cpu-used 8; then
+    dec av1_cuvid av1.mkv && echo dec_av1=1
+else echo av1_untested=1; fi
+rm -rf "$T"; exit 0
+EOF
+)
+probe_gpu() {
+    local out
+    echo "    Measuring what the $GPU_VENDOR GPU can decode/encode with Jellyfin's ffmpeg (one-off container, image $JELLYFIN_IMAGE)..."
+    case "$GPU_VENDOR" in
+        nvidia) out=$(timeout 900 docker run --rm --gpus all -e NVIDIA_DRIVER_CAPABILITIES=all --entrypoint /bin/bash "$JELLYFIN_IMAGE" -c "$PROBE_NVIDIA" 2>&1) ;;
+        *)      out=$(timeout 900 docker run --rm --device /dev/dri:/dev/dri -e RENDER="$GPU_RENDER" --entrypoint /bin/bash "$JELLYFIN_IMAGE" -c "$PROBE_VAAPI" 2>&1) ;;
+    esac
+    local rc=$?
+    if [ $rc -ne 0 ]; then
+        GPU_NOTE="GPU probe container failed (exit $rc): $(printf '%s' "$out" | grep -v '^vainfo:' | tail -2 | tr '\n' ' '). Jellyfin runs without the GPU."
+        GPU_VENDOR="none"; return 1
+    fi
+    local parsed
+    parsed=$(printf '%s\n' "$out" | VENDOR="$GPU_VENDOR" python3 -c '
+import json, os, re, sys
+lines = sys.stdin.read().splitlines()
+flags = {l.split("=")[0]: 1 for l in lines if re.fullmatch(r"[a-z0-9_]+=1", l)}
+dec, enc, lp = [], [], []
+hevc10 = vp9_10 = rext10 = rext12 = 0
+driver = ""
+if os.environ["VENDOR"] == "nvidia":
+    dec = [c for c in ("h264", "hevc", "vp8", "vp9", "av1", "mpeg2video") if flags.get("dec_" + c)]
+    if "h264" in dec: dec.append("vc1")            # NVDEC has decoded VC-1 on every generation that has NVDEC
+    if "av1_untested" in flags and flags.get("enc_av1"): dec.append("av1")   # AV1 encode implies AV1 decode
+    enc = [c for c in ("h264", "hevc", "av1") if flags.get("enc_" + c)]
+    hevc10, vp9_10 = flags.get("dec_hevc10", 0), flags.get("dec_vp9_10", 0)
+else:
+    for l in lines:
+        m = re.match(r"vainfo:\s*VAProfile(\S+)\s*:\s*VAEntrypoint(\S+)", l)
+        dm = re.search(r"vainfo:.*Driver version:\s*(.*)", l)
+        if dm: driver = dm.group(1).strip()
+        if not m: continue
+        prof, ep = m.groups()
+        if ep == "VLD":
+            if prof.startswith("H264"): dec.append("h264")
+            elif prof in ("HEVCMain", "HEVCMain10"): dec.append("hevc"); hevc10 |= prof == "HEVCMain10"
+            elif prof.startswith("HEVC"): rext10 |= prof in ("HEVCMain422_10", "HEVCMain444", "HEVCMain444_10"); rext12 |= prof in ("HEVCMain12", "HEVCMain422_12", "HEVCMain444_12")
+            elif prof in ("VP9Profile0", "VP9Profile2"): dec.append("vp9"); vp9_10 |= prof == "VP9Profile2"
+            elif prof == "AV1Profile0": dec.append("av1")
+            elif prof.startswith("MPEG2"): dec.append("mpeg2video")
+            elif prof.startswith("VC1"): dec.append("vc1")
+            elif prof.startswith("VP8"): dec.append("vp8")
+        elif ep in ("EncSlice", "EncSliceLP"):
+            c = "h264" if prof.startswith("H264") else "hevc" if prof == "HEVCMain" else "av1" if prof == "AV1Profile0" else None
+            if c:
+                enc.append(c)
+                if ep == "EncSliceLP": lp.append(c)
+dedupe = lambda xs: sorted(set(xs), key=["h264", "hevc", "mpeg2video", "vc1", "vp8", "vp9", "av1"].index)
+print(json.dumps({"dec": dedupe(dec), "enc": dedupe(enc), "lp": dedupe(lp), "hevc10": int(bool(hevc10)), "vp9_10": int(bool(vp9_10)),
+                  "rext10": int(bool(rext10)), "rext12": int(bool(rext12)), "qsv": flags.get("qsv", 0), "opencl": flags.get("opencl", 0), "driver": driver}))')
+    GPU_DEC=$(printf '%s' "$parsed" | jpy "','.join(d['dec'])")
+    GPU_ENC=$(printf '%s' "$parsed" | jpy "','.join(d['enc'])")
+    GPU_LP=$(printf '%s' "$parsed" | jpy "','.join(d['lp'])")
+    GPU_HEVC10=$(printf '%s' "$parsed" | jpy "d['hevc10']"); GPU_VP9_10=$(printf '%s' "$parsed" | jpy "d['vp9_10']")
+    GPU_REXT10=$(printf '%s' "$parsed" | jpy "d['rext10']"); GPU_REXT12=$(printf '%s' "$parsed" | jpy "d['rext12']")
+    GPU_DRIVER=$(printf '%s' "$parsed" | jpy "d['driver']")
+    if [ -z "$GPU_DEC" ] && [ -z "$GPU_ENC" ]; then
+        GPU_NOTE="The $GPU_VENDOR GPU exposed no decoders or encoders to Jellyfin's ffmpeg${GPU_DRIVER:+ (driver: $GPU_DRIVER)}; Jellyfin runs without it. Probe output: $(printf '%s' "$out" | tail -3 | tr '\n' ' ')"
+        GPU_VENDOR="none"; return 1
+    fi
+    case "$GPU_VENDOR" in
+        nvidia) GPU_ACCEL="nvenc"; GPU_TONEMAP=1 ;;   # CUDA tone mapping is available wherever NVENC is
+        intel)  if [ "$(printf '%s' "$parsed" | jpy "d['qsv']")" = "1" ]; then GPU_ACCEL="qsv"; else GPU_ACCEL="vaapi"; fi
+                GPU_TONEMAP=$(printf '%s' "$parsed" | jpy "d['opencl']") ;;
+        amd)    GPU_ACCEL="vaapi"; GPU_TONEMAP=$(printf '%s' "$parsed" | jpy "d['opencl']") ;;
+    esac
+    local tenbit=""
+    [ "$GPU_HEVC10" = 1 ] && tenbit+=" +10-bit HEVC"
+    [ "$GPU_VP9_10" = 1 ] && tenbit+=" +10-bit VP9"
+    ok "GPU: decode [${GPU_DEC:-none}]$tenbit, encode [${GPU_ENC:-none}]${GPU_LP:+ (low-power: $GPU_LP)}, acceleration '$GPU_ACCEL', HDR tone mapping $([ "$GPU_TONEMAP" = 1 ] && echo on || echo off)${GPU_DRIVER:+, driver $GPU_DRIVER}"
+}
+[ "$GPU_VENDOR" = "none" ] || probe_gpu || warn "$GPU_NOTE"
+
+# Compose fragments for the Jellyfin stack (already indented for the file).
+JELLYFIN_GPU_ENV=""
+JELLYFIN_GPU_BLOCK=""
+case "$GPU_VENDOR" in
+    intel|amd)
+        render_gid=$(stat -c '%g' "$GPU_RENDER")
+        video_gid=$(stat -c '%g' /dev/dri/card0 2>/dev/null || echo "$render_gid")
+        JELLYFIN_GPU_BLOCK="    devices:
+      - /dev/dri:/dev/dri
+    group_add:
+      - \"$render_gid\""
+        [ "$video_gid" != "$render_gid" ] && JELLYFIN_GPU_BLOCK+="
+      - \"$video_gid\""
+        ;;
+    nvidia)
+        JELLYFIN_GPU_ENV="      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=all"
+        JELLYFIN_GPU_BLOCK="    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]"
+        ;;
+esac
 
 # ── Layout ──────────────────────────────────────────────────────────────────
 # configs/<app>: one dataset per app. Seerr is the exception: its container
@@ -450,6 +643,7 @@ services:
       - $MEDIA_PATH:/media
 EOF
 
+# The GPU lines come from the detection above (empty when there is no GPU).
 write_stack jellyfin <<EOF
 services:
   jellyfin:
@@ -459,12 +653,14 @@ services:
       - PUID=568
       - PGID=568
       - TZ=$TZ_VALUE
+$JELLYFIN_GPU_ENV
     ports:
       - '8096:8096'
     restart: unless-stopped
     volumes:
       - $CONFIGS_PATH/jellyfin:/config
       - $MEDIA_PATH:/media
+$JELLYFIN_GPU_BLOCK
 EOF
 
 write_stack qbittorrent <<EOF
@@ -1089,7 +1285,37 @@ configure_profilarr() {
         if [[ "$linked" == *"\"${app^}\""* ]]; then ok "Profilarr: ${app^} linked ($url) [HTTP $code]"
         else todo "Profilarr: linking ${app^} returned HTTP $code ($(profilarr_body_hint)); add it under Arrs."; fi
     done
+    profilarr_link_anime_db
     profilarr_sync_all
+}
+
+# Second database (wiki section 3): Dumpstarr, the community database built
+# on top of Dictionarry and the TRaSH formats. It is the one of the three
+# listed catalogs with an anime profile that applies to Radarr and Sonarr
+# alike ("Anime 1080p", based on the TRaSH anime profile, dual audio
+# preferred). Linked exactly like the stock Dictionarry entry: hourly
+# auto-pull (sync_strategy 60 minutes, auto_pull on). Dictionarry stays the
+# higher-priority database, so on a name clash its definitions win.
+PROFILARR_ANIME_DB="Dumpstarr"
+PROFILARR_ANIME_DB_REPO="https://github.com/Dumpstarr/Database"
+PROFILARR_ANIME_PROFILE="Anime 1080p"
+profilarr_link_anime_db() {
+    local dbs
+    dbs=$(http GET "$PROFILARR_URL/api/v1/databases" "" -b "$PROFILARR_COOKIE" | jpy "[x['name'] for x in d]")
+    if [[ "$dbs" == *"\"$PROFILARR_ANIME_DB\""* ]]; then
+        ok "Profilarr: database '$PROFILARR_ANIME_DB' already linked"
+    else
+        # The API links synchronously (clone + build), so this can take a minute.
+        echo "    Profilarr: linking database '$PROFILARR_ANIME_DB' ($PROFILARR_ANIME_DB_REPO)..."
+        http POST "$PROFILARR_URL/api/v1/databases" \
+            "$(NAME="$PROFILARR_ANIME_DB" REPO="$PROFILARR_ANIME_DB_REPO" jbuild '{"name": os.environ["NAME"], "repository_url": os.environ["REPO"], "sync_strategy": 60, "auto_pull": True}')" \
+            -b "$PROFILARR_COOKIE" -H 'Content-Type: application/json' -m 600 >/dev/null
+        if http_ok; then ok "Profilarr: database '$PROFILARR_ANIME_DB' linked (auto-pull hourly, like Dictionarry)"
+        else todo "Profilarr: linking '$PROFILARR_ANIME_DB' returned HTTP $(http_code); link $PROFILARR_ANIME_DB_REPO under Databases for the anime profile."; return 1; fi
+    fi
+    # Its profiles only show up once the cache is built.
+    wait_for "Profilarr database '$PROFILARR_ANIME_DB'" 300 bash -c "curl -fs -b '$PROFILARR_COOKIE' '$PROFILARR_URL/api/v1/status' | python3 -c \"import json,sys; d=json.load(sys.stdin); sys.exit(0 if any(x['name']=='$PROFILARR_ANIME_DB' and x['counts']['qualityProfiles']>0 for x in d['databases']) else 1)\"" \
+        || warn "Profilarr: '$PROFILARR_ANIME_DB' has no profiles yet; the anime profile is picked up on the next run"
 }
 
 # profilarr_action <instance-id> <action> <form args...> -> prints JSON result; status via http_code
@@ -1155,7 +1381,7 @@ profilarr_sync_instance() {  # profilarr_sync_instance <Radarr|Sonarr>
 
     # The profile/config names live only in the sync page's load data
     # (SvelteKit __data.json, devalue-encoded). Decode it generically.
-    lists=$(http GET "$PROFILARR_URL/arr/$id/sync/__data.json" "" -b "$PROFILARR_COOKIE" | NAME="$name" python3 -c '
+    lists=$(http GET "$PROFILARR_URL/arr/$id/sync/__data.json" "" -b "$PROFILARR_COOKIE" | NAME="$name" ANIME_DB="$PROFILARR_ANIME_DB" ANIME_PROFILE="$PROFILARR_ANIME_PROFILE" python3 -c '
 import json, os, sys
 raw = json.load(sys.stdin)
 SPECIAL = {-1: None, -2: None, -3: float("nan"), -4: float("inf"), -5: float("-inf"), -6: -0.0}
@@ -1181,28 +1407,44 @@ for node in raw.get("nodes") or []:
     if isinstance(data, dict) and isinstance(data.get("databases"), list):
         found = data["databases"]
 if not found: sys.exit(1)
-db = found[0]
-names = lambda key: [x["name"] for x in (db.get(key) or []) if isinstance(x, dict) and x.get("name")]
+# Dictionarry (the stock database) supplies every profile plus the delay /
+# naming / quality-definition / media-settings configs. The anime database
+# only contributes its anime profile(s).
+db = next((x for x in found if x.get("name") == "Dictionarry"), found[0])
+anime_db = next((x for x in found if x.get("name") == os.environ["ANIME_DB"]), None)
+names = lambda src, key: [x["name"] for x in (src.get(key) or []) if isinstance(x, dict) and x.get("name")]
+sel = [{"databaseId": db["id"], "profileName": n} for n in names(db, "qualityProfiles")]
+anime = []
+if anime_db:
+    qps = names(anime_db, "qualityProfiles")
+    anime = [n for n in qps if n == os.environ["ANIME_PROFILE"]] or [n for n in qps if "anime" in n.lower()]
+    sel += [{"databaseId": anime_db["id"], "profileName": n} for n in anime]
+# Lower number = higher priority; the last-synced (highest-priority) database wins on clashes.
+prio = [{"databaseId": db["id"], "priority": 1}] + ([{"databaseId": anime_db["id"], "priority": 2}] if anime_db else [])
 # The database ships one delay/naming/etc. config per app ("Radarr", "Sonarr").
 # Prefer the one named after this instance; fall back to the first listed.
 app = os.environ["NAME"].lower()
 def pick(key):
-    xs = names(key)
+    xs = names(db, key)
     return next((n for n in xs if app in n.lower()), xs[0] if xs else "")
-print(json.dumps({"dbId": db["id"], "db": db.get("name"), "qp": names("qualityProfiles"), "dp": pick("delayProfiles"),
-                  "naming": pick("namingConfigs"), "qdef": pick("qualityDefinitionsConfigs"), "media": pick("mediaSettingsConfigs")}))' 2>/dev/null)
+print(json.dumps({"dbId": db["id"], "db": db.get("name"), "qp": names(db, "qualityProfiles"), "anime": anime, "sel": sel, "prio": prio,
+                  "dp": pick("delayProfiles"), "naming": pick("namingConfigs"), "qdef": pick("qualityDefinitionsConfigs"), "media": pick("mediaSettingsConfigs")}))' 2>/dev/null)
     [ -n "$lists" ] || { todo "Profilarr: could not read the Dictionarry profile list for $name; pick profiles under Arrs > $name > Sync."; return 1; }
-    local db_id qp_sel dp_name naming qdef media
+    local db_id qp_sel qp_prio dp_name naming qdef media anime
     db_id=$(printf '%s' "$lists" | jpy "d['dbId']")
-    qp_sel=$(printf '%s' "$lists" | jpy "[{'databaseId': d['dbId'], 'profileName': n} for n in d['qp']]")
+    qp_sel=$(printf '%s' "$lists" | jpy "d['sel']")
+    qp_prio=$(printf '%s' "$lists" | jpy "d['prio']")
     dp_name=$(printf '%s' "$lists" | jpy "d['dp']")
     naming=$(printf '%s' "$lists" | jpy "d['naming']")
     qdef=$(printf '%s' "$lists" | jpy "d['qdef']")
     media=$(printf '%s' "$lists" | jpy "d['media']")
+    anime=$(printf '%s' "$lists" | jpy "', '.join(d['anime'])")
     echo "    Profilarr/$name: $(printf '%s' "$lists" | jpy "len(d['qp'])") quality profiles from '$(printf '%s' "$lists" | jpy "d['db']")', delay '$dp_name', naming '$naming', quality defs '$qdef', media settings '$media'"
+    if [ -n "$anime" ]; then echo "    Profilarr/$name: anime profile '$anime' from '$PROFILARR_ANIME_DB'"
+    else warn "Profilarr/$name: no anime profile found in '$PROFILARR_ANIME_DB'; re-run once that database has finished building"; fi
 
     # Save selections (scheduled daily at 04:00 so later database updates flow through).
-    profilarr_action "$id" saveQualityProfiles --data-urlencode "selections=$qp_sel" --data-urlencode 'priorities=[]' \
+    profilarr_action "$id" saveQualityProfiles --data-urlencode "selections=$qp_sel" --data-urlencode "priorities=$qp_prio" \
         --data-urlencode 'trigger=schedule' --data-urlencode 'cron=0 4 * * *' >/dev/null
     http_ok || { todo "Profilarr: saving quality profiles for $name failed (HTTP $(http_code))."; return 1; }
     if [ -n "$dp_name" ]; then
@@ -1411,6 +1653,53 @@ configure_jellyfin() {
     [ -n "$JELLYFIN_TOKEN" ] || { todo "Jellyfin: could not log in as $ADMIN_USER; add the Movies and TV libraries in the UI."; return 1; }
     jf_add_library "Movies"   movies  /media/movies
     jf_add_library "TV Shows" tvshows /media/tv
+    jellyfin_configure_transcoding
+}
+
+# Hardware transcoding (Dashboard > Playback > Transcoding), from the probe
+# at the top of the script. Jellyfin keeps the whole encoding configuration
+# as one object: read it, change only the hardware fields, write it back.
+jellyfin_configure_transcoding() {
+    local cfg body
+    if [ "$GPU_VENDOR" = "none" ]; then
+        ok "Jellyfin: no usable GPU; software transcoding left as is${GPU_NOTE:+ ($GPU_NOTE)}"
+        return 0
+    fi
+    cfg=$(jf_api GET /System/Configuration/encoding)
+    http_ok || { todo "Jellyfin: could not read the encoding settings (HTTP $(http_code)); set up $GPU_ACCEL transcoding in Dashboard > Playback."; return 1; }
+    body=$(printf '%s' "$cfg" | ACCEL="$GPU_ACCEL" VENDOR="$GPU_VENDOR" RENDER="$GPU_RENDER" DEC="$GPU_DEC" ENC="$GPU_ENC" LP="$GPU_LP" \
+        HEVC10="$GPU_HEVC10" VP9_10="$GPU_VP9_10" REXT10="$GPU_REXT10" REXT12="$GPU_REXT12" TONEMAP="$GPU_TONEMAP" python3 -c '
+import json, os, sys
+d = json.load(sys.stdin)
+e = os.environ
+dec = [c for c in e["DEC"].split(",") if c]; enc = [c for c in e["ENC"].split(",") if c]; lp = [c for c in e["LP"].split(",") if c]
+d["HardwareAccelerationType"] = e["ACCEL"]
+d["HardwareDecodingCodecs"] = dec
+d["EnableDecodingColorDepth10Hevc"] = e["HEVC10"] == "1" and "hevc" in dec
+d["EnableDecodingColorDepth10Vp9"] = e["VP9_10"] == "1" and "vp9" in dec
+d["EnableDecodingColorDepth10HevcRext"] = e["REXT10"] == "1"
+d["EnableDecodingColorDepth12HevcRext"] = e["REXT12"] == "1"
+d["EnableHardwareEncoding"] = "h264" in enc
+d["AllowHevcEncoding"] = "hevc" in enc
+d["AllowAv1Encoding"] = "av1" in enc
+d["EnableTonemapping"] = e["TONEMAP"] == "1"
+d["EnableVppTonemapping"] = False
+d["PreferSystemNativeHwDecoder"] = True
+d["EnableEnhancedNvdecDecoder"] = e["VENDOR"] == "nvidia"
+d["EnableIntelLowPowerH264HwEncoder"] = e["VENDOR"] == "intel" and "h264" in lp
+d["EnableIntelLowPowerHevcHwEncoder"] = e["VENDOR"] == "intel" and "hevc" in lp
+if e["VENDOR"] in ("intel", "amd"):
+    d["VaapiDevice"] = e["RENDER"]
+if e["VENDOR"] == "intel":
+    d["QsvDevice"] = e["RENDER"]
+print(json.dumps(d))')
+    jf_api POST /System/Configuration/encoding "$body" >/dev/null
+    if http_ok; then
+        ok "Jellyfin: hardware transcoding set to $GPU_ACCEL (${GPU_NAME:-$GPU_VENDOR}): decode [${GPU_DEC:-none}], encode [${GPU_ENC:-none}], HDR tone mapping $([ "$GPU_TONEMAP" = 1 ] && echo on || echo off)"
+        [ "$GPU_TONEMAP" = 1 ] || warn "Jellyfin: OpenCL tone mapping is not available on this GPU/driver, so HDR video is transcoded without tone mapping (colors look washed out on SDR screens). Check Dashboard > Playback > Transcoding after the first HDR play."
+    else
+        todo "Jellyfin: saving the encoding settings returned HTTP $(http_code); set $GPU_ACCEL transcoding in Dashboard > Playback > Transcoding."
+    fi
 }
 
 # ── 8. Seerr ────────────────────────────────────────────────────────────────
@@ -1426,18 +1715,21 @@ seerr_api() {  # seerr_api <method> <path> [json]
 # sync had landed) is updated in place.
 SEERR_STOCK_PROFILES="{'Any', 'SD', 'HD-720p', 'HD-1080p', 'Ultra-HD', 'HD - 720p/1080p'}"
 seerr_add_arr() {
-    local app="$1" host="$2" port="$3" key="$4" root="$5" existing cur_profile test body id
+    local app="$1" host="$2" port="$3" key="$4" root="$5" existing cur_profile cur_anime test body id
     existing=$(seerr_api GET "/api/v1/settings/$app" | jpy "next((s for s in d if s['hostname']=='$host'), None)")
     if [ -n "$existing" ]; then
         cur_profile=$(printf '%s' "$existing" | jpy "d.get('activeProfileName')")
-        if [ "$(printf '%s' "$existing" | jpy "d.get('activeProfileName') in $SEERR_STOCK_PROFILES")" != "True" ]; then
-            ok "Seerr: ${app^} already configured (profile '$cur_profile')"; return 0
+        cur_anime=$(printf '%s' "$existing" | jpy "d.get('activeAnimeProfileName') or ''")
+        # Done when the default profile is a Profilarr one and, for Sonarr,
+        # the anime profile is set to a Profilarr one too.
+        if [ "$(printf '%s' "$existing" | jpy "d.get('activeProfileName') not in $SEERR_STOCK_PROFILES and ('$app' != 'sonarr' or (d.get('activeAnimeProfileName') or 'Any') not in $SEERR_STOCK_PROFILES)")" = "True" ]; then
+            ok "Seerr: ${app^} already configured (profile '$cur_profile'${cur_anime:+, anime $cur_anime})"; return 0
         fi
-        echo "    Seerr: ${app^} is on the stock profile '$cur_profile'; looking for a Profilarr profile..."
+        echo "    Seerr: ${app^} is on the stock profile '$cur_profile'${cur_anime:+ (anime $cur_anime)}; looking for Profilarr profiles..."
     fi
     test=$(seerr_api POST "/api/v1/settings/$app/test" "$(APP_HOST="$host" APP_PORT="$port" APP_KEY="$key" jbuild '{"hostname": os.environ["APP_HOST"], "port": int(os.environ["APP_PORT"]), "apiKey": os.environ["APP_KEY"], "useSsl": False, "baseUrl": ""}')")
     http_ok || { todo "Seerr: could not reach ${app^} for its profile list (HTTP $(http_code)); add it in Settings > Services."; return 1; }
-    body=$(printf '%s' "$test" | APP="$app" APP_HOST="$host" APP_PORT="$port" APP_KEY="$key" WANT_ROOT="$root" EXISTING="$existing" python3 -c '
+    body=$(printf '%s' "$test" | APP="$app" APP_HOST="$host" APP_PORT="$port" APP_KEY="$key" WANT_ROOT="$root" EXISTING="$existing" ANIME_PROFILE="$PROFILARR_ANIME_PROFILE" python3 -c '
 import json, os, sys
 d = json.load(sys.stdin)
 stock = {"Any", "SD", "HD-720p", "HD-1080p", "Ultra-HD", "HD - 720p/1080p"}
@@ -1450,9 +1742,17 @@ if not pick:
     sys.exit("no quality profiles")
 roots = [r["path"] for r in (d.get("rootFolders") or [])]
 root = os.environ["WANT_ROOT"] if os.environ["WANT_ROOT"] in roots else (roots[0] if roots else os.environ["WANT_ROOT"])
-if os.environ["EXISTING"]:
-    body = json.loads(os.environ["EXISTING"])
-    body.update(activeProfileId=pick["id"], activeProfileName=pick["name"])
+# Sonarr only: Seerr routes anime requests to a separate quality profile.
+# Use the Profilarr one ("Anime 1080p" from the anime database), else any
+# profile with "anime" in its name. With neither, the anime fields are left
+# unset (Seerr then uses the default profile) so a re-run can still set them.
+anime = None
+if os.environ["APP"] == "sonarr":
+    anime = (next((p for p in profiles if p["name"] == os.environ["ANIME_PROFILE"]), None)
+             or next((p for p in profiles if "anime" in p["name"].lower()), None))
+existing = json.loads(os.environ["EXISTING"]) if os.environ["EXISTING"] else None
+if existing:
+    body = dict(existing, activeProfileId=pick["id"], activeProfileName=pick["name"])
 else:
     body = {"name": os.environ["APP"].capitalize(), "hostname": os.environ["APP_HOST"], "port": int(os.environ["APP_PORT"]),
             "apiKey": os.environ["APP_KEY"], "useSsl": False, "baseUrl": "", "activeProfileId": pick["id"],
@@ -1462,22 +1762,30 @@ else:
         body["minimumAvailability"] = "released"
     else:
         body.update(enableSeasonFolders=True, seriesType="standard", animeSeriesType="anime", animeTags=[], monitorNewItems="all")
-print(json.dumps(body)); print(pick["name"], file=sys.stderr)' 2>"$COOKIE_DIR/profile.txt") \
+if anime:
+    body.update(activeAnimeProfileId=anime["id"], activeAnimeProfileName=anime["name"],
+                activeAnimeDirectory=(existing or {}).get("activeAnimeDirectory") or root, animeSeriesType="anime")
+changed = (not existing or existing.get("activeProfileName") != body["activeProfileName"]
+           or existing.get("activeAnimeProfileName") != body.get("activeAnimeProfileName"))
+print(json.dumps(body))
+print(pick["name"], file=sys.stderr); print(anime["name"] if anime else "", file=sys.stderr); print(int(changed), file=sys.stderr)' 2>"$COOKIE_DIR/profile.txt") \
         || { todo "Seerr: ${app^} has no quality profiles yet; add it in Settings > Services."; return 1; }
-    local picked; picked=$(cat "$COOKIE_DIR/profile.txt")
+    local picked anime_picked changed
+    picked=$(sed -n 1p "$COOKIE_DIR/profile.txt"); anime_picked=$(sed -n 2p "$COOKIE_DIR/profile.txt"); changed=$(sed -n 3p "$COOKIE_DIR/profile.txt")
     if [ -n "$existing" ]; then
-        if [ "$picked" = "$cur_profile" ]; then
+        if [ "$changed" != "1" ]; then
             warn "Seerr: ${app^} has no Profilarr profile yet (sync not finished?); staying on '$cur_profile'. Re-run after the sync."
             return 0
         fi
         id=$(printf '%s' "$existing" | jpy "d['id']")
         seerr_api PUT "/api/v1/settings/$app/$id" "$body" >/dev/null
-        if http_ok; then ok "Seerr: ${app^} profile changed to '$picked'"; else todo "Seerr: could not update ${app^} (HTTP $(http_code)); pick '$picked' in Settings > Services."; fi
+        if http_ok; then ok "Seerr: ${app^} profile changed to '$picked'${anime_picked:+, anime profile $anime_picked}"; else todo "Seerr: could not update ${app^} (HTTP $(http_code)); pick '$picked' in Settings > Services."; fi
         return 0
     fi
     seerr_api POST "/api/v1/settings/$app" "$body" >/dev/null
     if http_ok; then
-        ok "Seerr: ${app^} added (profile '$picked', root $root)"
+        ok "Seerr: ${app^} added (profile '$picked'${anime_picked:+, anime profile $anime_picked}, root $root)"
+        [ "$app" != sonarr ] || [ -n "$anime_picked" ] || warn "Seerr: no anime profile found in Sonarr yet (Profilarr '$PROFILARR_ANIME_DB' sync not finished?); anime requests use '$picked' until a re-run."
         [[ "$picked" == "1080p Balanced" ]] || warn "Seerr: '1080p Balanced' not found in ${app^} (Profilarr sync not finished?); using '$picked'. Re-run after the sync to switch."
     else
         todo "Seerr: could not add ${app^} (HTTP $(http_code))."; fi
@@ -1877,6 +2185,11 @@ if [ -n "$DOCKGE_PASS" ]; then
 fi
 echo "  CHANGE THESE before exposing anything beyond your LAN."
 echo "  Stacks: $STACKS_PATH/<container>/compose.yaml, managed from Dockge at http://$HOST_IP:5001"
+if [ "$GPU_VENDOR" = "none" ]; then
+    echo "  Jellyfin transcoding: software (no usable GPU found).${GPU_NOTE:+ $GPU_NOTE}"
+else
+    echo "  Jellyfin transcoding: $GPU_ACCEL on ${GPU_NAME:-$GPU_VENDOR}; decode [${GPU_DEC:-none}], encode [${GPU_ENC:-none}]"
+fi
 if [ "${#TODO_LIST[@]}" -gt 0 ]; then
     echo ""
     echo "  Finish by hand:"
