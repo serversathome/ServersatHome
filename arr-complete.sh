@@ -239,10 +239,14 @@ detect_gpu() {
         [ -r "$node/device/vendor" ] || continue
         vendor=$(cat "$node/device/vendor")
         case "$vendor" in
-            0x8086) GPU_VENDOR="intel"; GPU_RENDER="/dev/${node##*/}"; break ;;
-            0x1002) [ "$GPU_VENDOR" = "none" ] && { GPU_VENDOR="amd"; GPU_RENDER="/dev/${node##*/}"; } ;;
+            0x8086) GPU_VENDOR="intel"; GPU_RENDER="/dev/dri/${node##*/}"; break ;;
+            0x1002) [ "$GPU_VENDOR" = "none" ] && { GPU_VENDOR="amd"; GPU_RENDER="/dev/dri/${node##*/}"; } ;;
         esac
     done
+    if [ "$GPU_VENDOR" != "none" ] && [ ! -c "$GPU_RENDER" ]; then
+        GPU_NOTE="render node $GPU_RENDER is not a character device; cannot pass it to Jellyfin"
+        GPU_VENDOR="none"
+    fi
     if [ "$GPU_VENDOR" != "none" ]; then
         dev=$(basename "$(readlink -f "/sys/class/drm/${GPU_RENDER##*/}/device" 2>/dev/null)" 2>/dev/null)
         GPU_NAME=$(lspci -s "$dev" 2>/dev/null | sed 's/^[^:]*: //' | head -1)
