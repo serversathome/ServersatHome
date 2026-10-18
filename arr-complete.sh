@@ -1822,9 +1822,18 @@ configure_dockge() {
     fi
     dockge_sio_send "$sid" "423[\"setSettings\",{\"disableAuth\":true},$pass]"
     ack=$(dockge_sio_ack "$sid" 3)
-    if [[ "$ack" == *'"ok":true'* ]]; then ok "Dockge: authentication disabled; the UI opens without a login"; else
-        todo "Dockge: could not disable authentication ('${ack:-no answer}'); log in as $ADMIN_USER with the password in $DOCKGE_PASS_FILE."; fi
     dockge_sio_send "$sid" '41'
+    if [[ "$ack" != *'"ok":true'* ]]; then
+        todo "Dockge: could not disable authentication ('${ack:-no answer}'); log in as $ADMIN_USER with the password in $DOCKGE_PASS_FILE."
+        return 1
+    fi
+    # Dockge only announces the auto-login when a page's socket connects, so a
+    # tab opened before this step keeps asking for a login until it reconnects.
+    # A restart makes every open tab reconnect and log itself in.
+    docker restart dockge >/dev/null 2>&1
+    wait_for "Dockge after the restart" 180 bash -c "curl -fs $DOCKGE_URL/ -o /dev/null" \
+        || warn "Dockge did not answer after the restart; check: docker logs dockge"
+    ok "Dockge: authentication disabled; the UI opens without a login (reload any Dockge tab that was already open)"
     echo "    Dockge manages the stacks in $STACKS_PATH; use Scan Stacks Folder if one is missing from its list."
 }
 
