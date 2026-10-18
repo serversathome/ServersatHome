@@ -1726,12 +1726,21 @@ if e["VENDOR"] in ("intel", "amd"):
 if e["VENDOR"] == "intel":
     d["QsvDevice"] = e["RENDER"]
 print(json.dumps(d))')
+    [ -n "$body" ] || { todo "Jellyfin: could not build the encoding settings from what the server returned; set $GPU_ACCEL transcoding in Dashboard > Playback > Transcoding."; return 1; }
     jf_api POST /System/Configuration/encoding "$body" >/dev/null
-    if http_ok; then
+    http_ok || { todo "Jellyfin: saving the encoding settings returned HTTP $(http_code); set $GPU_ACCEL transcoding in Dashboard > Playback > Transcoding."; return 1; }
+    # Read it back: the server answers 204 before anything is checked, so the
+    # only proof is what it reports afterwards.
+    local readback accel_now
+    readback=$(jf_api GET /System/Configuration/encoding)
+    accel_now=$(printf '%s' "$readback" | jpy "d.get('HardwareAccelerationType')")
+    if [ "$accel_now" = "$GPU_ACCEL" ]; then
         ok "Jellyfin: hardware transcoding set to $GPU_ACCEL (${GPU_NAME:-$GPU_VENDOR}): decode [${GPU_DEC:-none}], encode [${GPU_ENC:-none}], HDR tone mapping $([ "$GPU_TONEMAP" = 1 ] && echo on || echo off)"
+        echo "    Jellyfin reports: $(printf '%s' "$readback" | jpy "f\"acceleration={d.get('HardwareAccelerationType')}, device={d.get('QsvDevice') or d.get('VaapiDevice')}, decode={','.join(d.get('HardwareDecodingCodecs') or [])}, hw encode={d.get('EnableHardwareEncoding')}, HEVC encode={d.get('AllowHevcEncoding')}, AV1 encode={d.get('AllowAv1Encoding')}, tone mapping={d.get('EnableTonemapping')}\"")"
+        echo "    (Dashboard > Playback > Transcoding; reload the page if it was already open.)"
         [ "$GPU_TONEMAP" = 1 ] || warn "Jellyfin: OpenCL tone mapping is not available on this GPU/driver, so HDR video is transcoded without tone mapping (colors look washed out on SDR screens). Check Dashboard > Playback > Transcoding after the first HDR play."
     else
-        todo "Jellyfin: saving the encoding settings returned HTTP $(http_code); set $GPU_ACCEL transcoding in Dashboard > Playback > Transcoding."
+        todo "Jellyfin: accepted the encoding settings (HTTP $(http_code)) but reads back acceleration '${accel_now:-?}' instead of '$GPU_ACCEL'; set $GPU_ACCEL transcoding in Dashboard > Playback > Transcoding. Sent: $(printf '%s' "$body" | head -c 300)"
     fi
 }
 
