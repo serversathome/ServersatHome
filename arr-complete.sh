@@ -249,10 +249,29 @@ detect_gpu() {
     fi
 }
 detect_gpu
+# Say what was looked at and what came of it, so a software-only result is
+# never a mystery (VM without passthrough, missing driver, no GPU at all).
+info "GPU for Jellyfin hardware transcoding"
+GPU_DRI_NODES=$(find /dev/dri -maxdepth 1 -name 'card*' -o -name 'renderD*' 2>/dev/null | sed 's|.*/||' | sort | tr '\n' ' ')
+GPU_DISPLAYS=$(lspci 2>/dev/null | grep -iE 'vga|3d|display' | sed 's/^/      /')
+echo "    Checked: nvidia-smi, render nodes under /dev/dri, PCI display adapters"
+echo "    /dev/dri: ${GPU_DRI_NODES:-(absent)}"
+echo "    Display adapters (lspci):"; echo "${GPU_DISPLAYS:-      (none listed)}"
 case "$GPU_VENDOR" in
-    none) echo "GPU: none usable for transcoding; Jellyfin will transcode in software. ${GPU_NOTE}" ;;
-    nvidia) echo "GPU: NVIDIA ${GPU_NAME:-GPU} (NVENC/NVDEC)" ;;
-    *) echo "GPU: ${GPU_VENDOR^^} ${GPU_NAME:-GPU} via $GPU_RENDER${GPU_NOTE:+ (note: $GPU_NOTE)}" ;;
+    none)
+        echo "    Result: no usable GPU; Jellyfin will transcode in software."
+        if printf '%s' "$GPU_DISPLAYS" | grep -qiE '1234:1111|qemu|bochs|virtio|vmware|hyper-v|microsoft corporation|red hat'; then
+            echo "    The only display adapter is a virtual one, so TrueNAS is running in a VM and the"
+            echo "    physical GPU has not been passed through. Pass it to the VM (PCI passthrough; a"
+            echo "    renderD* node then appears under /dev/dri) and re-run this script."
+        elif [[ "$GPU_DRI_NODES" == *card* ]]; then
+            echo "    A display device exists but no renderD* node: its driver is not loaded or the GPU"
+            echo "    has no video engine Jellyfin can use."
+        fi
+        [ -n "$GPU_NOTE" ] && echo "    $GPU_NOTE"
+        ;;
+    nvidia) echo "    Result: NVIDIA ${GPU_NAME:-GPU} (NVENC/NVDEC)${GPU_NOTE:+; note: $GPU_NOTE}" ;;
+    *)      echo "    Result: ${GPU_VENDOR^^} ${GPU_NAME:-GPU} via $GPU_RENDER${GPU_NOTE:+; note: $GPU_NOTE}" ;;
 esac
 
 # What can the GPU really decode and encode? Hardware varies too much for a
@@ -303,7 +322,8 @@ EOF
 )
 probe_gpu() {
     local out
-    echo "    Measuring what the $GPU_VENDOR GPU can decode/encode with Jellyfin's ffmpeg (one-off container, image $JELLYFIN_IMAGE)..."
+    echo "    Measuring what the $GPU_VENDOR GPU can decode/encode with Jellyfin's ffmpeg in a throwaway container"
+    echo "    (docker run --rm $JELLYFIN_IMAGE; nothing stays behind except the image, which the stack needs anyway)..."
     case "$GPU_VENDOR" in
         nvidia) out=$(timeout 900 docker run --rm --gpus all -e NVIDIA_DRIVER_CAPABILITIES=all --entrypoint /bin/bash "$JELLYFIN_IMAGE" -c "$PROBE_NVIDIA" 2>&1) ;;
         *)      out=$(timeout 900 docker run --rm --device /dev/dri:/dev/dri -e RENDER="$GPU_RENDER" --entrypoint /bin/bash "$JELLYFIN_IMAGE" -c "$PROBE_VAAPI" 2>&1) ;;
@@ -368,11 +388,20 @@ print(json.dumps({"dec": dedupe(dec), "enc": dedupe(enc), "lp": dedupe(lp), "hev
         amd)    GPU_ACCEL="vaapi"; GPU_TONEMAP=$(printf '%s' "$parsed" | jpy "d['opencl']") ;;
     esac
     local tenbit=""
-    [ "$GPU_HEVC10" = 1 ] && tenbit+=" +10-bit HEVC"
-    [ "$GPU_VP9_10" = 1 ] && tenbit+=" +10-bit VP9"
-    ok "GPU: decode [${GPU_DEC:-none}]$tenbit, encode [${GPU_ENC:-none}]${GPU_LP:+ (low-power: $GPU_LP)}, acceleration '$GPU_ACCEL', HDR tone mapping $([ "$GPU_TONEMAP" = 1 ] && echo on || echo off)${GPU_DRIVER:+, driver $GPU_DRIVER}"
+    [ "$GPU_HEVC10" = 1 ] && tenbit+=", 10-bit HEVC"
+    [ "$GPU_VP9_10" = 1 ] && tenbit+=", 10-bit VP9"
+    [ "$GPU_REXT10" = 1 ] && tenbit+=", HEVC RExt 10-bit"
+    [ "$GPU_REXT12" = 1 ] && tenbit+=", HEVC RExt 12-bit"
+    ok "GPU probe finished. The throwaway container found:"
+    [ -n "$GPU_DRIVER" ] && echo "      driver:            $GPU_DRIVER"
+    echo "      hardware decode:   ${GPU_DEC:-none}${tenbit}"
+    echo "      hardware encode:   ${GPU_ENC:-none}${GPU_LP:+ (Intel low-power: $GPU_LP)}"
+    echo "      acceleration:      $GPU_ACCEL"
+    echo "      HDR tone mapping:  $([ "$GPU_TONEMAP" = 1 ] && echo "on (OpenCL/CUDA available)" || echo "off (no OpenCL on this driver)")"
+    echo "    These settings are applied to Jellyfin in step 7."
 }
 [ "$GPU_VENDOR" = "none" ] || probe_gpu || warn "$GPU_NOTE"
+echo ""
 
 # Compose fragments for the Jellyfin stack (already indented for the file).
 JELLYFIN_GPU_ENV=""
