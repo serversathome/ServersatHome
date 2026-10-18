@@ -679,7 +679,7 @@ PROWLARR_URL="http://localhost:9696"; PROWLARR_INT="http://prowlarr:9696"
 FLARE_URL="http://localhost:8191";    FLARE_INT="http://flaresolverr:8191/"
 PROFILARR_URL="http://localhost:6868"
 JELLYFIN_URL="http://localhost:8096"; JELLYFIN_INT="http://jellyfin:8096"
-SEERR_URL="http://localhost:5055"
+SEERR_URL="http://localhost:5055";    SEERR_INT="http://seerr:5055"
 BAZARR_URL="http://localhost:6767"
 QUI_URL="http://localhost:7476"
 TRACEARR_URL="http://localhost:3000"
@@ -1720,16 +1720,38 @@ configure_tracearr() {
         http_ok && ok "Tracearr: logged in" || { todo "Tracearr: login failed (HTTP $(http_code)); configure it at $TRACEARR_URL."; return 1; }
     fi
 
-    local servers key
-    servers=$(tracearr_api GET /api/v1/servers | jpy "[s.get('url') for s in (d if isinstance(d, list) else d.get('servers') or [])]")
-    if [[ "$servers" == *"\"$JELLYFIN_INT\""* ]]; then ok "Tracearr: Jellyfin already connected"; return 0; fi
-    [ -n "$JELLYFIN_TOKEN" ] || { todo "Tracearr: no Jellyfin session from step 7; add Jellyfin under Settings (http://jellyfin:8096 + an API key)."; return 1; }
-    key=$(jf_api_key Tracearr)
-    [ -n "$key" ] || { todo "Tracearr: could not create a Jellyfin API key; make one in Jellyfin (Dashboard > API Keys) and add the server in Tracearr."; return 1; }
-    res=$(tracearr_api POST /api/v1/auth/jellyfin/connect-api-key "$(JF_INT="$JELLYFIN_INT" K="$key" jbuild '{"serverUrl": os.environ["JF_INT"], "serverName": "Jellyfin", "apiKey": os.environ["K"]}')")
-    if http_ok; then ok "Tracearr: Jellyfin connected ($JELLYFIN_INT); users and libraries sync in the background"; else
-        todo "Tracearr: connecting Jellyfin returned HTTP $(http_code): $(printf '%s' "$res" | head -c 200)"; fi
+    local key server_id
+    server_id=$(tracearr_api GET /api/v1/servers | jpy "next((s.get('id') for s in (d if isinstance(d, list) else d.get('servers') or []) if s.get('url')=='$JELLYFIN_INT'), None)")
+    if [ -n "$server_id" ]; then
+        ok "Tracearr: Jellyfin already connected"
+    else
+        [ -n "$JELLYFIN_TOKEN" ] || { todo "Tracearr: no Jellyfin session from step 7; add Jellyfin under Settings (http://jellyfin:8096 + an API key)."; return 1; }
+        key=$(jf_api_key Tracearr)
+        [ -n "$key" ] || { todo "Tracearr: could not create a Jellyfin API key; make one in Jellyfin (Dashboard > API Keys) and add the server in Tracearr."; return 1; }
+        res=$(tracearr_api POST /api/v1/auth/jellyfin/connect-api-key "$(JF_INT="$JELLYFIN_INT" K="$key" jbuild '{"serverUrl": os.environ["JF_INT"], "serverName": "Jellyfin", "apiKey": os.environ["K"]}')")
+        if http_ok; then ok "Tracearr: Jellyfin connected ($JELLYFIN_INT); users and libraries sync in the background"; else
+            todo "Tracearr: connecting Jellyfin returned HTTP $(http_code): $(printf '%s' "$res" | head -c 200)"; return 1; fi
+        server_id=$(printf '%s' "$res" | jpy "d.get('serverId')")
+    fi
+    tracearr_link_seerr "$server_id"
     echo "    Tracearr: sharing rules and notifications are yours to tune under Settings."
+}
+
+# tracearr_link_seerr <tracearr server id>
+# "Link Seerr" on the Jellyfin connection: Tracearr reads request history
+# from Seerr. It probes Seerr with the key and insists that Seerr's media
+# server is this same Jellyfin. The key comes from Seerr's own settings
+# (Seerr > Settings > General > API key) through the session step 8 opened.
+tracearr_link_seerr() {
+    local server_id="$1" linked seerr_key res
+    [ -n "$server_id" ] || return 1
+    linked=$(tracearr_api GET /api/v1/request-services | jpy "[r.get('serverId') for r in d]")
+    if [[ "$linked" == *"\"$server_id\""* ]]; then ok "Tracearr: Seerr already linked to Jellyfin"; return 0; fi
+    seerr_key=$(seerr_api GET /api/v1/settings/main | jpy "d.get('apiKey')")
+    [ -n "$seerr_key" ] || { todo "Tracearr: could not read the Seerr API key (Seerr step not logged in?); link Seerr under Settings > Connections with the key from Seerr > Settings > General."; return 1; }
+    res=$(tracearr_api POST /api/v1/request-services "$(SID="$server_id" SURL="$SEERR_INT" SKEY="$seerr_key" jbuild '{"serverId": os.environ["SID"], "url": os.environ["SURL"], "apiKey": os.environ["SKEY"]}')")
+    if http_ok; then ok "Tracearr: Seerr linked to Jellyfin ($SEERR_INT); request history syncs in the background"; else
+        todo "Tracearr: linking Seerr returned HTTP $(http_code): $(printf '%s' "$res" | head -c 200)"; fi
 }
 
 # ── 12. Dockge ──────────────────────────────────────────────────────────────
