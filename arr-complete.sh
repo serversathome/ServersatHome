@@ -22,6 +22,8 @@
 #
 # Logins created by this script (change them afterwards!):
 #   user: admin   password: changeme   email: admin@admin.com
+#   (Dockge is the exception: it rejects that password, so it gets a generated
+#    one, printed at the end, and its authentication is then switched off.)
 #
 # Run in the TrueNAS shell as root:
 #   sudo su -c "wget https://raw.githubusercontent.com/serversathome/ServersatHome/refs/heads/main/arr-complete.sh && chmod +x arr-complete.sh && bash arr-complete.sh"
@@ -677,7 +679,7 @@ PROWLARR_URL="http://localhost:9696"; PROWLARR_INT="http://prowlarr:9696"
 FLARE_URL="http://localhost:8191";    FLARE_INT="http://flaresolverr:8191/"
 PROFILARR_URL="http://localhost:6868"
 JELLYFIN_URL="http://localhost:8096"; JELLYFIN_INT="http://jellyfin:8096"
-SEERR_URL="http://localhost:5055"
+SEERR_URL="http://localhost:5055";    SEERR_INT="http://seerr:5055"
 BAZARR_URL="http://localhost:6767"
 QUI_URL="http://localhost:7476"
 TRACEARR_URL="http://localhost:3000"
@@ -1718,16 +1720,38 @@ configure_tracearr() {
         http_ok && ok "Tracearr: logged in" || { todo "Tracearr: login failed (HTTP $(http_code)); configure it at $TRACEARR_URL."; return 1; }
     fi
 
-    local servers key
-    servers=$(tracearr_api GET /api/v1/servers | jpy "[s.get('url') for s in (d if isinstance(d, list) else d.get('servers') or [])]")
-    if [[ "$servers" == *"\"$JELLYFIN_INT\""* ]]; then ok "Tracearr: Jellyfin already connected"; return 0; fi
-    [ -n "$JELLYFIN_TOKEN" ] || { todo "Tracearr: no Jellyfin session from step 7; add Jellyfin under Settings (http://jellyfin:8096 + an API key)."; return 1; }
-    key=$(jf_api_key Tracearr)
-    [ -n "$key" ] || { todo "Tracearr: could not create a Jellyfin API key; make one in Jellyfin (Dashboard > API Keys) and add the server in Tracearr."; return 1; }
-    res=$(tracearr_api POST /api/v1/auth/jellyfin/connect-api-key "$(JF_INT="$JELLYFIN_INT" K="$key" jbuild '{"serverUrl": os.environ["JF_INT"], "serverName": "Jellyfin", "apiKey": os.environ["K"]}')")
-    if http_ok; then ok "Tracearr: Jellyfin connected ($JELLYFIN_INT); users and libraries sync in the background"; else
-        todo "Tracearr: connecting Jellyfin returned HTTP $(http_code): $(printf '%s' "$res" | head -c 200)"; fi
+    local key server_id
+    server_id=$(tracearr_api GET /api/v1/servers | jpy "next((s.get('id') for s in (d if isinstance(d, list) else d.get('servers') or []) if s.get('url')=='$JELLYFIN_INT'), None)")
+    if [ -n "$server_id" ]; then
+        ok "Tracearr: Jellyfin already connected"
+    else
+        [ -n "$JELLYFIN_TOKEN" ] || { todo "Tracearr: no Jellyfin session from step 7; add Jellyfin under Settings (http://jellyfin:8096 + an API key)."; return 1; }
+        key=$(jf_api_key Tracearr)
+        [ -n "$key" ] || { todo "Tracearr: could not create a Jellyfin API key; make one in Jellyfin (Dashboard > API Keys) and add the server in Tracearr."; return 1; }
+        res=$(tracearr_api POST /api/v1/auth/jellyfin/connect-api-key "$(JF_INT="$JELLYFIN_INT" K="$key" jbuild '{"serverUrl": os.environ["JF_INT"], "serverName": "Jellyfin", "apiKey": os.environ["K"]}')")
+        if http_ok; then ok "Tracearr: Jellyfin connected ($JELLYFIN_INT); users and libraries sync in the background"; else
+            todo "Tracearr: connecting Jellyfin returned HTTP $(http_code): $(printf '%s' "$res" | head -c 200)"; return 1; fi
+        server_id=$(printf '%s' "$res" | jpy "d.get('serverId')")
+    fi
+    tracearr_link_seerr "$server_id"
     echo "    Tracearr: sharing rules and notifications are yours to tune under Settings."
+}
+
+# tracearr_link_seerr <tracearr server id>
+# "Link Seerr" on the Jellyfin connection: Tracearr reads request history
+# from Seerr. It probes Seerr with the key and insists that Seerr's media
+# server is this same Jellyfin. The key comes from Seerr's own settings
+# (Seerr > Settings > General > API key) through the session step 8 opened.
+tracearr_link_seerr() {
+    local server_id="$1" linked seerr_key res
+    [ -n "$server_id" ] || return 1
+    linked=$(tracearr_api GET /api/v1/request-services | jpy "[r.get('serverId') for r in d]")
+    if [[ "$linked" == *"\"$server_id\""* ]]; then ok "Tracearr: Seerr already linked to Jellyfin"; return 0; fi
+    seerr_key=$(seerr_api GET /api/v1/settings/main | jpy "d.get('apiKey')")
+    [ -n "$seerr_key" ] || { todo "Tracearr: could not read the Seerr API key (Seerr step not logged in?); link Seerr under Settings > Connections with the key from Seerr > Settings > General."; return 1; }
+    res=$(tracearr_api POST /api/v1/request-services "$(SID="$server_id" SURL="$SEERR_INT" SKEY="$seerr_key" jbuild '{"serverId": os.environ["SID"], "url": os.environ["SURL"], "apiKey": os.environ["SKEY"]}')")
+    if http_ok; then ok "Tracearr: Seerr linked to Jellyfin ($SEERR_INT); request history syncs in the background"; else
+        todo "Tracearr: linking Seerr returned HTTP $(http_code): $(printf '%s' "$res" | head -c 200)"; fi
 }
 
 # ── 12. Dockge ──────────────────────────────────────────────────────────────
@@ -1746,27 +1770,60 @@ dockge_sio_ack() {
     return 1
 }
 
+# Dockge refuses any password its strength check rates "Too weak", and a
+# letters-only password such as "changeme" is exactly that (it wants letters
+# AND digits, 6+ characters). So Dockge gets a generated password instead,
+# kept in a root-only file inside its config dataset for re-runs and printed
+# in the summary, and then authentication is switched off so the UI opens
+# without a login (Dockge auto-logs the admin in).
+DOCKGE_PASS=""
+DOCKGE_PASS_FILE=""
 configure_dockge() {
     info "[12/12] Dockge"
     wait_for "Dockge" 180 bash -c "curl -fs $DOCKGE_URL/ -o /dev/null" \
         || { todo "Dockge did not come up; create the admin user at $DOCKGE_URL."; return 1; }
+    DOCKGE_PASS_FILE="$CONFIGS_PATH/dockge/admin-password.txt"
+    if [ -s "$DOCKGE_PASS_FILE" ]; then
+        DOCKGE_PASS=$(head -1 "$DOCKGE_PASS_FILE" | tr -d '[:space:]')
+    else
+        DOCKGE_PASS="Dockge-$(openssl rand -hex 6 2>/dev/null || date +%s%N | sha256sum | cut -c1-12)"
+    fi
     local sid first ack user pass
     sid=$(curl -sS -m 20 "$DOCKGE_URL/socket.io/?EIO=4&transport=polling" 2>/dev/null | tr '\036' '\n' | sed -n 's/^0{"sid":"\([^"]*\)".*/\1/p')
     [ -n "$sid" ] || { todo "Dockge: socket.io handshake failed; create the admin user at $DOCKGE_URL."; return 1; }
     dockge_sio_send "$sid" '40'
-    first=$(dockge_sio_get "$sid")      # 40{...} plus, on a fresh install, 42["setup"]
-    user=$(jbuild 'os.environ["ADMIN_USER"]'); pass=$(jbuild 'os.environ["ADMIN_PASS"]')
+    # The connect answer comes with 42["setup"] on a fresh install, or with
+    # 42["autoLogin"] once authentication has been disabled.
+    first=$(dockge_sio_get "$sid")
+    user=$(jbuild 'os.environ["ADMIN_USER"]'); pass=$(DOCKGE_PASS="$DOCKGE_PASS" jbuild 'os.environ["DOCKGE_PASS"]')
+    if [[ "$first" == *'["autoLogin"'* ]]; then
+        ok "Dockge: already set up, authentication disabled (no login needed)"
+        dockge_sio_send "$sid" '41'
+        return 0
+    fi
     if [[ "$first" == *'["setup"'* ]]; then
         dockge_sio_send "$sid" "421[\"setup\",$user,$pass]"
         ack=$(dockge_sio_ack "$sid" 1)
-        if [[ "$ack" == *'"ok":true'* ]]; then ok "Dockge: admin user created ($ADMIN_USER / $ADMIN_PASS)"; else
-            todo "Dockge: setup answered '${ack:-nothing}'; create the admin user at $DOCKGE_URL."; fi
-    else
-        dockge_sio_send "$sid" "422[\"login\",{\"username\":$user,\"password\":$pass}]"
-        ack=$(dockge_sio_ack "$sid" 2)
-        if [[ "$ack" == *'"ok":true'* ]]; then ok "Dockge: already set up; login $ADMIN_USER / $ADMIN_PASS verified"; else
-            todo "Dockge: already set up but $ADMIN_USER / $ADMIN_PASS does not log in ('${ack:-no answer}'); check $DOCKGE_URL."; fi
+        if [[ "$ack" == *'"ok":true'* ]]; then
+            printf '%s\n' "$DOCKGE_PASS" > "$DOCKGE_PASS_FILE" && chmod 600 "$DOCKGE_PASS_FILE"
+            ok "Dockge: admin user created ($ADMIN_USER / $DOCKGE_PASS); password saved to $DOCKGE_PASS_FILE"
+        else
+            todo "Dockge: setup answered '${ack:-nothing}'; create the admin user at $DOCKGE_URL."
+            dockge_sio_send "$sid" '41'; return 1
+        fi
     fi
+    # Log in on this socket (setup alone does not), then switch authentication
+    # off; Dockge re-checks the password for that one change.
+    dockge_sio_send "$sid" "422[\"login\",{\"username\":$user,\"password\":$pass}]"
+    ack=$(dockge_sio_ack "$sid" 2)
+    if [[ "$ack" != *'"ok":true'* ]]; then
+        todo "Dockge: login as $ADMIN_USER with the password in $DOCKGE_PASS_FILE failed ('${ack:-no answer}'); check $DOCKGE_URL."
+        dockge_sio_send "$sid" '41'; return 1
+    fi
+    dockge_sio_send "$sid" "423[\"setSettings\",{\"disableAuth\":true},$pass]"
+    ack=$(dockge_sio_ack "$sid" 3)
+    if [[ "$ack" == *'"ok":true'* ]]; then ok "Dockge: authentication disabled; the UI opens without a login"; else
+        todo "Dockge: could not disable authentication ('${ack:-no answer}'); log in as $ADMIN_USER with the password in $DOCKGE_PASS_FILE."; fi
     dockge_sio_send "$sid" '41'
     echo "    Dockge manages the stacks in $STACKS_PATH; use Scan Stacks Folder if one is missing from its list."
 }
@@ -1803,8 +1860,12 @@ docker ps --format "{{.Names}}" | while read -r container_name; do
     fi
 done
 echo ""
-echo "  Logins (qBittorrent, Radarr, Sonarr, Prowlarr, Profilarr, Jellyfin, Seerr, Bazarr, Qui, Tracearr, Dockge):"
+echo "  Logins (qBittorrent, Radarr, Sonarr, Prowlarr, Profilarr, Jellyfin, Seerr, Bazarr, Qui, Tracearr):"
 echo "    user: $ADMIN_USER   password: $ADMIN_PASS   email: $ADMIN_EMAIL"
+if [ -n "$DOCKGE_PASS" ]; then
+    echo "  Dockge: authentication is disabled (no login needed). Its admin user is $ADMIN_USER / $DOCKGE_PASS"
+    echo "    (also in $DOCKGE_PASS_FILE) should you turn authentication back on."
+fi
 echo "  CHANGE THESE before exposing anything beyond your LAN."
 echo "  Stacks: $STACKS_PATH/<container>/compose.yaml, managed from Dockge at http://$HOST_IP:5001"
 if [ "${#TODO_LIST[@]}" -gt 0 ]; then
