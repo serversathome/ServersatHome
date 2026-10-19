@@ -2065,12 +2065,12 @@ configure_qui() {
         ok "Qui: qBittorrent instance already present"
     fi
 
-    # Reflink cross-seed mode (ZFS), flat layout, plus reannounce. One PUT.
+    # Hardlink cross-seed mode, flat layout, plus reannounce. One PUT.
     # The update must carry the login again: Qui stores whatever username the
     # PUT holds, and an empty one switches the instance to "no login", after
     # which qBittorrent answers 403 and Qui backs off forever.
-    qui_api PUT "/api/instances/$inst" "$(jbuild '{"name": "qbittorrent", "host": "http://qbittorrent:8080", "username": os.environ["ADMIN_USER"], "password": os.environ["ADMIN_PASS"], "hasLocalFilesystemAccess": True, "useReflinks": True, "useHardlinks": False, "hardlinkBaseDir": "/media/downloads/crossseed", "hardlinkDirPreset": "flat", "fallbackToRegularMode": False, "reannounceSettings": {"enabled": True, "initialWaitSeconds": 15, "reannounceIntervalSeconds": 7, "maxAgeSeconds": 600, "maxRetries": 50, "aggressive": False, "monitorAll": True, "excludeCategories": False, "categories": [], "excludeTags": False, "tags": [], "excludeTrackers": False, "trackers": []}}')" >/dev/null
-    http_ok && ok "Qui: reflink cross-seed mode (/media/downloads/crossseed, flat) + reannounce enabled" \
+    qui_api PUT "/api/instances/$inst" "$(jbuild '{"name": "qbittorrent", "host": "http://qbittorrent:8080", "username": os.environ["ADMIN_USER"], "password": os.environ["ADMIN_PASS"], "hasLocalFilesystemAccess": True, "useHardlinks": True, "useReflinks": False, "hardlinkBaseDir": "/media/downloads/crossseed", "hardlinkDirPreset": "flat", "fallbackToRegularMode": False, "reannounceSettings": {"enabled": True, "initialWaitSeconds": 15, "reannounceIntervalSeconds": 7, "maxAgeSeconds": 600, "maxRetries": 50, "aggressive": False, "monitorAll": True, "excludeCategories": False, "categories": [], "excludeTags": False, "tags": [], "excludeTrackers": False, "trackers": []}}')" >/dev/null
+    http_ok && ok "Qui: hardlink cross-seed mode (/media/downloads/crossseed, flat) + reannounce enabled" \
             || warn "Qui: instance settings update returned HTTP $(http_code)"
 
     # Qui backs off (up to an hour after an IP ban) when qBittorrent rejected
@@ -2082,9 +2082,11 @@ configure_qui() {
     if [ "$(printf '%s' "$conn" | jpy "d.get('connected')")" = "True" ]; then ok "Qui: connected to qBittorrent"; else
         todo "Qui: cannot connect to qBittorrent: $(printf '%s' "$conn" | jpy "d.get('error') or d.get('message') or d")"; fi
 
-    # Cross-seed rules + RSS automation (wiki sections 3.1 and 3.3).
-    qui_api PATCH /api/cross-seed/settings "$(I="$inst" jbuild '{"useCrossCategoryAffix": True, "categoryAffixMode": "suffix", "categoryAffix": ".cross", "skipPieceBoundarySafetyCheck": False, "enabled": True, "runIntervalMinutes": 90, "targetInstanceIds": [int(os.environ["I"])], "targetIndexerIds": [], "rssSourceExcludeTags": ["cross-seed"]}')" >/dev/null
-    http_ok && ok "Qui: cross-seed rules (.cross suffix, piece check on) and RSS automation (90 min) set" \
+    # Cross-seed rules + RSS automation (wiki sections 3.1 and 3.3), and the
+    # post-injection "Max auto-start download": a new cross-seed that still
+    # has to fetch more than this many MiB stays paused for review.
+    qui_api PATCH /api/cross-seed/settings "$(I="$inst" jbuild '{"useCrossCategoryAffix": True, "categoryAffixMode": "suffix", "categoryAffix": ".cross", "skipPieceBoundarySafetyCheck": False, "enabled": True, "runIntervalMinutes": 90, "targetInstanceIds": [int(os.environ["I"])], "targetIndexerIds": [], "rssSourceExcludeTags": ["cross-seed"], "autoResumeMaxDownloadMb": 5}')" >/dev/null
+    http_ok && ok "Qui: cross-seed rules (.cross suffix, piece check on), RSS automation (90 min), max auto-start download 5 MiB" \
             || warn "Qui: cross-seed settings returned HTTP $(http_code)"
 
     # Auto-search on completion (wiki 3.4).
