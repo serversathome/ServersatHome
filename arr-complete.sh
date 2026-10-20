@@ -1107,8 +1107,8 @@ qb_diagnose() {
         echo "    probe: GET $QB_INT/api/v2/app/webapiVersion from inside '$app' -> $out  (403 = reachable, login needed; 000 = unreachable)"
         if [ -z "$QB_LOGIN_PROBED" ]; then
             QB_LOGIN_PROBED=1
-            out=$(docker exec "$app" curl -sS -m 10 -w ' [HTTP %{http_code}]' --data-urlencode "username=$ADMIN_USER" --data-urlencode "password=$ADMIN_PASS" "$QB_INT/api/v2/auth/login" 2>&1 | tail -c 160)
-            echo "    probe: login as $ADMIN_USER from inside '$app' -> $out  (Ok. = good; Fails. = wrong password; 403 = IP banned for 1h)"
+            out=$(qb_login_result "$(docker exec "$app" curl -sS -m 10 -w $'\n%{http_code}' --data-urlencode "username=$ADMIN_USER" --data-urlencode "password=$ADMIN_PASS" "$QB_INT/api/v2/auth/login" 2>&1)")
+            echo "    probe: login as $ADMIN_USER from inside '$app' -> $out  (Ok. = good; Fails. = wrong password; banned = too many failed logins, 1h)"
         fi
     else
         echo "    probe: no curl inside '$app'; cannot test the path to qBittorrent from there"
@@ -1199,13 +1199,33 @@ qb_curl() {
     else curl -sS -m 30 "$@"; fi
 }
 qb_up()    { [ "$(qb_curl -o /dev/null -w '%{http_code}' "$QB_URL/" 2>/dev/null)" = "200" ]; }
-qb_login() { [ "$(qb_curl -c "$QB_COOKIE" --data-urlencode "username=$1" --data-urlencode "password=$2" "$QB_URL/api/v2/auth/login" 2>/dev/null)" = "Ok." ]; }
+# qb_login_result <curl output ending in "\n<http code>"> -> "Ok." | "Fails." | "banned [HTTP 403]" | "<body> [HTTP code]"
+# The login API changed in qBittorrent 5.2: a good login answers 200 with an
+# empty body (older versions say "Ok."), a bad one 401 (older: 200 "Fails."),
+# and a banned address 403 in both. Judge by the status code first.
+qb_login_result() {
+    local out="$1" code body
+    code="${out##*$'\n'}"; body="${out%$'\n'*}"; [ "$body" = "$out" ] && body=""
+    case "$code" in
+        200) if [ "$body" = "Fails." ]; then echo "Fails."; else echo "Ok."; fi ;;
+        401) echo "Fails." ;;
+        403) echo "banned [HTTP 403]" ;;
+        *)   printf '%s [HTTP %s]\n' "$(printf '%s' "$body" | tr -d '\r' | head -c 100)" "${code:-none}" ;;
+    esac
+}
+qb_login() {  # qb_login <user> <pass> -> session cookie in $QB_COOKIE on success
+    local out
+    out=$(qb_curl -c "$QB_COOKIE" -w $'\n%{http_code}' --data-urlencode "username=$1" --data-urlencode "password=$2" "$QB_URL/api/v2/auth/login" 2>/dev/null)
+    [ "$(qb_login_result "$out")" = "Ok." ]
+}
 qb_post()  { qb_curl -b "$QB_COOKIE" "$@"; }   # qb_post <form args...> <url>
 qb_code()  { qb_post -o /dev/null -w '%{http_code}' "$@" 2>/dev/null; }   # HTTP status of a logged-in call
-# qb_login_from_host <user> <pass> -> "Ok." | "Fails." | "<error> [HTTP code]"
+# qb_login_from_host <user> <pass> -> "Ok." | "Fails." | "banned [HTTP 403]" | "<error> [HTTP code]"
 # A real credential check: the request enters through the published port.
 qb_login_from_host() {
-    curl -sS -m 15 -w ' [HTTP %{http_code}]' --data-urlencode "username=$1" --data-urlencode "password=$2" "$QB_URL/api/v2/auth/login" 2>&1 | tail -c 120
+    local out
+    out=$(curl -sS -m 15 -w $'\n%{http_code}' --data-urlencode "username=$1" --data-urlencode "password=$2" "$QB_URL/api/v2/auth/login" 2>&1)
+    qb_login_result "$out"
 }
 qb_pref() { printf '%s' "$1" | jpy "d.get('$2')"; }
 
