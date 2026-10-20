@@ -26,10 +26,12 @@
 # Every step is idempotent (safe to re-run) and isolated: a step that cannot be
 # completed prints what to finish in the UI and the rest still runs.
 #
-# Logins created by this script (change them afterwards!):
-#   user: admin   password: changeme   email: admin@admin.com
-#   (Dockge is the exception: it rejects that password, so it gets a generated
-#    one, printed at the end, and its authentication is then switched off.)
+# Logins: the script asks for one username and password and creates that
+# login in every app (Enter keeps the defaults admin / changeme; the email is
+# admin@admin.com). The choice is remembered in configs/arr-complete.env for
+# re-runs. Dockge rejects letters-only passwords such as the default, so it
+# gets a generated one in that case, printed at the end, and its
+# authentication is switched off either way.
 #
 # Run in the TrueNAS shell as root:
 #   sudo su -c "wget https://raw.githubusercontent.com/serversathome/ServersatHome/refs/heads/main/arr-complete.sh && chmod +x arr-complete.sh && bash arr-complete.sh"
@@ -40,10 +42,11 @@
 # shellcheck disable=SC2015
 set -uo pipefail
 
-# ── Defaults for every login this script creates ────────────────────────────
+# ── Defaults for every login this script creates (asked for below) ─────────
 ADMIN_USER="admin"
 ADMIN_PASS="changeme"
 ADMIN_EMAIL="admin@admin.com"
+QB_FORWARDED_PORT=""   # fixed forwarded port from the VPN provider, if any
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
 info() { echo ">>> $*"; }
@@ -192,6 +195,47 @@ for pool in "$CONFIG_POOL" "$MEDIA_POOL"; do
         || die "Pool name '$pool' must be lowercase with no spaces. Rename the pool or create a compliant one."
 done
 echo "Configs/stacks pool: $CONFIG_POOL    Media pool: $MEDIA_POOL"
+
+# ── Login and VPN port ──────────────────────────────────────────────────────
+# One username and password for every app. The answers are kept in a
+# root-only file inside the configs dataset so a re-run offers them as the
+# defaults (the apps already hold that login; a different one would lock the
+# script out of them).
+SETUP_STATE_FILE="/mnt/$CONFIG_POOL/configs/arr-complete.env"
+if [ -s "$SETUP_STATE_FILE" ]; then
+    # Written by this script with printf %q, so sourcing it is safe.
+    # shellcheck source=/dev/null
+    . "$SETUP_STATE_FILE"
+    echo "Previous answers loaded from $SETUP_STATE_FILE (Enter keeps them)."
+fi
+echo ""
+echo "Login to create in every app (Enter keeps the value in brackets):"
+while :; do
+    read -rp "  Username [$ADMIN_USER]: " answer
+    [ -z "$answer" ] && break
+    if [[ "$answer" =~ ^[^[:space:]]{3,}$ ]]; then ADMIN_USER="$answer"; break; fi
+    echo "  At least 3 characters and no spaces (Profilarr insists on that)."
+done
+while :; do
+    read -rsp "  Password [$([ "$ADMIN_PASS" = changeme ] && echo changeme || echo 'keep the saved one')]: " answer; echo
+    [ -z "$answer" ] && break
+    if [ "${#answer}" -lt 8 ]; then echo "  At least 8 characters (Tracearr insists on that)."; continue; fi
+    if [[ "$answer" =~ ^[[:space:]]|[[:space:]]$ ]]; then echo "  No leading or trailing spaces, please."; continue; fi
+    read -rsp "  Repeat the password: " answer2; echo
+    if [ "$answer" != "$answer2" ]; then echo "  They differ; try again."; continue; fi
+    ADMIN_PASS="$answer"; break
+done
+echo ""
+echo "qBittorrent VPN port forwarding (optional): if your VPN provider gave you a fixed"
+echo "forwarded port, enter it and qBittorrent listens on it. Enter for none."
+while :; do
+    read -rp "  Forwarded port [${QB_FORWARDED_PORT:-none}]: " answer
+    [ -z "$answer" ] && break
+    if [ "$answer" = none ]; then QB_FORWARDED_PORT=""; break; fi
+    if [[ "$answer" =~ ^[0-9]+$ ]] && [ "$answer" -ge 1 ] && [ "$answer" -le 65535 ]; then QB_FORWARDED_PORT="$answer"; break; fi
+    echo "  A number between 1 and 65535, Enter for none, or 'none' to clear a saved one."
+done
+unset answer answer2
 
 # ── Host facts ──────────────────────────────────────────────────────────────
 # LAN network for the qBittorrent VPN LAN bypass. Use the interface that
@@ -561,6 +605,10 @@ create_directory() {
 
 # ── Datasets ────────────────────────────────────────────────────────────────
 create_dataset "$CONFIG_POOL" "configs"
+{
+    echo "# Answers from the last run of arr-complete.sh (root only). Delete to be asked afresh."
+    printf 'ADMIN_USER=%q\nADMIN_PASS=%q\nQB_FORWARDED_PORT=%q\n' "$ADMIN_USER" "$ADMIN_PASS" "$QB_FORWARDED_PORT"
+} > "$SETUP_STATE_FILE" && chmod 600 "$SETUP_STATE_FILE"
 for dataset in "${CONFIG_DATASETS[@]}"; do
     if [ "$dataset" = "seerr" ]; then
         create_dataset "$CONFIG_POOL" "configs/$dataset" "1000:1000"
@@ -762,8 +810,11 @@ write_stack qbittorrent <<EOF
 services:
   qbittorrent:
     container_name: qbittorrent
-    # Version pinned on purpose; bump deliberately, not via :latest.
-    image: ghcr.io/hotio/qbittorrent:release-5.1.2
+    # hotio's floating stable tag (the same image as "release"); Watchtower
+    # keeps it current. The variables below follow hotio's current base image
+    # (VPN_FIREWALL_TYPE is gone, nftables only; VPN_INTERFACE_PREFIXES and
+    # Unbound are new; VPN_AUTO_PORT_FORWARD defaults to false).
+    image: ghcr.io/hotio/qbittorrent:latest
     restart: unless-stopped
     ports:
       - 8080:8080
@@ -772,19 +823,27 @@ services:
       - PGID=568
       - UMASK=002
       - TZ=$TZ_VALUE
-      - WEBUI_PORTS=8080/tcp,8080/udp
+      - WEBUI_PORTS=8080/tcp
+      # hotio ships both libtorrent builds and runs the 1.2 one by default.
+      # The POSIX-compliant disk IO type (set by this script, the right choice
+      # on ZFS) only exists with libtorrent 2.
+      - LIBTORRENT=v2
       - VPN_ENABLED=true
       - VPN_CONF=wg0
       - VPN_PROVIDER=generic
       - VPN_LAN_NETWORK=$CIDR_NETWORK,10.8.0.0/24
       - VPN_LAN_LEAK_ENABLED=false
       - VPN_EXPOSE_PORTS_ON_LAN=
-      - VPN_AUTO_PORT_FORWARD=true
+      # false for a plain WireGuard config, or the fixed forwarded port the
+      # script asked for (qBittorrent then listens on it); "true" only works
+      # together with VPN_PROVIDER=proton or pia.
+      - VPN_AUTO_PORT_FORWARD=${QB_FORWARDED_PORT:-false}
       - VPN_PORT_REDIRECTS=
-      - VPN_FIREWALL_TYPE=auto
       - VPN_HEALTHCHECK_ENABLED=false
       - VPN_NAMESERVERS=wg
+      - VPN_INTERFACE_PREFIXES=
       - PRIVOXY_ENABLED=false
+      - UNBOUND_ENABLED=false
     cap_add:
       - NET_ADMIN
     sysctls:
@@ -1206,12 +1265,24 @@ configure_qbittorrent() {
 
     # Connection / BitTorrent / Advanced per wiki.serversatho.me/en/qBittorrent:
     # no connection limits (-1 = box unchecked), no torrent queueing, more
-    # parallel checking, and all torrent traffic bound to the VPN interface
-    # on every IPv4 address.
-    code=$(qb_code --data-urlencode 'json={"max_connec":-1,"max_connec_per_torrent":-1,"max_uploads":-1,"max_uploads_per_torrent":-1,"queueing_enabled":false,"max_active_checking_torrents":3,"current_network_interface":"wg0","current_interface_address":"0.0.0.0"}' \
+    # parallel checking, all torrent traffic bound to the VPN interface on
+    # every IPv4 address, and the POSIX-compliant disk IO type (2; the
+    # libtorrent 2 build the compose file selects is required for it).
+    local io_before
+    io_before=$(qb_pref "$prefs" disk_io_type)
+    code=$(qb_code --data-urlencode 'json={"max_connec":-1,"max_connec_per_torrent":-1,"max_uploads":-1,"max_uploads_per_torrent":-1,"queueing_enabled":false,"max_active_checking_torrents":3,"current_network_interface":"wg0","current_interface_address":"0.0.0.0","disk_io_type":2}' \
         "$QB_URL/api/v2/app/setPreferences")
-    if [ "$code" = "200" ]; then ok "qBittorrent: connection limits off, queueing off, 3 checking torrents, interface wg0 / all IPv4"; else
+    if [ "$code" = "200" ]; then ok "qBittorrent: connection limits off, queueing off, 3 checking torrents, interface wg0 / all IPv4, disk IO type POSIX-compliant"; else
         todo "qBittorrent: could not apply the connection/advanced settings (HTTP $code); set them in Tools > Options."; fi
+    # The disk IO type is read when the session starts, so a change needs one
+    # restart (the VPN tunnel comes back on its own).
+    if [ "$code" = "200" ] && [ "$io_before" != "2" ]; then
+        echo "    qBittorrent: restarting the container so the POSIX disk IO type takes effect (was ${io_before:-unset})..."
+        docker restart qbittorrent >/dev/null 2>&1
+        wait_for "qBittorrent WebUI after the restart" 300 qb_up \
+            || { todo "qBittorrent did not come back after the restart: docker logs qbittorrent"; return 1; }
+        qb_login "$ADMIN_USER" "$ADMIN_PASS" || { todo "qBittorrent: could not log back in after the restart; check the WebUI."; return 1; }
+    fi
 
     # Categories for Radarr and Sonarr, both saving straight into
     # /media/downloads. The path is set explicitly: a category with an empty
@@ -2204,13 +2275,23 @@ dockge_sio_ack() {
 }
 
 # Dockge refuses any password its strength check rates "Too weak", and a
-# letters-only password such as "changeme" is exactly that (it wants letters
-# AND digits, 6+ characters). So Dockge gets a generated password instead,
+# letters-only password such as the default "changeme" is exactly that (it
+# wants 6+ characters of at least two kinds). The chosen password is used
+# when Dockge accepts it; otherwise Dockge gets a generated one. Either is
 # kept in a root-only file inside its config dataset for re-runs and printed
 # in the summary, and then authentication is switched off so the UI opens
 # without a login (Dockge auto-logs the admin in).
 DOCKGE_PASS=""
 DOCKGE_PASS_FILE=""
+dockge_accepts() {  # Dockge's strength check: 6+ characters and at least two kinds (lower, upper, digit, other)
+    local p="$1" kinds=0
+    [ "${#p}" -ge 6 ] || return 1
+    [[ "$p" =~ [a-z] ]] && kinds=$(( kinds + 1 ))
+    [[ "$p" =~ [A-Z] ]] && kinds=$(( kinds + 1 ))
+    [[ "$p" =~ [0-9] ]] && kinds=$(( kinds + 1 ))
+    [[ "$p" =~ [^a-zA-Z0-9] ]] && kinds=$(( kinds + 1 ))
+    [ "$kinds" -ge 2 ]
+}
 configure_dockge() {
     info "[12/12] Dockge"
     wait_for "Dockge" 180 bash -c "curl -fs $DOCKGE_URL/ -o /dev/null" \
@@ -2218,6 +2299,8 @@ configure_dockge() {
     DOCKGE_PASS_FILE="$CONFIGS_PATH/dockge/admin-password.txt"
     if [ -s "$DOCKGE_PASS_FILE" ]; then
         DOCKGE_PASS=$(head -1 "$DOCKGE_PASS_FILE" | tr -d '[:space:]')
+    elif dockge_accepts "$ADMIN_PASS"; then
+        DOCKGE_PASS="$ADMIN_PASS"
     else
         DOCKGE_PASS="Dockge-$(openssl rand -hex 6 2>/dev/null || date +%s%N | sha256sum | cut -c1-12)"
     fi
@@ -2309,10 +2392,16 @@ echo ""
 echo "  Logins (qBittorrent, Radarr, Sonarr, Prowlarr, Profilarr, Jellyfin, Seerr, Bazarr, Qui, Tracearr):"
 echo "    user: $ADMIN_USER   password: $ADMIN_PASS   email: $ADMIN_EMAIL"
 if [ -n "$DOCKGE_PASS_FILE" ] && [ -s "$DOCKGE_PASS_FILE" ]; then
-    echo "  Dockge: authentication is disabled (no login needed). Its admin user is $ADMIN_USER / $DOCKGE_PASS"
-    echo "    (also in $DOCKGE_PASS_FILE) should you turn authentication back on."
+    if [ "$DOCKGE_PASS" = "$ADMIN_PASS" ]; then
+        echo "  Dockge: authentication is disabled (no login needed); its admin user is the same login, should you turn it back on."
+    else
+        echo "  Dockge: authentication is disabled (no login needed). Its admin user is $ADMIN_USER / $DOCKGE_PASS"
+        echo "    (also in $DOCKGE_PASS_FILE) should you turn authentication back on."
+    fi
 fi
-echo "  CHANGE THESE before exposing anything beyond your LAN."
+if [ "$ADMIN_PASS" = changeme ]; then echo "  CHANGE THESE before exposing anything beyond your LAN."; fi
+echo "  (Your answers are kept root-only in $SETUP_STATE_FILE for re-runs.)"
+[ -n "$QB_FORWARDED_PORT" ] && echo "  qBittorrent listens on forwarded port $QB_FORWARDED_PORT (VPN_AUTO_PORT_FORWARD)."
 echo "  Stacks: $STACKS_PATH/<container>/compose.yaml, managed from Dockge at http://$HOST_IP:5001"
 if [ "$GPU_VENDOR" = "none" ]; then
     echo "  Jellyfin transcoding: software (no usable GPU found).${GPU_NOTE:+ $GPU_NOTE}"
