@@ -1284,6 +1284,13 @@ configure_qbittorrent() {
     if qb_2xx "$code"; then ok "qBittorrent: save paths set (/media/downloads, incomplete in /media/downloads/torrent)"; else
         todo "qBittorrent: could not set the save paths (HTTP $code); set them in Tools > Options > Downloads."; fi
 
+    # WebUI: bypass authentication for clients on localhost. Set only after the
+    # real login was verified from the host above, because from here on a
+    # loopback login succeeds with any password.
+    code=$(qb_code --data-urlencode 'json={"bypass_local_auth":true}' "$QB_URL/api/v2/app/setPreferences")
+    if qb_2xx "$code"; then ok "qBittorrent: bypass authentication for clients on localhost enabled"; else
+        todo "qBittorrent: could not enable the localhost authentication bypass (HTTP $code); tick it in Tools > Options > WebUI."; fi
+
     # Connection / BitTorrent / Advanced per wiki.serversatho.me/en/qBittorrent:
     # no connection limits (-1 = box unchecked), no torrent queueing, more
     # parallel checking, all torrent traffic bound to the VPN interface on
