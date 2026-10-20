@@ -1200,14 +1200,14 @@ qb_curl() {
 }
 qb_up()    { [ "$(qb_curl -o /dev/null -w '%{http_code}' "$QB_URL/" 2>/dev/null)" = "200" ]; }
 # qb_login_result <curl output ending in "\n<http code>"> -> "Ok." | "Fails." | "banned [HTTP 403]" | "<body> [HTTP code]"
-# The login API changed in qBittorrent 5.2: a good login answers 200 with an
-# empty body (older versions say "Ok."), a bad one 401 (older: 200 "Fails."),
+# The login API changed in qBittorrent 5.2: a good login answers 204 No
+# Content (older versions: 200 "Ok."), a bad one 401 (older: 200 "Fails."),
 # and a banned address 403 in both. Judge by the status code first.
 qb_login_result() {
     local out="$1" code body
     code="${out##*$'\n'}"; body="${out%$'\n'*}"; [ "$body" = "$out" ] && body=""
     case "$code" in
-        200) if [ "$body" = "Fails." ]; then echo "Fails."; else echo "Ok."; fi ;;
+        2??) if [ "$body" = "Fails." ]; then echo "Fails."; else echo "Ok."; fi ;;
         401) echo "Fails." ;;
         403) echo "banned [HTTP 403]" ;;
         *)   printf '%s [HTTP %s]\n' "$(printf '%s' "$body" | tr -d '\r' | head -c 100)" "${code:-none}" ;;
@@ -1220,6 +1220,7 @@ qb_login() {  # qb_login <user> <pass> -> session cookie in $QB_COOKIE on succes
 }
 qb_post()  { qb_curl -b "$QB_COOKIE" "$@"; }   # qb_post <form args...> <url>
 qb_code()  { qb_post -o /dev/null -w '%{http_code}' "$@" 2>/dev/null; }   # HTTP status of a logged-in call
+qb_2xx()   { case "$1" in 2??) return 0 ;; *) return 1 ;; esac; }   # qBittorrent 5.2 answers 204 where older versions answered 200
 # qb_login_from_host <user> <pass> -> "Ok." | "Fails." | "banned [HTTP 403]" | "<error> [HTTP code]"
 # A real credential check: the request enters through the published port.
 qb_login_from_host() {
@@ -1257,7 +1258,7 @@ configure_qbittorrent() {
     else
         echo "    qBittorrent: login from the host answered '$verify'; setting the WebUI login now."
         code=$(qb_code --data-urlencode "json=$(jbuild '{"web_ui_username": os.environ["ADMIN_USER"], "web_ui_password": os.environ["ADMIN_PASS"]}')" "$QB_URL/api/v2/app/setPreferences")
-        [ "$code" = "200" ] || { todo "qBittorrent: setPreferences for the WebUI login returned HTTP $code; set $ADMIN_USER / $ADMIN_PASS in Tools > Options > WebUI."; return 1; }
+        qb_2xx "$code" || { todo "qBittorrent: setPreferences for the WebUI login returned HTTP $code; set $ADMIN_USER / $ADMIN_PASS in Tools > Options > WebUI."; return 1; }
         # 3. Restart: flushes the new login to disk and clears the in-memory
         #    IP bans earlier failed logins (Radarr, Sonarr, Qui, you) have
         #    collected. The VPN tunnel comes back on its own.
@@ -1280,7 +1281,7 @@ configure_qbittorrent() {
     # ones and .torrent files in /media/downloads/torrent.
     code=$(qb_code --data-urlencode 'json={"save_path":"/media/downloads","temp_path_enabled":true,"temp_path":"/media/downloads/torrent","export_dir":"/media/downloads/torrent","auto_tmm_enabled":true,"torrent_content_layout":"Original"}' \
         "$QB_URL/api/v2/app/setPreferences")
-    if [ "$code" = "200" ]; then ok "qBittorrent: save paths set (/media/downloads, incomplete in /media/downloads/torrent)"; else
+    if qb_2xx "$code"; then ok "qBittorrent: save paths set (/media/downloads, incomplete in /media/downloads/torrent)"; else
         todo "qBittorrent: could not set the save paths (HTTP $code); set them in Tools > Options > Downloads."; fi
 
     # Connection / BitTorrent / Advanced per wiki.serversatho.me/en/qBittorrent:
@@ -1292,11 +1293,11 @@ configure_qbittorrent() {
     io_before=$(qb_pref "$prefs" disk_io_type)
     code=$(qb_code --data-urlencode 'json={"max_connec":-1,"max_connec_per_torrent":-1,"max_uploads":-1,"max_uploads_per_torrent":-1,"queueing_enabled":false,"max_active_checking_torrents":3,"current_network_interface":"wg0","current_interface_address":"0.0.0.0","disk_io_type":2}' \
         "$QB_URL/api/v2/app/setPreferences")
-    if [ "$code" = "200" ]; then ok "qBittorrent: connection limits off, queueing off, 3 checking torrents, interface wg0 / all IPv4, disk IO type POSIX-compliant"; else
+    if qb_2xx "$code"; then ok "qBittorrent: connection limits off, queueing off, 3 checking torrents, interface wg0 / all IPv4, disk IO type POSIX-compliant"; else
         todo "qBittorrent: could not apply the connection/advanced settings (HTTP $code); set them in Tools > Options."; fi
     # The disk IO type is read when the session starts, so a change needs one
     # restart (the VPN tunnel comes back on its own).
-    if [ "$code" = "200" ] && [ "$io_before" != "2" ]; then
+    if qb_2xx "$code" && [ "$io_before" != "2" ]; then
         echo "    qBittorrent: restarting the container so the POSIX disk IO type takes effect (was ${io_before:-unset})..."
         docker restart qbittorrent >/dev/null 2>&1
         wait_for "qBittorrent WebUI after the restart" 300 qb_up \
@@ -1316,12 +1317,12 @@ configure_qbittorrent() {
             if [ "$cur" = "/media/downloads" ]; then ok "qBittorrent: category '$cat' already saves to /media/downloads"; continue; fi
             # editCategory answers 409 when nothing changes, hence the check above.
             code=$(qb_code --data-urlencode "category=$cat" --data-urlencode "savePath=/media/downloads" "$QB_URL/api/v2/torrents/editCategory")
-            if [ "$code" = "200" ]; then ok "qBittorrent: category '$cat' save path changed from '${cur:-<default>}' to /media/downloads"; else
+            if qb_2xx "$code"; then ok "qBittorrent: category '$cat' save path changed from '${cur:-<default>}' to /media/downloads"; else
                 warn "qBittorrent: could not change the save path of category '$cat' (HTTP $code); set it to /media/downloads in the WebUI"; fi
             continue
         fi
         code=$(qb_code --data-urlencode "category=$cat" --data-urlencode "savePath=/media/downloads" "$QB_URL/api/v2/torrents/createCategory")
-        if [ "$code" = "200" ]; then ok "qBittorrent: category '$cat' -> /media/downloads"; else
+        if qb_2xx "$code"; then ok "qBittorrent: category '$cat' -> /media/downloads"; else
             warn "qBittorrent: could not create category '$cat' (HTTP $code)"; fi
     done
     [ "$QB_MODE" = "exec" ] && docker exec qbittorrent rm -f "$QB_COOKIE" >/dev/null 2>&1
