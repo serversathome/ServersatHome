@@ -213,8 +213,8 @@ echo "Login to create in every app (Enter keeps the value in brackets):"
 while :; do
     read -rp "  Username [$ADMIN_USER]: " answer
     [ -z "$answer" ] && break
-    if [[ "$answer" =~ ^[^[:space:]]+$ ]]; then ADMIN_USER="$answer"; break; fi
-    echo "  No spaces in the username, please."
+    if [[ "$answer" =~ ^[^[:space:]]{3,}$ ]]; then ADMIN_USER="$answer"; break; fi
+    echo "  At least 3 characters and no spaces (Profilarr insists on that)."
 done
 while :; do
     read -rsp "  Password [$([ "$ADMIN_PASS" = changeme ] && echo changeme || echo 'keep the saved one')]: " answer; echo
