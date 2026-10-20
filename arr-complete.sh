@@ -762,8 +762,11 @@ write_stack qbittorrent <<EOF
 services:
   qbittorrent:
     container_name: qbittorrent
-    # Version pinned on purpose; bump deliberately, not via :latest.
-    image: ghcr.io/hotio/qbittorrent:release-5.1.2
+    # hotio's floating stable tag (the same image as "release"); Watchtower
+    # keeps it current. The variables below follow hotio's current base image
+    # (VPN_FIREWALL_TYPE is gone, nftables only; VPN_INTERFACE_PREFIXES and
+    # Unbound are new; VPN_AUTO_PORT_FORWARD defaults to false).
+    image: ghcr.io/hotio/qbittorrent:latest
     restart: unless-stopped
     ports:
       - 8080:8080
@@ -772,23 +775,27 @@ services:
       - PGID=568
       - UMASK=002
       - TZ=$TZ_VALUE
+      - WEBUI_PORTS=8080/tcp
       # hotio ships both libtorrent builds and runs the 1.2 one by default.
-      # The POSIX-compliant disk IO type (set below, the right choice on ZFS)
-      # only exists with libtorrent 2.
+      # The POSIX-compliant disk IO type (set by this script, the right choice
+      # on ZFS) only exists with libtorrent 2.
       - LIBTORRENT=v2
-      - WEBUI_PORTS=8080/tcp,8080/udp
       - VPN_ENABLED=true
       - VPN_CONF=wg0
       - VPN_PROVIDER=generic
       - VPN_LAN_NETWORK=$CIDR_NETWORK,10.8.0.0/24
       - VPN_LAN_LEAK_ENABLED=false
       - VPN_EXPOSE_PORTS_ON_LAN=
-      - VPN_AUTO_PORT_FORWARD=true
+      # false for a plain WireGuard config. Put a port number here if your
+      # provider gave you a fixed forwarded port; "true" only works together
+      # with VPN_PROVIDER=proton or pia.
+      - VPN_AUTO_PORT_FORWARD=false
       - VPN_PORT_REDIRECTS=
-      - VPN_FIREWALL_TYPE=auto
       - VPN_HEALTHCHECK_ENABLED=false
       - VPN_NAMESERVERS=wg
+      - VPN_INTERFACE_PREFIXES=
       - PRIVOXY_ENABLED=false
+      - UNBOUND_ENABLED=false
     cap_add:
       - NET_ADMIN
     sysctls:
