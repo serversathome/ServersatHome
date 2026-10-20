@@ -1804,13 +1804,88 @@ jf_api() {  # jf_api <method> <path> [json] [extra curl args]
     http "$method" "$JELLYFIN_URL$path" "$body" -H "Authorization: $auth" -H 'Content-Type: application/json' "$@"
 }
 
-jf_add_library() {  # jf_add_library <name> <collectionType> <path>
-    local name="$1" ctype="$2" path="$3" have
-    have=$(jf_api GET /Library/VirtualFolders | jpy "[v['Name'] for v in d]")
-    if [[ "$have" == *"\"$name\""* ]]; then ok "Jellyfin: library '$name' already present"; return 0; fi
+# jf_api_key <app-name> -> a Jellyfin API key named <app-name> (created if missing)
+jf_api_key() {
+    local app="$1" key
+    key=$(jf_api GET /Auth/Keys | jpy "next((k['AccessToken'] for k in d.get('Items', []) if k.get('AppName')=='$app'), None)")
+    [ -n "$key" ] && { printf '%s' "$key"; return 0; }
+    jf_api POST "/Auth/Keys?app=$app" >/dev/null
+    jf_api GET /Auth/Keys | jpy "next((k['AccessToken'] for k in d.get('Items', []) if k.get('AppName')=='$app'), None)"
+}
+
+# jf_add_library <name> <collectionType> <path>
+# Real-time monitoring is switched on explicitly: Jellyfin's API default for
+# an omitted EnableRealtimeMonitor is false (only the web UI ticks it), and
+# without it new files only appear at the next scheduled scan (12 h). A
+# library from an earlier run gets it switched on in place.
+jf_add_library() {
+    local name="$1" ctype="$2" path="$3" lib body
+    lib=$(jf_api GET /Library/VirtualFolders | jpy "next((v for v in d if v.get('Name')=='$name'), None)")
+    if [ -n "$lib" ]; then
+        if [ "$(printf '%s' "$lib" | jpy "(d.get('LibraryOptions') or {}).get('EnableRealtimeMonitor')")" = "True" ]; then
+            ok "Jellyfin: library '$name' already present (real-time monitoring on)"; return 0
+        fi
+        body=$(printf '%s' "$lib" | python3 -c '
+import json, sys
+v = json.load(sys.stdin)
+o = v.get("LibraryOptions") or {}
+o["EnableRealtimeMonitor"] = True
+print(json.dumps({"Id": v["ItemId"], "LibraryOptions": o}))')
+        jf_api POST /Library/VirtualFolders/LibraryOptions "$body" >/dev/null
+        if http_ok; then ok "Jellyfin: library '$name' already present; real-time monitoring switched on"; else
+            todo "Jellyfin: could not switch on real-time monitoring for '$name' (HTTP $(http_code)); tick 'Enable real time monitoring' in Dashboard > Libraries > $name."; fi
+        return 0
+    fi
     jf_api POST "/Library/VirtualFolders?name=$(python3 -c 'import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))' "$name")&collectionType=$ctype&refreshLibrary=true" \
-        "{\"LibraryOptions\": {\"PathInfos\": [{\"Path\": \"$path\"}]}}" >/dev/null
-    if http_ok; then ok "Jellyfin: library '$name' -> $path"; else todo "Jellyfin: could not add library '$name' (HTTP $(http_code))."; fi
+        "{\"LibraryOptions\": {\"EnableRealtimeMonitor\": true, \"PathInfos\": [{\"Path\": \"$path\"}]}}" >/dev/null
+    if http_ok; then ok "Jellyfin: library '$name' -> $path (real-time monitoring on)"; else todo "Jellyfin: could not add library '$name' (HTTP $(http_code))."; fi
+}
+
+# arr_add_jellyfin <app> <base-url> <api-key> <jellyfin-api-key>
+# Settings > Connect > Emby / Jellyfin: after every import, upgrade, rename
+# or delete the app tells Jellyfin which folder changed, so new downloads
+# show up right away. Both sides see the media under the same /media path,
+# so no path mapping is needed. Built from the app's own schema; only a
+# connection that passes its test is saved.
+arr_add_jellyfin() {
+    local app="$1" base="$2" key="$3" jf_key="$4" have body res
+    have=$(arr_api "$base" "$key" GET /api/v3/notification | jpy "next((n['name'] for n in d if n['implementation']=='MediaBrowser'), None)")
+    if [ -n "$have" ]; then ok "$app: Jellyfin connection already present ('$have')"; return 0; fi
+    body=$(arr_api "$base" "$key" GET /api/v3/notification/schema | JF_KEY="$jf_key" python3 -c '
+import json, os, sys
+t = next(x for x in json.load(sys.stdin) if x.get("implementation") == "MediaBrowser")
+vals = {"host": "jellyfin", "port": 8096, "useSsl": False, "urlBase": "",
+        "apiKey": os.environ["JF_KEY"], "notify": False, "updateLibrary": True}
+for f in t["fields"]:
+    if f["name"] in vals:
+        f["value"] = vals[f["name"]]
+for ev in ("Download", "Upgrade", "Rename", "MovieDelete", "MovieFileDelete", "MovieFileDeleteForUpgrade",
+           "SeriesDelete", "EpisodeFileDelete", "EpisodeFileDeleteForUpgrade"):
+    if t.get("supportsOn" + ev):
+        t["on" + ev] = True
+t.update(name="Jellyfin", tags=[])
+t.pop("id", None)
+print(json.dumps(t))') || { todo "$app: Emby / Jellyfin not found in the connection schema; add it in Settings > Connect."; return 1; }
+    res=$(arr_api "$base" "$key" POST /api/v3/notification/test "$body")
+    if ! http_ok; then
+        todo "$app: Jellyfin connection test failed (HTTP $(http_code)): $(arr_errors "$res"); add Emby / Jellyfin (host jellyfin, port 8096) in Settings > Connect."
+        return 1
+    fi
+    res=$(arr_api "$base" "$key" POST '/api/v3/notification?forceSave=true' "$body")
+    if http_ok; then ok "$app: Jellyfin connection added (library refresh on import, upgrade, rename and delete)"; else
+        todo "$app: could not add the Jellyfin connection (HTTP $(http_code)): $(arr_errors "$res"); add Emby / Jellyfin in Settings > Connect."; fi
+}
+
+# Radarr and Sonarr come before Jellyfin in the install order, so their
+# Jellyfin connections are added here, once Jellyfin can hand out an API key.
+jellyfin_connect_arrs() {
+    [ -n "$RADARR_API_KEY$SONARR_API_KEY" ] || return 0
+    local jf_key
+    jf_key=$(jf_api_key radarr-sonarr)
+    [ -n "$jf_key" ] || { todo "Jellyfin: could not create an API key for Radarr and Sonarr; add Emby / Jellyfin in Settings > Connect in both."; return 1; }
+    [ -n "$RADARR_API_KEY" ] && arr_add_jellyfin Radarr "$RADARR_URL" "$RADARR_API_KEY" "$jf_key"
+    [ -n "$SONARR_API_KEY" ] && arr_add_jellyfin Sonarr "$SONARR_URL" "$SONARR_API_KEY" "$jf_key"
+    return 0
 }
 
 configure_jellyfin() {
@@ -1836,6 +1911,7 @@ configure_jellyfin() {
     [ -n "$JELLYFIN_TOKEN" ] || { todo "Jellyfin: could not log in as $ADMIN_USER; add the Movies and TV libraries in the UI."; return 1; }
     jf_add_library "Movies"   movies  /media/movies
     jf_add_library "TV Shows" tvshows /media/tv
+    jellyfin_connect_arrs
     jellyfin_configure_transcoding
 }
 
@@ -2219,15 +2295,6 @@ tracearr_api() {  # tracearr_api <method> <path> [json]
 }
 tracearr_ready() {  # /health answers 200 while still starting; "mode":"ready" is the real signal
     [[ "$(curl -sS -m 10 "$TRACEARR_URL/health" 2>/dev/null)" == *'"mode":"ready"'* ]]
-}
-
-# jf_api_key <app-name> -> a Jellyfin API key named <app-name> (created if missing)
-jf_api_key() {
-    local app="$1" key
-    key=$(jf_api GET /Auth/Keys | jpy "next((k['AccessToken'] for k in d.get('Items', []) if k.get('AppName')=='$app'), None)")
-    [ -n "$key" ] && { printf '%s' "$key"; return 0; }
-    jf_api POST "/Auth/Keys?app=$app" >/dev/null
-    jf_api GET /Auth/Keys | jpy "next((k['AccessToken'] for k in d.get('Items', []) if k.get('AppName')=='$app'), None)"
 }
 
 configure_tracearr() {
