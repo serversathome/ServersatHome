@@ -1628,7 +1628,12 @@ anime = []
 if anime_db:
     qps = names(anime_db, "qualityProfiles")
     anime = [n for n in qps if n == os.environ["ANIME_PROFILE"]] or [n for n in qps if "anime" in n.lower()]
-    sel += [{"databaseId": anime_db["id"], "profileName": n} for n in anime]
+    # Sonarr v5 keeps size limits per profile, so the anime profile can take the
+    # anime database'\''s own sizes; everything else uses the instance-wide pick
+    # below. On Sonarr v4 and Radarr (global sizes) Profilarr stores and ignores it.
+    anime_qdef = (names(anime_db, "qualityDefinitionsConfigs") or [None])[0]
+    sel += [dict({"databaseId": anime_db["id"], "profileName": n},
+                 **({"qualityDefinitionsConfigName": anime_qdef} if anime_qdef else {})) for n in anime]
 # Lower number = higher priority; the last-synced (highest-priority) database wins on clashes.
 prio = [{"databaseId": db["id"], "priority": 1}] + ([{"databaseId": anime_db["id"], "priority": 2}] if anime_db else [])
 # The database ships one delay/naming/etc. config per app ("Radarr", "Sonarr").
