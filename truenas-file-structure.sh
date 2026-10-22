@@ -419,10 +419,6 @@ services:
       - UMASK=002
       - TZ=$TZ_VALUE
       - WEBUI_PORTS=8080/tcp
-      # hotio ships libtorrent 1.2 and 2.1 builds; 2.1 is now its default, but
-      # it is pinned here because its default disk IO type (pread/pwrite,
-      # which this script keeps) is the right choice on ZFS.
-      - LIBTORRENT=v2
       - VPN_ENABLED=true
       - VPN_CONF=wg0
       - VPN_PROVIDER=generic
@@ -814,9 +810,9 @@ configure_qbittorrent() {
     # Connection / BitTorrent / Advanced per wiki.serversatho.me/en/qBittorrent:
     # no connection limits (-1 = box unchecked), no torrent queueing, more
     # parallel checking, all torrent traffic bound to the VPN interface on
-    # every IPv4 address, and the Default disk IO type (0), which on the
-    # libtorrent 2.1 build the compose file selects is pread/pwrite. Installs
-    # made when this script set POSIX-compliant (2) are moved back to Default;
+    # every IPv4 address, and the Default disk IO type (0), which on hotio's
+    # default libtorrent 2.1 build is pread/pwrite. Installs made when this
+    # script set POSIX-compliant (2) are moved back to Default;
     # qBittorrent reads it at startup, so it applies from the next restart
     # (Watchtower's next update, or: docker restart qbittorrent).
     code=$(qb_code --data-urlencode 'json={"max_connec":-1,"max_connec_per_torrent":-1,"max_uploads":-1,"max_uploads_per_torrent":-1,"queueing_enabled":false,"max_active_checking_torrents":3,"current_network_interface":"wg0","current_interface_address":"0.0.0.0","disk_io_type":0}' \
