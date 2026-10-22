@@ -44,10 +44,11 @@ resolve_template() {
   info "Resolving latest Ubuntu 26.04 LXC template from catalog..."
   pveam update >/dev/null 2>&1 || true
   local found
+  # Match the filename by pattern rather than column position: PVE 9.2 added an
+  # arch column, and a no-match must not trip set -e/pipefail (#52)
   found=$(pveam available --section system 2>/dev/null \
-            | awk '{print $NF}' \
-            | grep -E '^ubuntu-26\.04-standard' \
-            | sort -V | tail -n1)
+            | awk '{for (i = 1; i <= NF; i++) if ($i ~ /^ubuntu-26\.04-standard/) print $i}' \
+            | sort -V | tail -n1) || true
   if [[ -n "$found" ]]; then
     TEMPLATE="$found"
     success "Using template: $TEMPLATE"
