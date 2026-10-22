@@ -419,10 +419,6 @@ services:
       - UMASK=002
       - TZ=$TZ_VALUE
       - WEBUI_PORTS=8080/tcp
-      # hotio ships both libtorrent builds and runs the 1.2 one by default.
-      # The POSIX-compliant disk IO type (set by this script, the right choice
-      # on ZFS) only exists with libtorrent 2.
-      - LIBTORRENT=v2
       - VPN_ENABLED=true
       - VPN_CONF=wg0
       - VPN_PROVIDER=generic
@@ -814,23 +810,15 @@ configure_qbittorrent() {
     # Connection / BitTorrent / Advanced per wiki.serversatho.me/en/qBittorrent:
     # no connection limits (-1 = box unchecked), no torrent queueing, more
     # parallel checking, all torrent traffic bound to the VPN interface on
-    # every IPv4 address, and the POSIX-compliant disk IO type (2; the
-    # libtorrent 2 build the compose file selects is required for it).
-    local io_before
-    io_before=$(qb_pref "$prefs" disk_io_type)
-    code=$(qb_code --data-urlencode 'json={"max_connec":-1,"max_connec_per_torrent":-1,"max_uploads":-1,"max_uploads_per_torrent":-1,"queueing_enabled":false,"max_active_checking_torrents":3,"current_network_interface":"wg0","current_interface_address":"0.0.0.0","disk_io_type":2}' \
+    # every IPv4 address, and the Default disk IO type (0), which on hotio's
+    # default libtorrent 2.1 build is pread/pwrite. Installs made when this
+    # script set POSIX-compliant (2) are moved back to Default;
+    # qBittorrent reads it at startup, so it applies from the next restart
+    # (Watchtower's next update, or: docker restart qbittorrent).
+    code=$(qb_code --data-urlencode 'json={"max_connec":-1,"max_connec_per_torrent":-1,"max_uploads":-1,"max_uploads_per_torrent":-1,"queueing_enabled":false,"max_active_checking_torrents":3,"current_network_interface":"wg0","current_interface_address":"0.0.0.0","disk_io_type":0}' \
         "$QB_URL/api/v2/app/setPreferences")
-    if qb_2xx "$code"; then ok "qBittorrent: connection limits off, queueing off, 3 checking torrents, interface wg0 / all IPv4, disk IO type POSIX-compliant"; else
+    if qb_2xx "$code"; then ok "qBittorrent: connection limits off, queueing off, 3 checking torrents, interface wg0 / all IPv4, disk IO type Default (pread/pwrite)"; else
         todo "qBittorrent: could not apply the connection/advanced settings (HTTP $code); set them in Tools > Options."; fi
-    # The disk IO type is read when the session starts, so a change needs one
-    # restart (the VPN tunnel comes back on its own).
-    if qb_2xx "$code" && [ "$io_before" != "2" ]; then
-        echo "    qBittorrent: restarting the container so the POSIX disk IO type takes effect (was ${io_before:-unset})..."
-        docker restart qbittorrent >/dev/null 2>&1
-        wait_for "qBittorrent WebUI after the restart" 300 qb_up \
-            || { todo "qBittorrent did not come back after the restart: docker logs qbittorrent"; return 1; }
-        qb_login "$ADMIN_USER" "$ADMIN_PASS" || { todo "qBittorrent: could not log back in after the restart; check the WebUI."; return 1; }
-    fi
 
     # Categories for Radarr and Sonarr, both saving straight into
     # /media/downloads. The path is set explicitly: a category with an empty
