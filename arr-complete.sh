@@ -14,7 +14,7 @@
 #   3. Launches every stack (including Dockge), then configures every app
 #      through its API in the order from wiki.serversatho.me/en/InstallInstructions:
 #
-#        qBittorrent -> Radarr -> Sonarr -> FlareSolverr -> Prowlarr
+#        qBittorrent -> Radarr -> Sonarr -> Trawl -> Prowlarr
 #        -> Profilarr -> Jellyfin -> Seerr -> Bazarr -> Qui -> Tracearr -> Dockge
 #
 #   Along the way it detects a GPU (NVIDIA, Intel or AMD, dedicated or
@@ -544,9 +544,9 @@ esac
 # is owned by 1000 — see wiki.serversatho.me/en/seerr.
 # stacks/<container>: one DIRECTORY per container inside the stacks dataset,
 # each with its own compose.yaml — the layout Dockge manages.
-CONFIG_DATASETS=("prowlarr" "radarr" "sonarr" "seerr" "profilarr" "bazarr" "jellyfin" "qbittorrent" "qui" "dozzle" "tracearr" "dockge")
+CONFIG_DATASETS=("prowlarr" "radarr" "sonarr" "seerr" "profilarr" "bazarr" "jellyfin" "qbittorrent" "qui" "dozzle" "tracearr" "trawl" "dockge")
 MEDIA_SUBDIRECTORIES=("movies" "tv" "downloads" "downloads/torrent" "downloads/crossseed")
-STACKS=("qbittorrent" "radarr" "sonarr" "flaresolverr" "prowlarr" "profilarr" "jellyfin" "seerr" "bazarr" "qui" "tracearr" "dozzle" "watchtower" "dockge")
+STACKS=("qbittorrent" "radarr" "sonarr" "trawl" "prowlarr" "profilarr" "jellyfin" "seerr" "bazarr" "qui" "tracearr" "dozzle" "watchtower" "dockge")
 CONFIGS_PATH="/mnt/$CONFIG_POOL/configs"
 STACKS_PATH="/mnt/$CONFIG_POOL/stacks"
 MEDIA_PATH="/mnt/$MEDIA_POOL/media"
@@ -737,19 +737,32 @@ services:
       - $CONFIGS_PATH/seerr:/app/config
 EOF
 
-write_stack flaresolverr <<EOF
+# Trawl replaces FlareSolverr: it serves the same FlareSolverr API on 8191
+# (Prowlarr keeps using its FlareSolverr proxy type) and adds a dashboard at
+# /dashboard. The standard image needs an x86 CPU with AVX2; older CPUs get
+# the :baseline build of the same release.
+TRAWL_TAG=latest
+if [ "$(uname -m)" = x86_64 ] && ! grep -qw avx2 /proc/cpuinfo; then TRAWL_TAG=baseline; fi
+write_stack trawl <<EOF
 services:
-  flaresolverr:
-    image: ghcr.io/flaresolverr/flaresolverr:latest
-    container_name: flaresolverr
+  trawl:
+    image: ghcr.io/germondai/trawl:$TRAWL_TAG
+    container_name: trawl
+    restart: unless-stopped
+    # Camoufox (Firefox) needs more shared memory than Docker's 64 MB default.
+    shm_size: 1gb
     environment:
-      - LOG_LEVEL=info
-      - LOG_HTML=false
-      - CAPTCHA_SOLVER=none
       - TZ=$TZ_VALUE
+      # One process, no Redis: clearance is cached in memory.
+      - SESSION_CACHE_DRIVER=memory
+      - BROWSER_POOL_SIZE=1
+      # The request-history dashboard at /dashboard, without a token (LAN only).
+      - METRICS_DASHBOARD_ENABLED=true
+      - METRICS_DB_PATH=/data/metrics/trawl.sqlite
     ports:
       - 8191:8191
-    restart: unless-stopped
+    volumes:
+      - $CONFIGS_PATH/trawl:/data/metrics
 EOF
 
 write_stack profilarr <<EOF
@@ -1004,6 +1017,21 @@ else
     echo "Docker network '$DOCKER_NETWORK' created."
 fi
 
+# Trawl replaced FlareSolverr. On an install made before that, take the old
+# stack down (it holds port 8191) and move its compose file out of stacks/ so
+# Dockge stops listing it; FlareSolverr kept no data.
+if [ -f "$STACKS_PATH/flaresolverr/compose.yaml" ] || docker container inspect flaresolverr >/dev/null 2>&1; then
+    echo "Replacing FlareSolverr with Trawl..."
+    if [ -f "$STACKS_PATH/flaresolverr/compose.yaml" ]; then
+        docker compose -f "$STACKS_PATH/flaresolverr/compose.yaml" down >/dev/null 2>&1
+        mv "$STACKS_PATH/flaresolverr/compose.yaml" "$STACKS_PATH/flaresolverr-compose.yaml.bak-$(date +%Y%m%d-%H%M%S)"
+        rmdir "$STACKS_PATH/flaresolverr" 2>/dev/null \
+            || warn "stacks/flaresolverr still holds other files; Dockge may keep listing it."
+    fi
+    docker rm -f flaresolverr >/dev/null 2>&1
+    ok "FlareSolverr removed (its compose file is kept in $STACKS_PATH as flaresolverr-compose.yaml.bak-*)"
+fi
+
 # Each stack is its own compose project, named after its directory (that is
 # what Dockge expects to find).
 echo "Launching the stacks from $STACKS_PATH..."
@@ -1026,7 +1054,7 @@ QB_URL="http://localhost:8080"
 RADARR_URL="http://localhost:7878";   RADARR_INT="http://radarr:7878"
 SONARR_URL="http://localhost:8989";   SONARR_INT="http://sonarr:8989"
 PROWLARR_URL="http://localhost:9696"; PROWLARR_INT="http://prowlarr:9696"
-FLARE_URL="http://localhost:8191";    FLARE_INT="http://flaresolverr:8191/"
+TRAWL_URL="http://localhost:8191";    TRAWL_INT="http://trawl:8191/"
 PROFILARR_URL="http://localhost:6868"
 JELLYFIN_URL="http://localhost:8096"; JELLYFIN_INT="http://jellyfin:8096"
 SEERR_URL="http://localhost:5055";    SEERR_INT="http://seerr:5055"
@@ -1357,11 +1385,12 @@ configure_sonarr() {
     arr_add_qbittorrent   Sonarr "$SONARR_URL" "$SONARR_API_KEY" tvCategory sonarr
 }
 
-# ── 4. FlareSolverr ─────────────────────────────────────────────────────────
-configure_flaresolverr() {
-    info "[4/12] FlareSolverr"
-    if wait_for "FlareSolverr" 120 bash -c "curl -fs $FLARE_URL/ -o /dev/null"; then ok "FlareSolverr is up (nothing to configure)"
-    else todo "FlareSolverr did not respond on :8191; Prowlarr's proxy test may fail."; fi
+# ── 4. Trawl ────────────────────────────────────────────────────────────────
+configure_trawl() {
+    info "[4/12] Trawl"
+    # It starts a browser before it answers; give it time.
+    if wait_for "Trawl" 180 bash -c "curl -fs $TRAWL_URL/health -o /dev/null"; then ok "Trawl is up (nothing to configure; dashboard at http://$HOST_IP:8191/dashboard)"
+    else todo "Trawl did not respond on :8191 (docker logs trawl); Prowlarr's proxy test may fail."; fi
 }
 
 # ── 5. Prowlarr ─────────────────────────────────────────────────────────────
@@ -1400,23 +1429,42 @@ configure_prowlarr() {
         || { todo "Prowlarr API not responding; skipping."; return 1; }
     arr_enable_forms_auth Prowlarr "$PROWLARR_URL" "$PROWLARR_API_KEY" v1
 
-    # FlareSolverr as an indexer proxy, applied to indexers tagged "flaresolverr".
+    # Trawl as an indexer proxy, applied to indexers tagged "flaresolverr".
+    # Prowlarr has no Trawl type: Trawl speaks the FlareSolverr API, so it is a
+    # FlareSolverr proxy pointed at trawl:8191. The tag keeps its name, so
+    # indexers already tagged on an older install keep using the proxy.
     local have tag_id body
-    have=$(arr_api "$PROWLARR_URL" "$PROWLARR_API_KEY" GET /api/v1/indexerproxy | jpy "[p['implementation'] for p in d]")
-    if [[ "$have" == *'"FlareSolverr"'* ]]; then ok "Prowlarr: FlareSolverr proxy already present"; else
+    have=$(arr_api "$PROWLARR_URL" "$PROWLARR_API_KEY" GET /api/v1/indexerproxy | jpy "next((p for p in d if p['implementation']=='FlareSolverr'), None)")
+    if [ -n "$have" ]; then
+        # Present from a FlareSolverr install: repoint it at Trawl.
+        if [ "$(printf '%s' "$have" | jpy "next((f.get('value') for f in d['fields'] if f['name']=='host'), '')")" = "$TRAWL_INT" ]; then
+            ok "Prowlarr: Trawl proxy already present"
+        else
+            body=$(printf '%s' "$have" | TRAWL_INT="$TRAWL_INT" python3 -c '
+import json, os, sys
+t = json.load(sys.stdin)
+for f in t["fields"]:
+    if f["name"] == "host": f["value"] = os.environ["TRAWL_INT"]
+t["name"] = "Trawl"
+print(json.dumps(t))')
+            arr_api "$PROWLARR_URL" "$PROWLARR_API_KEY" PUT "/api/v1/indexerproxy/$(printf '%s' "$have" | jpy "d['id']")?forceSave=true" "$body" >/dev/null
+            if http_ok; then ok "Prowlarr: FlareSolverr proxy now points at Trawl ($TRAWL_INT)"
+            else todo "Prowlarr: could not repoint the FlareSolverr proxy at Trawl (HTTP $(http_code)); set its host to $TRAWL_INT in Settings > Indexers."; fi
+        fi
+    else
         tag_id=$(prowlarr_tag_id flaresolverr)
         body=$(arr_api "$PROWLARR_URL" "$PROWLARR_API_KEY" GET /api/v1/indexerproxy/schema \
-            | TAG_ID="${tag_id:-0}" FLARE_INT="$FLARE_INT" python3 -c '
+            | TAG_ID="${tag_id:-0}" TRAWL_INT="$TRAWL_INT" python3 -c '
 import json, os, sys
 t = next(x for x in json.load(sys.stdin) if x.get("implementation") == "FlareSolverr")
 for f in t["fields"]:
-    if f["name"] == "host": f["value"] = os.environ["FLARE_INT"]
+    if f["name"] == "host": f["value"] = os.environ["TRAWL_INT"]
     if f["name"] == "requestTimeout": f["value"] = 60
-t.update(name="FlareSolverr", tags=[int(os.environ["TAG_ID"])] if int(os.environ["TAG_ID"]) else [])
+t.update(name="Trawl", tags=[int(os.environ["TAG_ID"])] if int(os.environ["TAG_ID"]) else [])
 t.pop("id", None)
 print(json.dumps(t))')
         arr_api "$PROWLARR_URL" "$PROWLARR_API_KEY" POST '/api/v1/indexerproxy?forceSave=true' "$body" >/dev/null
-        if http_ok; then ok "Prowlarr: FlareSolverr proxy added (tag 'flaresolverr')"; else todo "Prowlarr: could not add the FlareSolverr proxy (HTTP $(http_code))."; fi
+        if http_ok; then ok "Prowlarr: Trawl proxy added (tag 'flaresolverr')"; else todo "Prowlarr: could not add the Trawl proxy (HTTP $(http_code))."; fi
     fi
 
     [ -n "$RADARR_API_KEY" ] && prowlarr_add_app Radarr "$RADARR_INT" "$RADARR_API_KEY"
@@ -2465,7 +2513,7 @@ echo "════════════════════════�
 configure_qbittorrent
 configure_radarr
 configure_sonarr
-configure_flaresolverr
+configure_trawl
 configure_prowlarr
 configure_profilarr
 configure_jellyfin
@@ -2483,7 +2531,9 @@ echo "════════════════════════�
 docker ps --format "{{.Names}}" | while read -r container_name; do
     ports=$(docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{ (index $conf 0).HostPort }} {{end}}{{end}}' "$container_name")
     if [ -n "$ports" ]; then
-        for port in $ports; do echo "  $container_name | http://$HOST_IP:$port"; done
+        # Trawl's port is its API; the page to open is the dashboard.
+        path=""; [ "$container_name" = trawl ] && path="/dashboard"
+        for port in $ports; do echo "  $container_name | http://$HOST_IP:$port$path"; done
     else
         echo "  $container_name | no published port"
     fi
