@@ -11,7 +11,7 @@
 #   2. Server: filter by your preferred countries and a minimum server
 #      bandwidth (read from AirVPN's live list: currently 2000, 6000 or
 #      20000 Mbit/s; the default is the largest size on offer), healthy
-#      servers only, ranked on measured ping + load + reliability (outages
+#      servers only, ranked on load + reliability + measured ping (outages
 #      counted from AirVPN's session history, 90 days for the top 5, 10 days
 #      for the rest). A server refilling after a recent outage is ranked on
 #      its load once users are back, not on its misleadingly low current
@@ -51,6 +51,8 @@ DEEP_CHECKS=5                # top servers whose full RELIABILITY_DAYS are read
 DEEP_ROUNDS=5                # re-checks until the whole top DEEP_CHECKS has them
 RELIABILITY_DAYS=90          # 10 days per request, so 8 more requests per deep server
 OUTAGE_PENALTY=20            # ranking: 1 (weighted) outage per 30 days counts like 20% load
+PING_WEIGHT=0.25             # ranking: 1 ms of ping counts like 0.25% load. Low on purpose: for
+                             # torrents, capacity and uptime matter far more than latency
 SHORT_OUTAGE_WEIGHT=0.2      # a short outage (under ~20 min) counts as this much of one
 LONG_OUTAGE_HOURLY=0.5       # a long outage (30+ min) counts 1, plus this per hour beyond the first
 WG_PORTS="1637 47107 51820"  # AirVPN's WireGuard ports (UDP)
@@ -333,7 +335,7 @@ SERVER_LABEL=""
 # hours afterwards its load is misleadingly low. For a server with an outage
 # in the last 6 hours whose users are still below 90% of its usual sessions,
 # the load is scaled up to what it will be with those sessions back.
-# Score = ping ms + ranked load % + OUTAGE_PENALTY per weighted outage per
+# Score = PING_WEIGHT x ping ms + ranked load % + OUTAGE_PENALTY per weighted outage per
 # 30 days (see analyze_history); without ping every server gets the same
 # ping, so load and reliability decide;
 # a server whose history is unknown or unchecked counts as 3 outages per 30
@@ -342,12 +344,13 @@ SERVER_LABEL=""
 # rate.
 server_rows() {
     CC="$1" MINBW="$2" EXCLUDE="${3-}" PINGS="$PING_FILE" REL="$REL_FILE" \
-    PENALTY="$OUTAGE_PENALTY" python3 -c '
+    PENALTY="$OUTAGE_PENALTY" PINGW="$PING_WEIGHT" python3 -c '
 import json, os, statistics, sys
 d = json.load(sys.stdin)
 cc = set(os.environ["CC"].lower().split())
 minbw = int(os.environ["MINBW"] or 0)
 penalty = float(os.environ["PENALTY"])
+ping_w = float(os.environ["PINGW"])
 pings = {}
 for line in open(os.environ["PINGS"]):
     n, _, v = line.rstrip("\n").partition("\t")
@@ -378,7 +381,7 @@ def rate(s):
     r = rel.get(s["public_name"])
     return float(r[4]) if r and r[0] in ("ok", "new") else 3.0
 ping = lambda s: pings.get(s["public_name"], 9999)
-key = lambda s: (ping(s) + ranked_load(s) + penalty * rate(s), ping(s))
+key = lambda s: (ping_w * ping(s) + ranked_load(s) + penalty * rate(s), ping(s))
 for s in sorted(rows, key=key):
     n = s["public_name"]
     p = pings.get(n)
@@ -652,7 +655,7 @@ pick_server() {
     rank_servers || die "No healthy server matches those filters. Lower the bandwidth or add countries."
     rows=$RANKED
     echo
-    echo "Ranked best first on ping + load + reliability (1 ms of ping = 1% load = 1/$OUTAGE_PENALTY of an outage per month):"
+    echo "Ranked best first on load + reliability + ping (1 outage a month = $OUTAGE_PENALTY% load, 1 ms of ping = $PING_WEIGHT% load):"
     printf '  %3s  %-14s %-3s %-22s %5s %6s' "#" "Server" "CC" "Location" "Load" "Users"
     [ "$PINGED" = 1 ] && printf ' %6s' "Ping"
     printf '  %s\n' "Outages"
@@ -845,7 +848,7 @@ configure_autoswitch() {
     echo
     echo "Auto-switch: when $SERVER goes down, the monitor rewrites wg0.conf for the next"
     echo "best healthy server matching your filters (${COUNTRIES:-all countries}, >= ${MIN_BW:-the largest size} Mbit/s;"
-    echo "ping + load + reliability, as in the list) and restarts the container that uses it."
+    echo "load + reliability + ping, as in the list) and restarts the container that uses it."
     if yesno "Enable auto-switch?" "$([ "$AUTO_SWITCH" = 1 ] && echo y || echo n)"; then
         AUTO_SWITCH=1
         RESTART_CONTAINER=$(ask "Container to restart after a switch (\"none\" = don't restart)" "${RESTART_CONTAINER:-none}")
