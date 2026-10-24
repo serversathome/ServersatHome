@@ -10,7 +10,8 @@
 #      create a new one.
 #   2. Server: filter by your preferred countries and a minimum server
 #      bandwidth (AirVPN servers are 2000, 6000 or 20000 Mbit/s), healthy
-#      servers only, sorted by load, free bandwidth or users. Or pick a whole
+#      servers only, sorted by load, free bandwidth, users, measured ping
+#      or a ping + load balance. Or pick a whole
 #      country and let AirVPN choose a server at connect time.
 #   3. Generate: writes wg0.conf, backs up the previous one, and checks the
 #      config really belongs to the chosen device.
@@ -99,7 +100,8 @@ STATE_FILE="$OUT_DIR/airvpn-wg.state"
 
 CALLS_FILE=$(mktemp)
 echo 0 > "$CALLS_FILE"
-trap 'rm -f "$CALLS_FILE"' EXIT
+PING_FILE=$(mktemp)
+trap 'rm -f "$CALLS_FILE" "$PING_FILE"' EXIT
 
 # ── Saved settings ──────────────────────────────────────────────────────────
 # Everything the menus remember, with defaults. A key in the environment wins
@@ -293,21 +295,54 @@ STATUS=""
 SERVER_LABEL=""
 
 # server_rows <countries> <min_bw> <sort> — healthy servers, TSV:
-# name, cc, location, load, bw, bw_max, users.
+# name, cc, location, load, bw, bw_max, users, ping ms ("-" if not
+# measured), recovering (1 = under 5% load), entry IP.
+# Pings come from $PING_FILE (see measure_pings); an unanswered ping sorts
+# last. Recovering servers sort last whatever the order: AirVPN drops a
+# server's users during an outage (packet loss, maintenance), so a server
+# that has just come back shows "ok" with almost no load and would otherwise
+# top the "lowest load" list.
 server_rows() {
-    CC="$1" MINBW="$2" SORTBY="$3" python3 -c '
+    CC="$1" MINBW="$2" SORTBY="$3" PINGS="$PING_FILE" python3 -c '
 import json, os, sys
 d = json.load(sys.stdin)
 cc = set(os.environ["CC"].lower().split())
 minbw = int(os.environ["MINBW"] or 0)
+pings = {}
+for line in open(os.environ["PINGS"]):
+    n, _, ms = line.rstrip("\n").partition("\t")
+    try:
+        pings[n] = float(ms)
+    except ValueError:
+        pass
+ping = lambda s: pings.get(s["public_name"], 9999)
+recovering = lambda s: s["currentload"] < 5
 rows = [s for s in d["servers"] if s.get("health") == "ok" and s.get("bw_max", 0) >= minbw
         and (not cc or s["country_code"] in cc)]
-key = {"load":  lambda s: (s["currentload"], -(s["bw_max"] - s["bw"])),
-       "free":  lambda s: (-(s["bw_max"] - s["bw"]), s["currentload"]),
-       "users": lambda s: (s.get("users", 0), s["currentload"])}[os.environ["SORTBY"]]
-for s in sorted(rows, key=key):
-    print("\t".join(str(s.get(k, "")) for k in
-          ("public_name", "country_code", "location", "currentload", "bw", "bw_max", "users")))' <<<"$STATUS"
+key = {"load":     lambda s: (s["currentload"], -(s["bw_max"] - s["bw"])),
+       "free":     lambda s: (-(s["bw_max"] - s["bw"]), s["currentload"]),
+       "users":    lambda s: (s.get("users", 0), s["currentload"]),
+       "ping":     lambda s: (ping(s), s["currentload"]),
+       "balanced": lambda s: (ping(s) + s["currentload"], ping(s))}[os.environ["SORTBY"]]
+for s in sorted(rows, key=lambda s: (recovering(s), key(s))):
+    p = pings.get(s["public_name"])
+    print("\t".join([str(s.get(k, "")) for k in
+          ("public_name", "country_code", "location", "currentload", "bw", "bw_max", "users")]
+          + ["%.0f" % p if p is not None else "-", "1" if recovering(s) else "0", s.get("ip_v4_in1", "")]))' <<<"$STATUS"
+}
+
+# measure_pings — reads server_rows output on stdin, pings every server's
+# entry IP from this machine (3 pings, 32 servers at a time) and writes
+# "name<TAB>avg ms" to $PING_FILE. No API requests. Returns 1 without ping.
+measure_pings() {
+    : > "$PING_FILE"
+    if ! command -v ping >/dev/null; then
+        warn "ping is not installed; sorting by load instead."
+        return 1
+    fi
+    cut -f1,10 | awk -F'\t' '$2 != ""' | tr '\t' ' ' \
+        | xargs -P 32 -L 1 sh -c 'ms=$(ping -c 3 -W 1 -q "$2" 2>/dev/null | sed -n "s#.*= *[0-9.]*/\([0-9.]*\)/.*#\1#p"); printf "%s\t%s\n" "$1" "$ms"' _ \
+        >> "$PING_FILE"
 }
 
 # country_rows <min_bw> — TSV: cc, name, healthy servers >= min_bw, all servers.
@@ -367,23 +402,48 @@ pick_server() {
     done
 
     echo
-    echo "Sort by: 1) lowest load  2) most free bandwidth  3) fewest users"
-    case "$SORT" in free) sort_choice=2 ;; users) sort_choice=3 ;; *) sort_choice=1 ;; esac
-    case "$(ask "Sort" "$sort_choice")" in 2) SORT=free ;; 3) SORT=users ;; *) SORT=load ;; esac
+    echo "Sort by:"
+    echo "  1) lowest load"
+    echo "  2) most free bandwidth"
+    echo "  3) fewest users"
+    echo "  4) lowest ping from this machine"
+    echo "  5) balanced: ping + load (1% load counts like 1 ms of ping)"
+    case "$SORT" in free) sort_choice=2 ;; users) sort_choice=3 ;; ping) sort_choice=4 ;; balanced) sort_choice=5 ;; *) sort_choice=1 ;; esac
+    case "$(ask "Sort" "$sort_choice")" in
+        2) SORT=free ;; 3) SORT=users ;; 4) SORT=ping ;; 5) SORT=balanced ;; *) SORT=load ;;
+    esac
 
-    rows=$(server_rows "$COUNTRIES" "$MIN_BW" "$SORT")
+    rows=$(server_rows "$COUNTRIES" "$MIN_BW" load)
     [ -n "$rows" ] || die "No healthy server matches those filters. Lower the bandwidth or add countries."
+    local pinged=0
+    if [ "$SORT" = ping ] || [ "$SORT" = balanced ]; then
+        echo "Pinging $(wc -l <<<"$rows") servers..."
+        if measure_pings <<<"$rows"; then pinged=1; else SORT=load; fi
+    fi
+    rows=$(server_rows "$COUNTRIES" "$MIN_BW" "$SORT")
     echo
-    printf '  %3s  %-14s %-3s %-26s %5s %15s %6s\n' "#" "Server" "CC" "Location" "Load" "Used/Max Mbit" "Users"
+    printf '  %3s  %-14s %-3s %-26s %5s %15s %6s' "#" "Server" "CC" "Location" "Load" "Used/Max Mbit" "Users"
+    [ "$pinged" = 1 ] && printf ' %6s' "Ping"
+    echo
     i=0
-    while IFS=$'\t' read -r name cc loc load bw bwmax users; do
+    while IFS=$'\t' read -r name cc loc load bw bwmax users ms recovering _; do
         i=$(( i + 1 ))
-        printf '  %3d) %-14s %-3s %-26.26s %4s%% %7s/%-7s %6s\n' "$i" "$name" "$cc" "$loc" "$load" "$bw" "$bwmax" "$users"
+        printf '  %3d) %-14s %-3s %-26.26s %4s%% %7s/%-7s %6s' "$i" "$name" "$cc" "$loc" "$load" "$bw" "$bwmax" "$users"
+        if [ "$pinged" = 1 ]; then
+            if [ "$ms" = - ]; then printf ' %6s' "-"; else printf ' %4sms' "$ms"; fi
+        fi
+        [ "$recovering" = 1 ] && printf '  recovering'
+        echo
     done <<<"$rows"
     echo
-    echo "Pick a number for that server (fixed IP), or type a country code to use"
-    echo "<cc>.vpn.airdns.org: AirVPN then picks a healthy server in that country at"
-    echo "every connect (survives a server outage, but can land on a smaller server)."
+    grep -q $'\t-\t[01]\t[^\t]*$' <<<"$rows" && echo "Ping \"-\" = no answer (listed last)."
+    grep -q $'\t1\t[^\t]*$' <<<"$rows" \
+        && echo "recovering = under 5% load: usually just back from an outage that dropped its users (listed last)."
+    echo "Type a number to use that server."
+    local example=${COUNTRIES%% *}
+    echo "Advanced: type a country code (e.g. ${example:-us}) instead to use <cc>.vpn.airdns.org,"
+    echo "where AirVPN picks a server for you at every connect. It survives an outage on"
+    echo "its own but ignores your bandwidth filter. With auto-switch you don't need it."
     choice=$(ask "Server" 1)
     if [[ "$choice" =~ ^[0-9]+$ ]]; then
         [ "$choice" -ge 1 ] && [ "$choice" -le "$i" ] || die "Invalid choice."
@@ -586,6 +646,9 @@ SWITCH_TO=""; SWITCH_ERR=""
 auto_switch() {
     local old=$SERVER next out
     STATUS=$1
+    if [ "$SORT" = ping ] || [ "$SORT" = balanced ]; then
+        server_rows "$COUNTRIES" "$MIN_BW" load | measure_pings
+    fi
     next=$(server_rows "$COUNTRIES" "$MIN_BW" "$SORT" | awk -F'\t' -v cur="$old" '$1 != cur && !f { print $1; f = 1 }')
     if [ -z "$next" ]; then
         SWITCH_ERR="no healthy server with >= $MIN_BW Mbit/s in ${COUNTRIES:-any country}"
