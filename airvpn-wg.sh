@@ -9,7 +9,8 @@
 #   1. Device: pick one of the devices (keys) on your AirVPN account, or
 #      create a new one.
 #   2. Server: filter by your preferred countries and a minimum server
-#      bandwidth (AirVPN servers are 2000, 6000 or 20000 Mbit/s), healthy
+#      bandwidth (read from AirVPN's live list: currently 2000, 6000 or
+#      20000 Mbit/s; the default is the largest size on offer), healthy
 #      servers only. Default sort "balanced": measured ping + load +
 #      reliability (outages counted from AirVPN's session history, 90 days
 #      for the top 5, 10 days for the rest). A server refilling after a
@@ -125,7 +126,7 @@ ENV_KEY=${AIRVPN_API_KEY:-}
 AIRVPN_API_KEY=""
 # SERVER_MODE: only "server" now; "country" in an older settings file is refused.
 DEVICE=""; SERVER_MODE=""; SERVER=""; WG_PORT=1637
-COUNTRIES=""; MIN_BW=20000; SORT=balanced
+COUNTRIES=""; MIN_BW=""; SORT=balanced   # MIN_BW "" = largest size AirVPN has
 ALERT_CHANNEL=none
 NTFY_URL=""; NTFY_TOKEN=""; DISCORD_WEBHOOK=""
 GOTIFY_URL=""; GOTIFY_TOKEN=""; TELEGRAM_TOKEN=""; TELEGRAM_CHAT_ID=""
@@ -562,6 +563,12 @@ measure_pings() {
         >> "$PING_FILE"
 }
 
+# largest_size — the biggest bw_max among healthy servers in $STATUS: the
+# default minimum bandwidth when none is saved (sizes are never hardcoded).
+largest_size() {
+    jget 'max(s["bw_max"] for s in d["servers"] if s.get("health") == "ok")' <<<"$STATUS"
+}
+
 # country_rows <min_bw> — TSV: cc, name, healthy servers >= min_bw, all servers.
 country_rows() {
     MINBW="$1" python3 -c '
@@ -587,7 +594,12 @@ pick_server() {
     fi
 
     echo
-    echo "AirVPN servers come in 2000, 6000 and 20000 Mbit/s sizes."
+    # Sizes come from the live server list, so new or retired sizes show up
+    # as they are; with nothing saved the default is the largest size.
+    local sizes
+    sizes=$(jget '", ".join("%d (%d servers)" % (b, n) for b, n in sorted(__import__("collections").Counter(s["bw_max"] for s in d["servers"] if s.get("health") == "ok").items()))' <<<"$STATUS")
+    echo "AirVPN server sizes right now, in Mbit/s: ${sizes:-unknown}"
+    [ -n "$MIN_BW" ] || MIN_BW=$(largest_size)
     MIN_BW=$(ask "Minimum server bandwidth in Mbit/s (0 = any)" "$MIN_BW")
     [[ "$MIN_BW" =~ ^[0-9]+$ ]] || die "Bandwidth must be a number."
 
@@ -822,7 +834,7 @@ needs_key_for_monitor() {
 configure_autoswitch() {
     echo
     echo "Auto-switch: when $SERVER goes down, the monitor rewrites wg0.conf for the next"
-    echo "healthy server matching your filters (${COUNTRIES:-all countries}, >= $MIN_BW Mbit/s,"
+    echo "healthy server matching your filters (${COUNTRIES:-all countries}, >= ${MIN_BW:-the largest size} Mbit/s,"
     echo "sorted by $SORT) and restarts the container that uses it."
     if yesno "Enable auto-switch?" "$([ "$AUTO_SWITCH" = 1 ] && echo y || echo n)"; then
         AUTO_SWITCH=1
@@ -863,6 +875,7 @@ SWITCH_TO=""; SWITCH_ERR=""; SWITCH_WARN=""
 auto_switch() {
     local old=$SERVER next out
     STATUS=$1
+    [ -n "$MIN_BW" ] || MIN_BW=$(largest_size)
     # Same ranking as the menu (pings, outage history, reliability), read fresh.
     rank_servers "$old"
     next=$(head -n 1 <<<"$RANKED" | cut -f1)
