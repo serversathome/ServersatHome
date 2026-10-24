@@ -19,8 +19,8 @@
 #      are also available.
 #   3. Generate: writes wg0.conf, backs up the previous one, and checks the
 #      config really belongs to the chosen device.
-#   4. Alerts (optional): pick a channel (AirVPN notification, ntfy,
-#      Discord, Gotify, Telegram) and the events you care about, then run
+#   4. Alerts (optional): pick a channel (ntfy, Discord, Gotify, Telegram)
+#      and the events you care about, then run
 #      "airvpn-wg.sh monitor" from cron.
 #   5. Auto-switch (optional): when the chosen server goes down, the monitor
 #      rewrites wg0.conf for the next healthy server matching the same
@@ -124,8 +124,7 @@ trap 'rm -rf "$CALLS_FILE" "$PING_FILE" "$REL_FILE" "$HIST_DIR"' EXIT
 # over the saved one.
 ENV_KEY=${AIRVPN_API_KEY:-}
 AIRVPN_API_KEY=""
-# SERVER_MODE: only "server" now; "country" in an older settings file is refused.
-DEVICE=""; SERVER_MODE=""; SERVER=""; WG_PORT=1637
+DEVICE=""; SERVER=""; WG_PORT=1637
 COUNTRIES=""; MIN_BW=""; SORT=balanced   # MIN_BW "" = largest size AirVPN has
 ALERT_CHANNEL=none
 NTFY_URL=""; NTFY_TOKEN=""; DISCORD_WEBHOOK=""
@@ -134,7 +133,7 @@ EVENT_SERVER_DOWN=1; EVENT_SERVER_WARNING=1; EVENT_SERVER_LOAD=0; LOAD_THRESHOLD
 EVENT_DEVICE_OFFLINE=0; EVENT_EXPIRY=1; EXPIRY_DAYS=7; EVENT_RECOVERY=1
 AUTO_SWITCH=0; RESTART_CONTAINER=qbittorrent
 SAVE_KEY=1
-SETTINGS="AIRVPN_API_KEY DEVICE SERVER_MODE SERVER WG_PORT COUNTRIES MIN_BW SORT
+SETTINGS="AIRVPN_API_KEY DEVICE SERVER WG_PORT COUNTRIES MIN_BW SORT
 ALERT_CHANNEL NTFY_URL NTFY_TOKEN DISCORD_WEBHOOK GOTIFY_URL GOTIFY_TOKEN
 TELEGRAM_TOKEN TELEGRAM_CHAT_ID EVENT_SERVER_DOWN EVENT_SERVER_WARNING
 EVENT_SERVER_LOAD LOAD_THRESHOLD EVENT_DEVICE_OFFLINE EVENT_EXPIRY EXPIRY_DAYS
@@ -589,7 +588,7 @@ pick_server() {
     if [ -n "$ARG_SERVER" ]; then
         match=$(N="$ARG_SERVER" jget '[s["public_name"] for s in d["servers"] if s["public_name"].lower() == __import__("os").environ["N"].lower()][0]' <<<"$STATUS")
         [ -n "$match" ] || die "\"$ARG_SERVER\" is not an AirVPN server name (see https://airvpn.org/status/)."
-        SERVER_MODE=server; SERVER=$match
+        SERVER=$match
         set_server_label; ok "Server: $SERVER_LABEL"; return 0
     fi
 
@@ -691,7 +690,7 @@ pick_server() {
         echo "Type a number from the list."
     done
     line=$(sed -n "${choice}p" <<<"$rows")
-    SERVER_MODE=server; SERVER=$(cut -f1 <<<"$line")
+    SERVER=$(cut -f1 <<<"$line")
     set_server_label; ok "Server: $SERVER_LABEL"
 }
 
@@ -731,13 +730,9 @@ generate() {
 # ── Alerts ──────────────────────────────────────────────────────────────────
 # send_alert <title> <message> — returns non-zero if the channel refused it.
 send_alert() {
-    local title=$1 msg=$2 code r hdr=()
+    local title=$1 msg=$2 code hdr=()
     case "$ALERT_CHANNEL" in
         none) return 0 ;;
-        airvpn)
-            r=$(api notification subject="$title" body="$msg")
-            [ "$(result_of <<<"$r")" = ok ] && return 0
-            warn "AirVPN notification failed: $(result_of <<<"$r")"; return 1 ;;
         ntfy)
             [ -n "$NTFY_TOKEN" ] && hdr=(-H "Authorization: Bearer $NTFY_TOKEN")
             code=$(curl -sS -m 20 -o /dev/null -w '%{http_code}' "${hdr[@]}" \
@@ -762,24 +757,21 @@ configure_alerts() {
     echo
     echo "Alert channel:"
     echo "  1) None"
-    echo "  2) AirVPN notification (the bell on airvpn.org only: AirVPN has no email"
-    echo "     option for these, so pick 3-6 for alerts that reach your phone)"
-    echo "  3) ntfy"
-    echo "  4) Discord webhook"
-    echo "  5) Gotify"
-    echo "  6) Telegram bot"
-    case "$ALERT_CHANNEL" in airvpn) c=2 ;; ntfy) c=3 ;; discord) c=4 ;; gotify) c=5 ;; telegram) c=6 ;; *) c=1 ;; esac
+    echo "  2) ntfy"
+    echo "  3) Discord webhook"
+    echo "  4) Gotify"
+    echo "  5) Telegram bot"
+    case "$ALERT_CHANNEL" in ntfy) c=2 ;; discord) c=3 ;; gotify) c=4 ;; telegram) c=5 ;; *) c=1 ;; esac
     case "$(ask "Channel" "$c")" in
-        2) ALERT_CHANNEL=airvpn ;;
-        3) ALERT_CHANNEL=ntfy
+        2) ALERT_CHANNEL=ntfy
            NTFY_URL=$(ask "ntfy topic URL (e.g. https://ntfy.sh/my-airvpn-alerts)" "$NTFY_URL")
            NTFY_TOKEN=$(ask "ntfy access token (empty if none)" "$NTFY_TOKEN") ;;
-        4) ALERT_CHANNEL=discord
+        3) ALERT_CHANNEL=discord
            DISCORD_WEBHOOK=$(ask "Discord webhook URL" "$DISCORD_WEBHOOK") ;;
-        5) ALERT_CHANNEL=gotify
+        4) ALERT_CHANNEL=gotify
            GOTIFY_URL=$(ask "Gotify URL (e.g. https://gotify.example.com)" "$GOTIFY_URL")
            GOTIFY_TOKEN=$(ask "Gotify application token" "$GOTIFY_TOKEN") ;;
-        6) ALERT_CHANNEL=telegram
+        5) ALERT_CHANNEL=telegram
            TELEGRAM_TOKEN=$(ask "Telegram bot token" "$TELEGRAM_TOKEN")
            TELEGRAM_CHAT_ID=$(ask "Telegram chat ID" "$TELEGRAM_CHAT_ID") ;;
         *) ALERT_CHANNEL=none ;;
@@ -816,30 +808,19 @@ configure_alerts() {
         esac
     done
     if needs_key_for_monitor && [ "$SAVE_KEY" != 1 ]; then
-        warn "The selected events/channel need the API key, so it will be saved in $ENV_FILE."
+        warn "The selected events need the API key, so it will be saved in $ENV_FILE."
         SAVE_KEY=1
     fi
     if yesno "Send a test alert now?" y; then
         send_alert "AirVPN monitor test" "Test from airvpn-wg.sh on $(hostname): alerts for $DEVICE work." \
-            && test_alert_sent
+            && ok "Test alert sent via $ALERT_CHANNEL"
     fi
 }
 
 mark() { [ "$1" = 1 ] && echo x || echo " "; }
 
-# AirVPN answers "ok" once it has stored the notification, which only shows
-# in the site's bell: its API docs mention an email option under Air -> API,
-# but the notification settings page has none (and the docs' link 404s).
-test_alert_sent() {
-    if [ "$ALERT_CHANNEL" = airvpn ]; then
-        ok "AirVPN accepted the test alert: check the bell on airvpn.org (no email is sent)."
-    else
-        ok "Test alert sent via $ALERT_CHANNEL"
-    fi
-}
-
 needs_key_for_monitor() {
-    [ "$ALERT_CHANNEL" = airvpn ] || [ "$EVENT_DEVICE_OFFLINE" = 1 ] || [ "$EVENT_EXPIRY" = 1 ]
+    [ "$EVENT_DEVICE_OFFLINE" = 1 ] || [ "$EVENT_EXPIRY" = 1 ]
 }
 
 configure_autoswitch() {
@@ -929,7 +910,6 @@ auto_switch() {
 monitor() {
     [ -f "$ENV_FILE" ] || die "No $ENV_FILE. Run setup first."
     [ -n "$SERVER" ] || die "No server saved in $ENV_FILE. Run setup first."
-    [ "${SERVER_MODE:-server}" = server ] || die "$ENV_FILE uses a country hostname, which is no longer supported. Run setup again and pick a server."
     local status ui target conds=() line key title prev active=()
 
     status=$(api status)
@@ -1025,7 +1005,7 @@ case "$CMD" in
         monitor ;;
     test-alert)
         [ "$ALERT_CHANNEL" != none ] || die "No alert channel configured. Run: airvpn-wg.sh alerts --output $OUTPUT"
-        send_alert "AirVPN monitor test" "Test from airvpn-wg.sh on $(hostname)." && test_alert_sent ;;
+        send_alert "AirVPN monitor test" "Test from airvpn-wg.sh on $(hostname)." && ok "Test alert sent via $ALERT_CHANNEL" ;;
     alerts)
         [ -f "$ENV_FILE" ] || die "No $ENV_FILE. Run setup first."
         configure_alerts; configure_autoswitch; save_settings; ok "Saved $ENV_FILE"; print_cron ;;
@@ -1039,7 +1019,7 @@ case "$CMD" in
             save_settings
         else
             if [ -z "$ENV_KEY" ]; then
-                yesno "Save the API key in $ENV_FILE (root only)? Needed for the monitor's device/expiry events and AirVPN alerts" y \
+                yesno "Save the API key in $ENV_FILE (root only)? Needed for the monitor's device/expiry events and auto-switch" y \
                     && SAVE_KEY=1 || SAVE_KEY=0
             fi
             yesno "Set up alerts?" "$([ "$ALERT_CHANNEL" = none ] && echo n || echo y)" && configure_alerts
