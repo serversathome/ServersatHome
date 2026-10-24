@@ -801,6 +801,7 @@ set_server_label() {
 }
 
 # ── Step 3: generate wg0.conf ───────────────────────────────────────────────
+WG_CHANGED=0    # set by generate when wg0.conf is new or different
 generate() {
     local port=${ARG_PORT:-$WG_PORT} conf addr tmp
     [[ " $WG_PORTS " == *" $port "* ]] || die "Port must be one of: $WG_PORTS"
@@ -825,8 +826,44 @@ generate() {
     if [ -s "$OUTPUT" ] && ! cmp -s "$tmp" "$OUTPUT"; then
         cp -p "$OUTPUT" "$OUTPUT.bak" && ok "Previous config saved as $OUTPUT.bak"
     fi
+    cmp -s "$tmp" "$OUTPUT" 2>/dev/null || WG_CHANGED=1
     mv "$tmp" "$OUTPUT"
     ok "Wrote $OUTPUT (WireGuard, Linux, IPv4 only, $(sed -n 's/^Endpoint *= *//p' <<<"$conf"))"
+}
+
+# containers_using <dir> — running containers with <dir> (or a folder above
+# it) mounted, e.g. qbittorrent for .../configs/qbittorrent/wireguard. Found
+# from the mounts, not guessed from names.
+containers_using() {
+    local ids
+    command -v docker >/dev/null || return 0
+    ids=$(docker ps -q 2>/dev/null)
+    [ -n "$ids" ] || return 0
+    # shellcheck disable=SC2086
+    docker inspect $ids 2>/dev/null | DIR="$1" python3 -c '
+import json, os, sys
+target = os.path.realpath(os.environ["DIR"])
+try:
+    for c in json.load(sys.stdin):
+        for m in c.get("Mounts", []):
+            src = os.path.realpath(m.get("Source") or "/nonexistent")
+            if src != "/" and (target == src or target.startswith(src.rstrip("/") + "/")):
+                print(c["Name"].lstrip("/"))
+                break
+except Exception:
+    pass'
+}
+
+# restart_users — after a new wg0.conf, restart the running containers that
+# use it so they switch over. Returns 1 if there is none to restart.
+restart_users() {
+    local names n
+    names=$(containers_using "$OUT_DIR")
+    [ -n "$names" ] || return 1
+    for n in $names; do
+        if docker restart "$n" >/dev/null 2>&1; then ok "Restarted $n so it uses the new wg0.conf"
+        else warn "Could not restart $n; restart it by hand: docker restart $n"; fi
+    done
 }
 
 # ── Alerts ──────────────────────────────────────────────────────────────────
@@ -996,7 +1033,14 @@ configure_autoswitch() {
         # container is started right after this, so it is not checked there.
         # After a wrong name there is no default: Enter asks again, so "no
         # restart" is only ever chosen by typing none.
-        local names def=${RESTART_CONTAINER:-none}
+        local names def=${RESTART_CONTAINER:-none} detected
+        # If the saved name isn't a container here, offer the one that has
+        # this wg0.conf mounted instead.
+        if [ -z "${AIRVPN_WG_EMBEDDED:-}" ] && [ -n "$RESTART_CONTAINER" ] && command -v docker >/dev/null \
+            && ! docker inspect "$RESTART_CONTAINER" >/dev/null 2>&1; then
+            detected=$(containers_using "$OUT_DIR" | head -n 1)
+            [ -n "$detected" ] && def=$detected
+        fi
         while :; do
             RESTART_CONTAINER=$(ask "Container to restart after a switch (\"none\" = don't restart)" "$def")
             [ -n "$RESTART_CONTAINER" ] || { echo "Type a container name, or none."; continue; }
@@ -1257,9 +1301,17 @@ case "$CMD" in
             echo "To change alerts or auto-switch later: bash $(cd "$(dirname "$0")" && pwd)/$(basename "$0") alerts --output $OUTPUT"
         fi
         echo
-        # arr-complete.sh runs this before starting the containers, so there is
-        # nothing to restart yet.
-        if [ -n "${AIRVPN_WG_EMBEDDED:-}" ]; then info "Done."
-        else info "Done. Restart the container using it (e.g. docker restart qbittorrent) to switch over."; fi
+        # A new wg0.conf only takes effect when the container using it
+        # restarts, so do that here. arr-complete.sh runs this before starting
+        # the containers, so there is nothing to restart then.
+        if [ -n "${AIRVPN_WG_EMBEDDED:-}" ]; then
+            info "Done."
+        elif [ "$WG_CHANGED" = 0 ]; then
+            info "Done. wg0.conf is unchanged, so nothing needs a restart."
+        elif restart_users; then
+            info "Done."
+        else
+            info "Done. No running container uses $OUT_DIR; restart whatever uses wg0.conf to switch over."
+        fi
         ;;
 esac
