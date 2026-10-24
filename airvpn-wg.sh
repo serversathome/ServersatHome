@@ -289,48 +289,60 @@ create_device() {
 }
 
 pick_device() {
-    local list rows i choice line busy
+    local list rows i choice line busy online name status ip last when
     list=$(api devices action=list)
     [ "$(result_of <<<"$list")" = ok ] || die "Could not list devices: $(result_of <<<"$list")"
     rows=$(device_rows <<<"$list")
+    # Devices online right now ("name<TAB>server"). One device = one WireGuard
+    # key = one connection: a device already used by another machine makes
+    # the two keep knocking each other off.
+    online=$(jget '"\n".join("%s\t%s" % (s["device_name"], s["server_name"]) for s in d.get("sessions", []))' <<<"$USERINFO")
 
     if [ -n "$ARG_DEVICE" ]; then
         line=$(awk -F'\t' -v n="$ARG_DEVICE" '$1==n' <<<"$rows")
         [ -n "$line" ] || die "No device named \"$ARG_DEVICE\" on this account."
+        [ "$(cut -f3 <<<"$line")" = ready ] || die "Device $ARG_DEVICE is not ready yet (status $(cut -f3 <<<"$line")). Try again in a minute."
+        busy=$(awk -F'\t' -v n="$ARG_DEVICE" '$1==n{print $2}' <<<"$online" | paste -sd, - | sed 's/,/, /g')
+        [ -n "$busy" ] && warn "Device $ARG_DEVICE is connected right now (to $busy). If that is another machine, give this one its own device."
     else
-        echo
-        echo "Devices on your AirVPN account:"
-        i=0
-        while IFS=$'\t' read -r name _ status ip last; do
-            [ -n "$name" ] || continue
-            i=$(( i + 1 ))
-            printf '  %2d) %-20s %-8s %-16s last connected %s\n' "$i" "$name" "$status" "$ip" "$last"
-        done <<<"$rows"
-        echo "   n) Create a new device"
-        local def=1
-        [ -n "$DEVICE" ] && def=$(awk -F'\t' -v n="$DEVICE" '$1==n{print NR}' <<<"$rows")
         while :; do
-            choice=$(ask "Device" "${def:-1}")
-            if [[ "$choice" =~ ^[Nn]$ ]]; then
-                create_device "$rows" && return 0
-                continue    # went back: choose again
+            echo
+            echo "Devices on your AirVPN account:"
+            i=0
+            while IFS=$'\t' read -r name _ status ip last; do
+                [ -n "$name" ] || continue
+                i=$(( i + 1 ))
+                busy=$(awk -F'\t' -v n="$name" '$1==n{print $2}' <<<"$online" | paste -sd, - | sed 's/,/, /g')
+                if [ -n "$busy" ]; then when="connected now to $busy"; else when="last connected $last"; fi
+                printf '  %2d) %-20s %-8s %-16s %s\n' "$i" "$name" "$status" "$ip" "$when"
+            done <<<"$rows"
+            echo "   n) Create a new device"
+            local def=1
+            [ -n "$DEVICE" ] && def=$(awk -F'\t' -v n="$DEVICE" '$1==n{print NR}' <<<"$rows")
+            while :; do
+                choice=$(ask "Device" "${def:-1}")
+                if [[ "$choice" =~ ^[Nn]$ ]]; then
+                    create_device "$rows" && return 0
+                    continue 2    # went back: show the list again
+                fi
+                [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "$i" ] && break
+                echo "Type a number from the list, or n."
+            done
+            line=$(sed -n "${choice}p" <<<"$rows")
+            name=$(cut -f1 <<<"$line")
+            if [ "$(cut -f3 <<<"$line")" != ready ]; then
+                echo "Device $name is not ready yet (status $(cut -f3 <<<"$line")); pick another, or wait a minute and pick it again."
+                continue
             fi
-            [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "$i" ] && break
-            echo "Type a number from the list, or n."
+            busy=$(awk -F'\t' -v n="$name" '$1==n{print $2}' <<<"$online" | paste -sd, - | sed 's/,/, /g')
+            [ -z "$busy" ] && break
+            warn "Device $name is connected right now (to $busy). If another machine uses it, the two will keep knocking each other off."
+            yesno "Use it anyway? (only if this is the same machine; n = pick another device)" n && break
         done
-        line=$(sed -n "${choice}p" <<<"$rows")
     fi
 
     DEVICE=$(cut -f1 <<<"$line"); DEVICE_IP=$(cut -f4 <<<"$line")
-    [ "$(cut -f3 <<<"$line")" = ready ] || die "Device $DEVICE is not ready yet (status $(cut -f3 <<<"$line")). Try again in a minute."
     ok "Device $DEVICE ($DEVICE_IP)"
-
-    # One device = one WireGuard key = one connection. Two machines sharing a
-    # device keep knocking each other off.
-    busy=$(DEV="$DEVICE" jget '", ".join(s["server_name"] for s in d.get("sessions", []) if s["device_name"] == __import__("os").environ["DEV"])' <<<"$USERINFO")
-    if [ -n "$busy" ]; then
-        warn "Device $DEVICE is connected right now (to $busy). If that is another machine, give this one its own device."
-    fi
 }
 
 # ── Step 2: server ──────────────────────────────────────────────────────────
