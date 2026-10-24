@@ -206,6 +206,17 @@ ask() {
     read -rp "$1${2:+ [$2]}: " a </dev/tty
     printf '%s' "${a:-$2}"
 }
+# ask_or_back <prompt> <default> — like ask, but returns 1 (go back) for "b",
+# or for a blank answer when there is no default to keep. Prints the answer.
+ask_or_back() {
+    local a hint
+    if [ -n "$2" ]; then hint=" (b = back)"; else hint=" (Enter = back)"; fi
+    read -rp "$1$hint${2:+ [$2]}: " a </dev/tty
+    case "$a" in b|B|back) return 1 ;; esac
+    a=${a:-$2}
+    [ -n "$a" ] || return 1
+    printf '%s' "$a"
+}
 yesno() {  # yesno <prompt> <y|n>
     local a
     a=$(ask "$1 (y/n)" "$2")
@@ -242,10 +253,13 @@ for x in d.get("devices", []):
 
 create_device() {
     local name resp newid i cur r
-    name=$(ask "Name for the new device (letters, digits, - and _)" "")
-    [[ "$name" =~ ^[A-Za-z0-9_-]+$ ]] || die "Invalid device name."
-    # The generator picks devices by name, so names must stay unique.
-    cut -f1 <<<"$1" | grep -qxF "$name" && die "A device named $name already exists."
+    while :; do
+        name=$(ask_or_back "Name for the new device (letters, digits, - and _)" "") || return 1
+        if [[ ! "$name" =~ ^[A-Za-z0-9_-]+$ ]]; then echo "Letters, digits, - and _ only."; continue; fi
+        # The generator picks devices by name, so names must stay unique.
+        if cut -f1 <<<"$1" | grep -qxF "$name"; then echo "A device named $name already exists."; continue; fi
+        break
+    done
     resp=$(api devices action=add)
     [ "$(result_of <<<"$resp")" = ok ] || die "AirVPN refused to add a device: $(result_of <<<"$resp")"
     newid=$(jget 'd["id"]' <<<"$resp")
@@ -295,12 +309,15 @@ pick_device() {
         echo "   n) Create a new device"
         local def=1
         [ -n "$DEVICE" ] && def=$(awk -F'\t' -v n="$DEVICE" '$1==n{print NR}' <<<"$rows")
-        choice=$(ask "Device" "${def:-1}")
-        if [[ "$choice" =~ ^[Nn]$ ]]; then
-            create_device "$rows"
-            return 0
-        fi
-        [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "$i" ] || die "Invalid choice."
+        while :; do
+            choice=$(ask "Device" "${def:-1}")
+            if [[ "$choice" =~ ^[Nn]$ ]]; then
+                create_device "$rows" && return 0
+                continue    # went back: choose again
+            fi
+            [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "$i" ] && break
+            echo "Type a number from the list, or n."
+        done
         line=$(sed -n "${choice}p" <<<"$rows")
     fi
 
@@ -632,97 +649,115 @@ pick_server() {
         set_server_label; ok "Server: $SERVER_LABEL"; return 0
     fi
 
-    echo
-    # Sizes come from the live server list, so new or retired sizes show up
-    # as they are; with nothing saved the default is the largest size.
-    local sizes
-    sizes=$(jget '", ".join("%d (%d servers)" % (b, n) for b, n in sorted(__import__("collections").Counter(s["bw_max"] for s in d["servers"] if s.get("health") == "ok").items()))' <<<"$STATUS")
-    echo "AirVPN server sizes right now, in Mbit/s: ${sizes:-unknown}"
-    [ -n "$MIN_BW" ] || MIN_BW=$(largest_size)
-    MIN_BW=$(ask "Minimum server bandwidth in Mbit/s (0 = any)" "$MIN_BW")
-    [[ "$MIN_BW" =~ ^[0-9]+$ ]] || die "Bandwidth must be a number."
-
-    echo
-    # Only countries with at least one healthy server that meets the bandwidth
-    # filter: there is no point picking one without.
-    local usable
-    usable=$(country_rows "$MIN_BW" | awk -F'\t' '$3 > 0')
-    [ -n "$usable" ] || die "No healthy AirVPN server has >= $MIN_BW Mbit/s right now. Run again with a lower minimum."
-    echo "Countries with healthy servers of >= $MIN_BW Mbit/s (matching / all servers):"
-    awk -F'\t' '{ printf "  %s  %-22s %2d / %2d\n", $1, $2, $3, $4 }' <<<"$usable" | column -c "${COLUMNS:-100}" 2>/dev/null \
-        || awk -F'\t' '{ printf "  %s  %-22s %2d / %2d\n", $1, $2, $3, $4 }' <<<"$usable"
-    # Enter keeps the saved list, so "all" is the way back to every country.
-    # Saved countries that no longer qualify (e.g. after raising the minimum)
-    # are dropped from it first, so Enter cannot loop on them.
-    local known all_codes cc saved="" dropped=""
-    known=$(cut -f1 <<<"$usable")
-    all_codes=$(country_rows 0 | cut -f1)
-    for cc in $COUNTRIES; do
-        if grep -qxF "$cc" <<<"$known"; then saved="$saved $cc"; else dropped="$dropped $cc"; fi
-    done
-    COUNTRIES=$(xargs <<<"$saved")
-    [ -n "$dropped" ] && echo "Dropped from your saved countries (no servers >= $MIN_BW Mbit/s):$dropped"
-    saved=$COUNTRIES
-    while true; do
-        if [ -n "$COUNTRIES" ]; then
-            COUNTRIES=$(ask "Preferred country codes, space separated (Enter keeps, \"all\" = every country)" "$COUNTRIES")
-        else
-            COUNTRIES=$(ask "Preferred country codes, space separated (Enter = every country)" "")
-        fi
-        COUNTRIES=$(tr 'A-Z,' 'a-z ' <<<"$COUNTRIES" | xargs)
-        [ "$COUNTRIES" = all ] && COUNTRIES=""
-        cc=""
-        for cc in $COUNTRIES; do grep -qxF "$cc" <<<"$known" || break; cc=""; done
-        [ -z "$cc" ] && break
-        if grep -qxF "$cc" <<<"$all_codes"; then
-            echo "$cc has no healthy servers with >= $MIN_BW Mbit/s; pick from the list."
-        else
-            echo "Unknown country code: $cc"
-        fi
-        COUNTRIES=$saved
-    done
-
-    echo
-    rank_servers || die "No healthy server matches those filters. Lower the bandwidth or add countries."
-    rows=$RANKED
-    echo
-    echo "Ranked best first on load + reliability + ping (1 outage a month = $OUTAGE_PENALTY% load, 1 ms of ping = $PING_WEIGHT% load):"
-    printf '  %3s  %-14s %-3s %-22s %5s %6s' "#" "Server" "CC" "Location" "Load" "Users"
-    [ "$PINGED" = 1 ] && printf ' %6s' "Ping"
-    printf '  %s\n' "Outages"
-    i=0
-    local adjusted=0 unknown=0
-    while IFS=$'\t' read -r name cc loc load rload users ms hist long short days _ _ _; do
-        i=$(( i + 1 ))
-        if [ "$rload" != "$load" ]; then load="~$rload"; adjusted=1; fi
-        printf '  %3d) %-14s %-3s %-22.22s %4s%% %6s' "$i" "$name" "$cc" "$loc" "$load" "$users"
-        if [ "$PINGED" = 1 ]; then
-            if [ "$ms" = - ]; then printf ' %6s' "-"; else printf ' %4sms' "$ms"; fi
-        fi
-        case "$hist" in
-            ok|new)  printf '  %s long, %s short in %sd' "$long" "$short" "$days"
-                     [ "$hist" = new ] && [ "$days" -lt 10 ] && printf ' (new server)' ;;
-            unknown) printf '  unknown'; unknown=$(( unknown + 1 )) ;;
-            *)       printf '  not checked' ;;
-        esac
+    # Bandwidth, countries and the ranked list loop: "c" at the server prompt
+    # (or filters that match nothing) goes back to bandwidth and countries.
+    # History already read this run is reused, so a second pass costs less.
+    while :; do
         echo
-    done <<<"$rows"
-    echo
-    [ "$PINGED" = 1 ] && awk -F'\t' '$7 == "-" { f = 1 } END { exit !f }' <<<"$rows" && echo "Ping \"-\" = no answer."
-    [ "$adjusted" = 1 ] && echo "~ = load once its users are back: it had an outage in the last few hours, so its current load is misleadingly low."
-    echo "Outages: from AirVPN's session history, $RELIABILITY_DAYS days for the top $DEEP_CHECKS and 10 days for the others."
-    local shallow
-    shallow=$(shallow_top <<<"$rows" | xargs)
-    echo "  long = down ~30 min or more (counts fully, more if it lasted hours); short = under ~20 min (counts $SHORT_OUTAGE_WEIGHT)."
-    [ -n "$shallow" ] && warn "Only 10 days of history for $shallow (stopped by the re-check or request limit), so their rank is less certain."
-    [ "$unknown" -gt 0 ] && warn "Could not read the outage history of $unknown server(s); they are ranked as unreliable. If every server shows unknown, AirVPN's server API may have changed."
-    while true; do
-        choice=$(ask "Server number (1-$i)" 1)
-        [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "$i" ] && break
-        echo "Type a number from the list."
+        # Sizes come from the live server list, so new or retired sizes show up
+        # as they are; with nothing saved the default is the largest size.
+        local sizes
+        sizes=$(jget '", ".join("%d (%d servers)" % (b, n) for b, n in sorted(__import__("collections").Counter(s["bw_max"] for s in d["servers"] if s.get("health") == "ok").items()))' <<<"$STATUS")
+        echo "AirVPN server sizes right now, in Mbit/s: ${sizes:-unknown}"
+        [ -n "$MIN_BW" ] || MIN_BW=$(largest_size)
+        while :; do
+            MIN_BW=$(ask "Minimum server bandwidth in Mbit/s (0 = any)" "$MIN_BW")
+            [[ "$MIN_BW" =~ ^[0-9]+$ ]] && break
+            echo "A number, please (0 = any size)."
+            MIN_BW=$(largest_size)
+        done
+
+        echo
+        # Only countries with at least one healthy server that meets the bandwidth
+        # filter: there is no point picking one without.
+        local usable
+        usable=$(country_rows "$MIN_BW" | awk -F'\t' '$3 > 0')
+        if [ -z "$usable" ]; then
+            echo "No healthy AirVPN server has >= $MIN_BW Mbit/s right now; try a lower minimum."
+            MIN_BW=0; continue
+        fi
+        echo "Countries with healthy servers of >= $MIN_BW Mbit/s (matching / all servers):"
+        awk -F'\t' '{ printf "  %s  %-22s %2d / %2d\n", $1, $2, $3, $4 }' <<<"$usable" | column -c "${COLUMNS:-100}" 2>/dev/null \
+            || awk -F'\t' '{ printf "  %s  %-22s %2d / %2d\n", $1, $2, $3, $4 }' <<<"$usable"
+        # Enter keeps the saved list, so "all" is the way back to every country.
+        # Saved countries that no longer qualify (e.g. after raising the minimum)
+        # are dropped from it first, so Enter cannot loop on them.
+        local known all_codes cc saved="" dropped=""
+        known=$(cut -f1 <<<"$usable")
+        all_codes=$(country_rows 0 | cut -f1)
+        for cc in $COUNTRIES; do
+            if grep -qxF "$cc" <<<"$known"; then saved="$saved $cc"; else dropped="$dropped $cc"; fi
+        done
+        COUNTRIES=$(xargs <<<"$saved")
+        [ -n "$dropped" ] && echo "Dropped from your saved countries (no servers >= $MIN_BW Mbit/s):$dropped"
+        saved=$COUNTRIES
+        while true; do
+            if [ -n "$COUNTRIES" ]; then
+                COUNTRIES=$(ask "Preferred country codes, space separated (Enter keeps, \"all\" = every country)" "$COUNTRIES")
+            else
+                COUNTRIES=$(ask "Preferred country codes, space separated (Enter = every country)" "")
+            fi
+            COUNTRIES=$(tr 'A-Z,' 'a-z ' <<<"$COUNTRIES" | xargs)
+            [ "$COUNTRIES" = all ] && COUNTRIES=""
+            cc=""
+            for cc in $COUNTRIES; do grep -qxF "$cc" <<<"$known" || break; cc=""; done
+            [ -z "$cc" ] && break
+            if grep -qxF "$cc" <<<"$all_codes"; then
+                echo "$cc has no healthy servers with >= $MIN_BW Mbit/s; pick from the list."
+            else
+                echo "Unknown country code: $cc"
+            fi
+            COUNTRIES=$saved
+        done
+
+        echo
+        if ! rank_servers; then
+            echo "No healthy server matches those filters; lower the bandwidth or add countries."
+            continue
+        fi
+        rows=$RANKED
+        echo
+        echo "Ranked best first on load + reliability + ping (1 outage a month = $OUTAGE_PENALTY% load, 1 ms of ping = $PING_WEIGHT% load):"
+        printf '  %3s  %-14s %-3s %-22s %5s %6s' "#" "Server" "CC" "Location" "Load" "Users"
+        [ "$PINGED" = 1 ] && printf ' %6s' "Ping"
+        printf '  %s\n' "Outages"
+        i=0
+        local adjusted=0 unknown=0
+        while IFS=$'\t' read -r name cc loc load rload users ms hist long short days _ _ _; do
+            i=$(( i + 1 ))
+            if [ "$rload" != "$load" ]; then load="~$rload"; adjusted=1; fi
+            printf '  %3d) %-14s %-3s %-22.22s %4s%% %6s' "$i" "$name" "$cc" "$loc" "$load" "$users"
+            if [ "$PINGED" = 1 ]; then
+                if [ "$ms" = - ]; then printf ' %6s' "-"; else printf ' %4sms' "$ms"; fi
+            fi
+            case "$hist" in
+                ok|new)  printf '  %s long, %s short in %sd' "$long" "$short" "$days"
+                         [ "$hist" = new ] && [ "$days" -lt 10 ] && printf ' (new server)' ;;
+                unknown) printf '  unknown'; unknown=$(( unknown + 1 )) ;;
+                *)       printf '  not checked' ;;
+            esac
+            echo
+        done <<<"$rows"
+        echo
+        [ "$PINGED" = 1 ] && awk -F'\t' '$7 == "-" { f = 1 } END { exit !f }' <<<"$rows" && echo "Ping \"-\" = no answer."
+        [ "$adjusted" = 1 ] && echo "~ = load once its users are back: it had an outage in the last few hours, so its current load is misleadingly low."
+        echo "Outages: from AirVPN's session history, $RELIABILITY_DAYS days for the top $DEEP_CHECKS and 10 days for the others."
+        local shallow
+        shallow=$(shallow_top <<<"$rows" | xargs)
+        echo "  long = down ~30 min or more (counts fully, more if it lasted hours); short = under ~20 min (counts $SHORT_OUTAGE_WEIGHT)."
+        [ -n "$shallow" ] && warn "Only 10 days of history for $shallow (stopped by the re-check or request limit), so their rank is less certain."
+        [ "$unknown" -gt 0 ] && warn "Could not read the outage history of $unknown server(s); they are ranked as unreliable. If every server shows unknown, AirVPN's server API may have changed."
+        while true; do
+            choice=$(ask "Server number (1-$i, c = change bandwidth or countries)" 1)
+            [[ "$choice" =~ ^[Cc]$ ]] && break
+            [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "$i" ] && break
+            echo "Type a number from the list, or c."
+        done
+        [[ "$choice" =~ ^[Cc]$ ]] && continue
+        line=$(sed -n "${choice}p" <<<"$rows")
+        SERVER=$(cut -f1 <<<"$line")
+        break
     done
-    line=$(sed -n "${choice}p" <<<"$rows")
-    SERVER=$(cut -f1 <<<"$line")
     set_server_label; ok "Server: $SERVER_LABEL"
 }
 
@@ -794,20 +829,27 @@ configure_alerts() {
     echo "  4) Gotify"
     echo "  5) Telegram bot"
     case "$ALERT_CHANNEL" in ntfy) c=2 ;; discord) c=3 ;; gotify) c=4 ;; telegram) c=5 ;; *) c=1 ;; esac
-    case "$(ask "Channel" "$c")" in
-        2) ALERT_CHANNEL=ntfy
-           NTFY_URL=$(ask "ntfy topic URL (e.g. https://ntfy.sh/my-airvpn-alerts)" "$NTFY_URL")
-           NTFY_TOKEN=$(ask "ntfy access token (empty if none)" "$NTFY_TOKEN") ;;
-        3) ALERT_CHANNEL=discord
-           DISCORD_WEBHOOK=$(ask "Discord webhook URL" "$DISCORD_WEBHOOK") ;;
-        4) ALERT_CHANNEL=gotify
-           GOTIFY_URL=$(ask "Gotify URL (e.g. https://gotify.example.com)" "$GOTIFY_URL")
-           GOTIFY_TOKEN=$(ask "Gotify application token" "$GOTIFY_TOKEN") ;;
-        5) ALERT_CHANNEL=telegram
-           TELEGRAM_TOKEN=$(ask "Telegram bot token" "$TELEGRAM_TOKEN")
-           TELEGRAM_CHAT_ID=$(ask "Telegram chat ID" "$TELEGRAM_CHAT_ID") ;;
-        *) ALERT_CHANNEL=none ;;
-    esac
+    # A channel's details can go back to this menu (Enter on an empty
+    # question, or b), where 1 is the way out.
+    local v1 v2
+    while :; do
+        case "$(ask "Channel" "$c")" in
+            2) v1=$(ask_or_back "ntfy topic URL (e.g. https://ntfy.sh/my-airvpn-alerts)" "$NTFY_URL") || continue
+               v2=$(ask "ntfy access token (empty if none)" "$NTFY_TOKEN")
+               ALERT_CHANNEL=ntfy NTFY_URL=$v1 NTFY_TOKEN=$v2 ;;
+            3) v1=$(ask_or_back "Discord webhook URL" "$DISCORD_WEBHOOK") || continue
+               ALERT_CHANNEL=discord DISCORD_WEBHOOK=$v1 ;;
+            4) v1=$(ask_or_back "Gotify URL (e.g. https://gotify.example.com)" "$GOTIFY_URL") || continue
+               v2=$(ask_or_back "Gotify application token" "$GOTIFY_TOKEN") || continue
+               ALERT_CHANNEL=gotify GOTIFY_URL=$v1 GOTIFY_TOKEN=$v2 ;;
+            5) v1=$(ask_or_back "Telegram bot token" "$TELEGRAM_TOKEN") || continue
+               v2=$(ask_or_back "Telegram chat ID" "$TELEGRAM_CHAT_ID") || continue
+               ALERT_CHANNEL=telegram TELEGRAM_TOKEN=$v1 TELEGRAM_CHAT_ID=$v2 ;;
+            1) ALERT_CHANNEL=none ;;
+            *) echo "Pick 1-5."; continue ;;
+        esac
+        break
+    done
     [ "$ALERT_CHANNEL" = none ] && { ok "Alerts off"; return 0; }
 
     while true; do
@@ -847,6 +889,36 @@ configure_alerts() {
 
 mark() { [ "$1" = 1 ] && echo x || echo " "; }
 
+# configure_monitor — the alert and auto-switch questions, then a review;
+# "n" goes through them again, so a slip needs no restart.
+configure_monitor() {
+    local events
+    while :; do
+        configure_alerts
+        configure_autoswitch
+        echo
+        if [ "$ALERT_CHANNEL" = none ]; then
+            echo "Review: alerts off"
+        else
+            events=""
+            [ "$EVENT_SERVER_DOWN" = 1 ] && events="$events server down,"
+            [ "$EVENT_SERVER_WARNING" = 1 ] && events="$events warning,"
+            [ "$EVENT_SERVER_LOAD" = 1 ] && events="$events load >= $LOAD_THRESHOLD%,"
+            [ "$EVENT_DEVICE_OFFLINE" = 1 ] && events="$events device offline,"
+            [ "$EVENT_EXPIRY" = 1 ] && events="$events expiry within $EXPIRY_DAYS days,"
+            [ "$EVENT_RECOVERY" = 1 ] && events="$events all clear,"
+            events=${events%,}
+            echo "Review: alerts via $ALERT_CHANNEL for${events:- no events}"
+        fi
+        if [ "$AUTO_SWITCH" = 1 ]; then
+            echo "        auto-switch on${RESTART_CONTAINER:+, restarts $RESTART_CONTAINER}"
+        else
+            echo "        auto-switch off"
+        fi
+        yesno "Save this? (n = go through alerts and auto-switch again)" y && return 0
+    done
+}
+
 # key_reasons — what the cron monitor needs the API key for, comma separated;
 # empty when nothing does (alerts off or only server events, no auto-switch),
 # in which case the key is not saved.
@@ -882,11 +954,20 @@ configure_autoswitch() {
     echo "load + reliability + ping, as in the list) and restarts the container that uses it."
     if yesno "Enable auto-switch?" "$([ "$AUTO_SWITCH" = 1 ] && echo y || echo n)"; then
         AUTO_SWITCH=1
-        RESTART_CONTAINER=$(ask "Container to restart after a switch (\"none\" = don't restart)" "${RESTART_CONTAINER:-none}")
-        [ "$RESTART_CONTAINER" = none ] && RESTART_CONTAINER=""
-        if [ -n "$RESTART_CONTAINER" ] && command -v docker >/dev/null && ! docker inspect "$RESTART_CONTAINER" >/dev/null 2>&1; then
-            warn "No container named $RESTART_CONTAINER right now; a switch will still rewrite wg0.conf."
-        fi
+        # The name has to exist (a typo would make every switch's restart
+        # fail), so ask again until it does. From arr-complete.sh the
+        # container is started right after this, so it is not checked there.
+        local names
+        while :; do
+            RESTART_CONTAINER=$(ask "Container to restart after a switch (\"none\" = don't restart)" "${RESTART_CONTAINER:-none}")
+            if [ "$RESTART_CONTAINER" = none ]; then RESTART_CONTAINER=""; break; fi
+            [ -n "${AIRVPN_WG_EMBEDDED:-}" ] && break
+            command -v docker >/dev/null || break
+            docker inspect "$RESTART_CONTAINER" >/dev/null 2>&1 && break
+            names=$(docker ps -a --format '{{.Names}}' 2>/dev/null | sort | xargs)
+            echo "No container named $RESTART_CONTAINER.${names:+ Containers here: $names}"
+            RESTART_CONTAINER=""    # don't offer the wrong name as the default
+        done
         ok "Auto-switch on${RESTART_CONTAINER:+, restarts $RESTART_CONTAINER}"
     else
         AUTO_SWITCH=0
@@ -1102,7 +1183,7 @@ case "$CMD" in
         send_alert "AirVPN monitor test" "Test from airvpn-wg.sh on $(hostname)." && ok "Test alert sent via $ALERT_CHANNEL" ;;
     alerts)
         [ -f "$ENV_FILE" ] || die "No $ENV_FILE. Run setup first."
-        configure_alerts; configure_autoswitch; save_monitor_settings; setup_cron ;;
+        configure_monitor; save_monitor_settings; setup_cron ;;
     setup)
         info "AirVPN WireGuard config for $OUTPUT"
         ensure_key
@@ -1115,10 +1196,10 @@ case "$CMD" in
             echo
             echo "Optional: a monitor (run from cron) can alert you about problems and switch"
             echo "servers automatically when this one goes down."
-            configure_alerts
-            configure_autoswitch
+            configure_monitor
             save_monitor_settings
             setup_cron
+            echo "To change alerts or auto-switch later: bash $(cd "$(dirname "$0")" && pwd)/$(basename "$0") alerts --output $OUTPUT"
         fi
         echo
         # arr-complete.sh runs this before starting the containers, so there is
