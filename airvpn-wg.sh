@@ -923,7 +923,8 @@ configure_monitor() {
             echo "Review: alerts via $ALERT_CHANNEL for${events:- no events}"
         fi
         if [ "$AUTO_SWITCH" = 1 ]; then
-            echo "        auto-switch on${RESTART_CONTAINER:+, restarts $RESTART_CONTAINER}"
+            if [ -n "$RESTART_CONTAINER" ]; then echo "        auto-switch on, restarts $RESTART_CONTAINER"
+            else echo "        auto-switch on, no restart (a new wg0.conf waits for a manual restart)"; fi
         else
             echo "        auto-switch off"
         fi
@@ -969,18 +970,27 @@ configure_autoswitch() {
         # The name has to exist (a typo would make every switch's restart
         # fail), so ask again until it does. From arr-complete.sh the
         # container is started right after this, so it is not checked there.
-        local names
+        # After a wrong name there is no default: Enter asks again, so "no
+        # restart" is only ever chosen by typing none.
+        local names def=${RESTART_CONTAINER:-none}
         while :; do
-            RESTART_CONTAINER=$(ask "Container to restart after a switch (\"none\" = don't restart)" "${RESTART_CONTAINER:-none}")
+            RESTART_CONTAINER=$(ask "Container to restart after a switch (\"none\" = don't restart)" "$def")
+            [ -n "$RESTART_CONTAINER" ] || { echo "Type a container name, or none."; continue; }
             if [ "$RESTART_CONTAINER" = none ]; then RESTART_CONTAINER=""; break; fi
             [ -n "${AIRVPN_WG_EMBEDDED:-}" ] && break
             command -v docker >/dev/null || break
             docker inspect "$RESTART_CONTAINER" >/dev/null 2>&1 && break
             names=$(docker ps -a --format '{{.Names}}' 2>/dev/null | sort | xargs)
-            echo "No container named $RESTART_CONTAINER.${names:+ Containers here: $names}"
-            RESTART_CONTAINER=""    # don't offer the wrong name as the default
+            if [ -n "$names" ]; then
+                echo "No container named $RESTART_CONTAINER. Containers here: $names"
+            else
+                echo "No container named $RESTART_CONTAINER: there are no containers on this machine yet."
+                echo "Type none, or set up the containers first and add it later with: airvpn-wg.sh alerts --output $OUTPUT"
+            fi
+            def=""
         done
-        ok "Auto-switch on${RESTART_CONTAINER:+, restarts $RESTART_CONTAINER}"
+        if [ -n "$RESTART_CONTAINER" ]; then ok "Auto-switch on, restarts $RESTART_CONTAINER"
+        else warn "Auto-switch on, but no container is restarted: a new wg0.conf only takes effect when the container using it restarts."; fi
     else
         AUTO_SWITCH=0
     fi
