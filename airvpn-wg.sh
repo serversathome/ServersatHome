@@ -592,12 +592,26 @@ pick_server() {
     [[ "$MIN_BW" =~ ^[0-9]+$ ]] || die "Bandwidth must be a number."
 
     echo
-    echo "Countries (healthy servers with >= $MIN_BW Mbit/s / all servers):"
-    country_rows "$MIN_BW" | awk -F'\t' '{ printf "  %s  %-22s %2d / %2d\n", $1, $2, $3, $4 }' | column -c "${COLUMNS:-100}" 2>/dev/null \
-        || country_rows "$MIN_BW" | awk -F'\t' '{ printf "  %s  %-22s %2d / %2d\n", $1, $2, $3, $4 }'
+    # Only countries with at least one healthy server that meets the bandwidth
+    # filter: there is no point picking one without.
+    local usable
+    usable=$(country_rows "$MIN_BW" | awk -F'\t' '$3 > 0')
+    [ -n "$usable" ] || die "No healthy AirVPN server has >= $MIN_BW Mbit/s right now. Run again with a lower minimum."
+    echo "Countries with healthy servers of >= $MIN_BW Mbit/s (matching / all servers):"
+    awk -F'\t' '{ printf "  %s  %-22s %2d / %2d\n", $1, $2, $3, $4 }' <<<"$usable" | column -c "${COLUMNS:-100}" 2>/dev/null \
+        || awk -F'\t' '{ printf "  %s  %-22s %2d / %2d\n", $1, $2, $3, $4 }' <<<"$usable"
     # Enter keeps the saved list, so "all" is the way back to every country.
-    local known cc saved=$COUNTRIES
-    known=$(country_rows 0 | cut -f1)
+    # Saved countries that no longer qualify (e.g. after raising the minimum)
+    # are dropped from it first, so Enter cannot loop on them.
+    local known all_codes cc saved="" dropped=""
+    known=$(cut -f1 <<<"$usable")
+    all_codes=$(country_rows 0 | cut -f1)
+    for cc in $COUNTRIES; do
+        if grep -qxF "$cc" <<<"$known"; then saved="$saved $cc"; else dropped="$dropped $cc"; fi
+    done
+    COUNTRIES=$(xargs <<<"$saved")
+    [ -n "$dropped" ] && echo "Dropped from your saved countries (no servers >= $MIN_BW Mbit/s):$dropped"
+    saved=$COUNTRIES
     while true; do
         if [ -n "$COUNTRIES" ]; then
             COUNTRIES=$(ask "Preferred country codes, space separated (Enter keeps, \"all\" = every country)" "$COUNTRIES")
@@ -609,7 +623,11 @@ pick_server() {
         cc=""
         for cc in $COUNTRIES; do grep -qxF "$cc" <<<"$known" || break; cc=""; done
         [ -z "$cc" ] && break
-        echo "Unknown country code: $cc"
+        if grep -qxF "$cc" <<<"$all_codes"; then
+            echo "$cc has no healthy servers with >= $MIN_BW Mbit/s; pick from the list."
+        else
+            echo "Unknown country code: $cc"
+        fi
         COUNTRIES=$saved
     done
 
