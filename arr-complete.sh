@@ -11,7 +11,10 @@
 #   2. Creates the shared Docker network "arr" and writes a compose stack per
 #      container; every stack joins "arr", so containers keep reaching each
 #      other by name across stacks.
-#   3. Launches every stack (including Dockge), then configures every app
+#   3. If you choose to launch: gets qBittorrent's WireGuard config (paste a
+#      wg0.conf, or generate one from AirVPN with airvpn-wg.sh, which can also
+#      set up alerts and automatic server switching), then launches every
+#      stack (including Dockge) and configures every app
 #      through its API in the order from wiki.serversatho.me/en/InstallInstructions:
 #
 #        qBittorrent -> Radarr -> Sonarr -> Trawl -> Prowlarr
@@ -989,20 +992,78 @@ docker info >/dev/null 2>&1 \
     || die "Cannot talk to the Docker daemon. Enable the Apps service in the TrueNAS UI, then re-run."
 
 # WireGuard config for qBittorrent (hotio expects /config/wireguard/wg0.conf).
+# Asked here, once the qbittorrent dataset exists and before the stacks start,
+# so qBittorrent comes up with its tunnel. Paste one, or generate one from
+# AirVPN with airvpn-wg.sh: that script and its settings live next to wg0.conf
+# (its cron job, if any, runs it from there).
+WG_FILE="$QBITTORRENT_WIREGUARD_DIR/wg0.conf"
+AIRVPN_WG="$QBITTORRENT_WIREGUARD_DIR/airvpn-wg.sh"
+AIRVPN_WG_URL="https://raw.githubusercontent.com/serversathome/ServersatHome/refs/heads/main/airvpn-wg.sh"
 create_directory "$QBITTORRENT_WIREGUARD_DIR"
-if [ -s "$QBITTORRENT_WIREGUARD_DIR/wg0.conf" ]; then
-    echo "WireGuard config already present at $QBITTORRENT_WIREGUARD_DIR/wg0.conf (leaving it alone)."
-else
-    echo "Please paste your WireGuard VPN configuration below by using SHIFT+INS to paste (press ENTER then Ctrl+D when done):"
-    WG_CONFIG=$(cat)
-    if [ -z "${WG_CONFIG//[[:space:]]/}" ]; then
-        warn "No WireGuard configuration entered. qBittorrent will not start until $QBITTORRENT_WIREGUARD_DIR/wg0.conf exists."
-    else
-        printf '%s\n' "$WG_CONFIG" > "$QBITTORRENT_WIREGUARD_DIR/wg0.conf"
-        chown root:apps "$QBITTORRENT_WIREGUARD_DIR/wg0.conf"
-        chmod 660 "$QBITTORRENT_WIREGUARD_DIR/wg0.conf"
-        echo "WireGuard configuration saved to $QBITTORRENT_WIREGUARD_DIR/wg0.conf"
+
+# paste_wg — read a pasted wg0.conf and save it.
+paste_wg() {
+    local conf
+    echo "Paste your WireGuard configuration below using SHIFT+INS (press ENTER then Ctrl+D when done):"
+    conf=$(cat)
+    if [ -z "${conf//[[:space:]]/}" ]; then
+        todo "No WireGuard configuration entered. qBittorrent will not start until $WG_FILE exists."
+        return
     fi
+    grep -q '^\[Interface\]' <<<"$conf" && grep -q '^\[Peer\]' <<<"$conf" \
+        || warn "That does not look like a WireGuard config (no [Interface]/[Peer] sections); saving it anyway."
+    printf '%s\n' "$conf" > "$WG_FILE"
+    chown root:apps "$WG_FILE"
+    chmod 660 "$WG_FILE"
+    ok "WireGuard configuration saved to $WG_FILE"
+}
+
+# airvpn_wg — fetch airvpn-wg.sh (the copy next to this script if there is
+# one, else the repo's) into the wireguard folder and run it interactively.
+airvpn_wg() {
+    local local_copy
+    local_copy="$(cd "$(dirname "$0")" && pwd)/airvpn-wg.sh"
+    if [ -f "$local_copy" ] && [ "$local_copy" != "$AIRVPN_WG" ]; then
+        cp "$local_copy" "$AIRVPN_WG"
+    elif ! curl -fsSL -m 60 "$AIRVPN_WG_URL" -o "$AIRVPN_WG.tmp" || ! mv "$AIRVPN_WG.tmp" "$AIRVPN_WG"; then
+        rm -f "$AIRVPN_WG.tmp"
+        [ -f "$AIRVPN_WG" ] || { todo "Could not download airvpn-wg.sh ($AIRVPN_WG_URL). Paste a wg0.conf into $WG_FILE, or download it and run: bash airvpn-wg.sh --output $WG_FILE"; return; }
+        warn "Could not download the latest airvpn-wg.sh; using the copy already in $QBITTORRENT_WIREGUARD_DIR."
+    fi
+    chown root:root "$AIRVPN_WG"
+    chmod 700 "$AIRVPN_WG"
+    echo ""
+    AIRVPN_WG_EMBEDDED=1 bash "$AIRVPN_WG" --output "$WG_FILE"
+    if [ -s "$WG_FILE" ]; then
+        WG_FROM_AIRVPN=1
+    else
+        todo "No WireGuard config was generated. Re-run: bash $AIRVPN_WG --output $WG_FILE (or paste one into that file)."
+    fi
+}
+
+WG_FROM_AIRVPN=0
+if [ -s "$WG_FILE" ]; then
+    echo "WireGuard config already present at $WG_FILE (leaving it alone)."
+    [ -f "$AIRVPN_WG" ] && echo "  To pick another AirVPN server or change alerts: bash $AIRVPN_WG --output $WG_FILE"
+else
+    echo ""
+    echo "qBittorrent needs a WireGuard config (wg0.conf) for its VPN:"
+    echo "  1) Paste a wg0.conf from your VPN provider"
+    echo "  2) Generate one from AirVPN: pick a device and a server ranked on load, reliability"
+    echo "     and ping, with optional alerts and automatic server switching"
+    echo "     (needs an AirVPN API key from https://airvpn.org/apisettings/)"
+    echo "  3) Skip for now"
+    while :; do
+        # End of input (nothing left to read) counts as skip instead of looping.
+        read -rp "Choose [1-3]: " answer || answer=3
+        case "$answer" in
+            1) paste_wg; break ;;
+            2) airvpn_wg; break ;;
+            3) todo "No WireGuard config yet. qBittorrent will not start until $WG_FILE exists (paste one there, or generate one: bash airvpn-wg.sh --output $WG_FILE)."; break ;;
+            *) echo "Please enter 1, 2 or 3." ;;
+        esac
+    done
+    unset answer
 fi
 
 # The shared network, once.
@@ -2540,6 +2601,7 @@ fi
 if [ "$ADMIN_PASS" = changeme ]; then echo "  CHANGE THESE before exposing anything beyond your LAN."; fi
 echo "  (Your answers are kept root-only in $SETUP_STATE_FILE for re-runs.)"
 [ -n "$QB_FORWARDED_PORT" ] && echo "  qBittorrent listens on forwarded port $QB_FORWARDED_PORT (VPN_AUTO_PORT_FORWARD)."
+[ "$WG_FROM_AIRVPN" = 1 ] && echo "  qBittorrent's WireGuard config came from AirVPN; to change server, alerts or auto-switch: bash $AIRVPN_WG --output $WG_FILE"
 echo "  Stacks: $STACKS_PATH/<container>/compose.yaml, managed from Dockge at http://$HOST_IP:5001"
 if [ "$GPU_VENDOR" = "none" ]; then
     echo "  Jellyfin transcoding: software (no usable GPU found).${GPU_NOTE:+ $GPU_NOTE}"

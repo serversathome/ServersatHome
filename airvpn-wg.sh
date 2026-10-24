@@ -1121,6 +1121,9 @@ case "$CMD" in
             setup_cron
         fi
         echo
-        info "Done. Restart the container using it (e.g. docker restart qbittorrent) to switch over."
+        # arr-complete.sh runs this before starting the containers, so there is
+        # nothing to restart yet.
+        if [ -n "${AIRVPN_WG_EMBEDDED:-}" ]; then info "Done."
+        else info "Done. Restart the container using it (e.g. docker restart qbittorrent) to switch over."; fi
         ;;
 esac
