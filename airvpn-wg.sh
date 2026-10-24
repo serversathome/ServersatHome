@@ -45,8 +45,8 @@
 set -uo pipefail
 
 API="https://airvpn.org/api"
-MAX_CALLS=200                # hard cap per run, far below AirVPN's ban limit
-MAX_HISTORY_CHECKS=40        # servers whose last 10 days of history are read (1 request each)
+MAX_CALLS=300                # hard cap per run: half AirVPN's ban limit (600 per 10 minutes)
+MAX_HISTORY_CHECKS=60        # servers whose last 10 days of history are read (1 request each)
 DEEP_CHECKS=5                # top servers whose full RELIABILITY_DAYS are read
 DEEP_ROUNDS=5                # re-checks until the whole top DEEP_CHECKS has them
 RELIABILITY_DAYS=90          # 10 days per request, so 8 more requests per deep server
