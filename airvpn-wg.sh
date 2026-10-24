@@ -48,7 +48,7 @@ API="https://airvpn.org/api"
 MAX_CALLS=300                # hard cap per run: half AirVPN's ban limit (600 per 10 minutes)
 MAX_HISTORY_CHECKS=60        # servers whose last 10 days of history are read (1 request each)
 DEEP_CHECKS=5                # top servers whose full RELIABILITY_DAYS are read
-DEEP_ROUNDS=5                # re-checks until the whole top DEEP_CHECKS has them
+DEEP_ROUNDS=10               # re-checks until the whole top DEEP_CHECKS has them
 RELIABILITY_DAYS=90          # 10 days per request, so 8 more requests per deep server
 OUTAGE_PENALTY=20            # ranking: 1 (weighted) outage per 30 days counts like 20% load
 PING_WEIGHT=0.25             # ranking: 1 ms of ping counts like 0.25% load. Low on purpose: for
@@ -713,8 +713,8 @@ pick_server() {
     echo "Outages: from AirVPN's session history, $RELIABILITY_DAYS days for the top $DEEP_CHECKS and 10 days for the others."
     local shallow
     shallow=$(shallow_top <<<"$rows" | xargs)
-    [ -n "$shallow" ] && warn "Only 10 days of history for $shallow (stopped by the re-check or request limit), so their rank is less certain."
     echo "  long = down ~30 min or more (counts fully, more if it lasted hours); short = under ~20 min (counts $SHORT_OUTAGE_WEIGHT)."
+    [ -n "$shallow" ] && warn "Only 10 days of history for $shallow (stopped by the re-check or request limit), so their rank is less certain."
     [ "$unknown" -gt 0 ] && warn "Could not read the outage history of $unknown server(s); they are ranked as unreliable. If every server shows unknown, AirVPN's server API may have changed."
     while true; do
         choice=$(ask "Server number (1-$i)" 1)
@@ -893,17 +893,63 @@ configure_autoswitch() {
     fi
 }
 
-print_cron() {
-    [ "$ALERT_CHANNEL" = none ] && [ "$AUTO_SWITCH" != 1 ] && return 0
-    local self
+# setup_cron — the monitor only works from cron, so add, update or remove its
+# job to match the settings: needed when alerts or auto-switch are on. On
+# TrueNAS the job goes through the middleware (midclt), so it shows under
+# System -> Advanced Settings -> Cron Jobs and survives updates; elsewhere it
+# goes in root's crontab. Each job is tagged with its wg0.conf, so re-running
+# updates it instead of adding another. Falls back to printing the line.
+setup_cron() {
+    local self cmd tag want=0 ids line
     self=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
+    cmd="bash $(printf '%q' "$self") monitor --output $(printf '%q' "$OUTPUT")"
+    tag="airvpn-wg monitor: $OUTPUT"
+    { [ "$ALERT_CHANNEL" != none ] || [ "$AUTO_SWITCH" = 1 ]; } && want=1
     echo
-    echo "For alerts and auto-switch, run the monitor every 5 minutes (1-3 API requests per run,"
-    echo "plus up to about $(( MAX_HISTORY_CHECKS + DEEP_CHECKS * 8 )) when it switches servers)."
-    echo "TrueNAS: System -> Advanced Settings -> Cron Jobs -> Add, user root, command:"
-    echo "    bash $self monitor --output $OUTPUT"
-    echo "Other Linux: add that line to root's crontab (crontab -e) as"
-    echo "    */5 * * * * bash $self monitor --output $OUTPUT"
+    if command -v midclt >/dev/null; then
+        ids=$(midclt call cronjob.query 2>/dev/null | TAG="$tag" python3 -c '
+import json, os, sys
+try:
+    print(" ".join(str(j["id"]) for j in json.load(sys.stdin) if j.get("description") == os.environ["TAG"]))
+except Exception:
+    sys.exit(1)') || { warn "Could not read the TrueNAS cron jobs."; cron_manual "$cmd" "$want"; return; }
+        if [ "$want" = 0 ]; then
+            for line in $ids; do midclt call cronjob.delete "$line" >/dev/null && ok "Removed the monitor's cron job (alerts and auto-switch are off)"; done
+            return 0
+        fi
+        line=$(CMD="$cmd" TAG="$tag" python3 -c '
+import json, os
+print(json.dumps({"user": "root", "command": os.environ["CMD"], "description": os.environ["TAG"], "enabled": True,
+                  "schedule": {"minute": "*/5", "hour": "*", "dom": "*", "month": "*", "dow": "*"}}))')
+        if [ -n "$ids" ]; then
+            midclt call cronjob.update "${ids%% *}" "$line" >/dev/null && { ok "Updated the TrueNAS cron job: the monitor runs every 5 minutes"; return 0; }
+        else
+            midclt call cronjob.create "$line" >/dev/null && { ok "Added a TrueNAS cron job (System -> Advanced Settings -> Cron Jobs): the monitor runs every 5 minutes"; return 0; }
+        fi
+        warn "Could not save the TrueNAS cron job."
+        cron_manual "$cmd" "$want"
+    elif command -v crontab >/dev/null; then
+        # Read the whole crontab before writing it back, keeping every other
+        # line: piping "crontab -l" straight into "crontab -" can lose them.
+        local current
+        current=$(crontab -l 2>/dev/null | grep -vF "# $tag")
+        line=$( { [ -n "$current" ] && printf '%s\n' "$current"; [ "$want" = 1 ] && echo "*/5 * * * * $cmd >/dev/null # $tag"; } | crontab - 2>&1 ) \
+            || { warn "Could not update the crontab: $line"; cron_manual "$cmd" "$want"; return; }
+        if [ "$want" = 1 ]; then ok "Added to root's crontab: the monitor runs every 5 minutes"; else ok "No monitor cron job needed (alerts and auto-switch are off)"; fi
+    else
+        cron_manual "$cmd" "$want"
+    fi
+}
+
+# cron_manual <command> <wanted> — what to add by hand when setup_cron can't.
+cron_manual() {
+    [ "$2" = 1 ] || return 0
+    echo "Run the monitor every 5 minutes (1-3 API requests per run, plus up to about"
+    echo "$(( MAX_HISTORY_CHECKS + DEEP_CHECKS * 8 )) when it switches servers). TrueNAS: System -> Advanced Settings ->"
+    echo "Cron Jobs -> Add, user root, command:"
+    echo "    $1"
+    echo "Other Linux: add to root's crontab (crontab -e):"
+    echo "    */5 * * * * $1"
 }
 
 # ── Auto-switch ─────────────────────────────────────────────────────────────
@@ -1056,7 +1102,7 @@ case "$CMD" in
         send_alert "AirVPN monitor test" "Test from airvpn-wg.sh on $(hostname)." && ok "Test alert sent via $ALERT_CHANNEL" ;;
     alerts)
         [ -f "$ENV_FILE" ] || die "No $ENV_FILE. Run setup first."
-        configure_alerts; configure_autoswitch; save_monitor_settings; print_cron ;;
+        configure_alerts; configure_autoswitch; save_monitor_settings; setup_cron ;;
     setup)
         info "AirVPN WireGuard config for $OUTPUT"
         ensure_key
@@ -1072,7 +1118,7 @@ case "$CMD" in
             yesno "Set up alerts?" "$([ "$ALERT_CHANNEL" = none ] && echo n || echo y)" && configure_alerts
             configure_autoswitch
             save_monitor_settings
-            print_cron
+            setup_cron
         fi
         echo
         info "Done. Restart the container using it (e.g. docker restart qbittorrent) to switch over."
