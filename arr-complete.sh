@@ -38,7 +38,9 @@
 # authentication is switched off either way.
 #
 # Run in the TrueNAS shell as root:
-#   sudo su -c "wget https://raw.githubusercontent.com/serversathome/ServersatHome/refs/heads/main/arr-complete.sh && chmod +x arr-complete.sh && bash arr-complete.sh"
+# (wget -O replaces an older copy; plain wget would save arr-complete.sh.1 and
+# run the old one):
+#   sudo su -c "wget -O arr-complete.sh https://raw.githubusercontent.com/serversathome/ServersatHome/refs/heads/main/arr-complete.sh && chmod +x arr-complete.sh && bash arr-complete.sh"
 # ============================================================================
 
 # ok()/warn()/todo() always succeed, so "cmd && ok ... || todo ..." is a safe
