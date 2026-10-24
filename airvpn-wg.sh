@@ -343,8 +343,23 @@ pick_server() {
     echo "Countries (healthy servers with >= $MIN_BW Mbit/s / all servers):"
     country_rows "$MIN_BW" | awk -F'\t' '{ printf "  %s  %-22s %2d / %2d\n", $1, $2, $3, $4 }' | column -c "${COLUMNS:-100}" 2>/dev/null \
         || country_rows "$MIN_BW" | awk -F'\t' '{ printf "  %s  %-22s %2d / %2d\n", $1, $2, $3, $4 }'
-    COUNTRIES=$(ask "Preferred country codes, space separated (empty = all)" "$COUNTRIES")
-    COUNTRIES=$(tr 'A-Z,' 'a-z ' <<<"$COUNTRIES" | xargs)
+    # Enter keeps the saved list, so "all" is the way back to every country.
+    local known cc saved=$COUNTRIES
+    known=$(country_rows 0 | cut -f1)
+    while true; do
+        if [ -n "$COUNTRIES" ]; then
+            COUNTRIES=$(ask "Preferred country codes, space separated (Enter keeps, \"all\" = every country)" "$COUNTRIES")
+        else
+            COUNTRIES=$(ask "Preferred country codes, space separated (Enter = every country)" "")
+        fi
+        COUNTRIES=$(tr 'A-Z,' 'a-z ' <<<"$COUNTRIES" | xargs)
+        [ "$COUNTRIES" = all ] && COUNTRIES=""
+        cc=""
+        for cc in $COUNTRIES; do grep -qxF "$cc" <<<"$known" || break; cc=""; done
+        [ -z "$cc" ] && break
+        echo "Unknown country code: $cc"
+        COUNTRIES=$saved
+    done
 
     echo
     echo "Sort by: 1) lowest load  2) most free bandwidth  3) fewest users"
