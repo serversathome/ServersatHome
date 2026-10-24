@@ -17,13 +17,16 @@
 #   4. Alerts (optional): pick a channel (AirVPN notification, ntfy,
 #      Discord, Gotify, Telegram) and the events you care about, then run
 #      "airvpn-wg.sh monitor" from cron.
+#   5. Auto-switch (optional): when the chosen server goes down, the monitor
+#      rewrites wg0.conf for the next healthy server matching the same
+#      filters (countries, bandwidth, sort) and restarts the container.
 #
 # Needs an AirVPN API key: https://airvpn.org/apisettings/ (premium account).
 # Settings (key, choices, alert channel) are kept in airvpn-wg.env next to
 # wg0.conf, readable by root only.
 #
 # AirVPN bans IPs that send more than 600 API requests in 10 minutes. This
-# script caps itself at MAX_CALLS requests per run; "monitor" uses 1 or 2.
+# script caps itself at MAX_CALLS requests per run; "monitor" uses 1 to 3.
 #
 # Run in the TrueNAS shell as root:
 #   sudo su -c "wget https://raw.githubusercontent.com/serversathome/ServersatHome/refs/heads/main/airvpn-wg.sh && chmod +x airvpn-wg.sh && bash airvpn-wg.sh"
@@ -49,9 +52,10 @@ Usage: airvpn-wg.sh [command] [options]
 
 Commands:
   setup        (default) pick a device and server, write wg0.conf, set up alerts
-  alerts       change the alert channel and events only
+  alerts       change the alert channel, events and auto-switch only
   test-alert   send a test message to the configured channel
-  monitor      check the chosen server once and alert on changes (for cron)
+  monitor      check the chosen server once, alert on changes and
+               auto-switch if it is down (for cron)
 
 Options:
   -o, --output PATH   wg0.conf to write (default ./wg0.conf). airvpn-wg.env
@@ -109,12 +113,13 @@ NTFY_URL=""; NTFY_TOKEN=""; DISCORD_WEBHOOK=""
 GOTIFY_URL=""; GOTIFY_TOKEN=""; TELEGRAM_TOKEN=""; TELEGRAM_CHAT_ID=""
 EVENT_SERVER_DOWN=1; EVENT_SERVER_WARNING=1; EVENT_SERVER_LOAD=0; LOAD_THRESHOLD=90
 EVENT_DEVICE_OFFLINE=0; EVENT_EXPIRY=1; EXPIRY_DAYS=7; EVENT_RECOVERY=1
+AUTO_SWITCH=0; RESTART_CONTAINER=qbittorrent
 SAVE_KEY=1
 SETTINGS="AIRVPN_API_KEY DEVICE SERVER_MODE SERVER WG_PORT COUNTRIES MIN_BW SORT
 ALERT_CHANNEL NTFY_URL NTFY_TOKEN DISCORD_WEBHOOK GOTIFY_URL GOTIFY_TOKEN
 TELEGRAM_TOKEN TELEGRAM_CHAT_ID EVENT_SERVER_DOWN EVENT_SERVER_WARNING
 EVENT_SERVER_LOAD LOAD_THRESHOLD EVENT_DEVICE_OFFLINE EVENT_EXPIRY EXPIRY_DAYS
-EVENT_RECOVERY"
+EVENT_RECOVERY AUTO_SWITCH RESTART_CONTAINER"
 # shellcheck disable=SC1090
 [ -f "$ENV_FILE" ] && . "$ENV_FILE"
 [ -n "$ENV_KEY" ] && AIRVPN_API_KEY=$ENV_KEY
@@ -343,8 +348,23 @@ pick_server() {
     echo "Countries (healthy servers with >= $MIN_BW Mbit/s / all servers):"
     country_rows "$MIN_BW" | awk -F'\t' '{ printf "  %s  %-22s %2d / %2d\n", $1, $2, $3, $4 }' | column -c "${COLUMNS:-100}" 2>/dev/null \
         || country_rows "$MIN_BW" | awk -F'\t' '{ printf "  %s  %-22s %2d / %2d\n", $1, $2, $3, $4 }'
-    COUNTRIES=$(ask "Preferred country codes, space separated (empty = all)" "$COUNTRIES")
-    COUNTRIES=$(tr 'A-Z,' 'a-z ' <<<"$COUNTRIES" | xargs)
+    # Enter keeps the saved list, so "all" is the way back to every country.
+    local known cc saved=$COUNTRIES
+    known=$(country_rows 0 | cut -f1)
+    while true; do
+        if [ -n "$COUNTRIES" ]; then
+            COUNTRIES=$(ask "Preferred country codes, space separated (Enter keeps, \"all\" = every country)" "$COUNTRIES")
+        else
+            COUNTRIES=$(ask "Preferred country codes, space separated (Enter = every country)" "")
+        fi
+        COUNTRIES=$(tr 'A-Z,' 'a-z ' <<<"$COUNTRIES" | xargs)
+        [ "$COUNTRIES" = all ] && COUNTRIES=""
+        cc=""
+        for cc in $COUNTRIES; do grep -qxF "$cc" <<<"$known" || break; cc=""; done
+        [ -z "$cc" ] && break
+        echo "Unknown country code: $cc"
+        COUNTRIES=$saved
+    done
 
     echo
     echo "Sort by: 1) lowest load  2) most free bandwidth  3) fewest users"
@@ -517,16 +537,82 @@ needs_key_for_monitor() {
     [ "$ALERT_CHANNEL" = airvpn ] || [ "$EVENT_DEVICE_OFFLINE" = 1 ] || [ "$EVENT_EXPIRY" = 1 ]
 }
 
+configure_autoswitch() {
+    echo
+    if [ "$SERVER_MODE" != server ]; then
+        echo "Auto-switch needs a specific server; $SERVER.vpn.airdns.org already moves to"
+        echo "another server in that country whenever the tunnel reconnects."
+        AUTO_SWITCH=0
+        return 0
+    fi
+    echo "Auto-switch: when $SERVER goes down, the monitor rewrites wg0.conf for the next"
+    echo "healthy server matching your filters (${COUNTRIES:-all countries}, >= $MIN_BW Mbit/s,"
+    echo "sorted by $SORT) and restarts the container that uses it."
+    if yesno "Enable auto-switch?" "$([ "$AUTO_SWITCH" = 1 ] && echo y || echo n)"; then
+        AUTO_SWITCH=1
+        RESTART_CONTAINER=$(ask "Container to restart after a switch (\"none\" = don't restart)" "${RESTART_CONTAINER:-none}")
+        [ "$RESTART_CONTAINER" = none ] && RESTART_CONTAINER=""
+        if [ -n "$RESTART_CONTAINER" ] && command -v docker >/dev/null && ! docker inspect "$RESTART_CONTAINER" >/dev/null 2>&1; then
+            warn "No container named $RESTART_CONTAINER right now; a switch will still rewrite wg0.conf."
+        fi
+        if [ "$SAVE_KEY" != 1 ]; then
+            warn "Auto-switch needs the API key, so it will be saved in $ENV_FILE."
+            SAVE_KEY=1
+        fi
+        ok "Auto-switch on${RESTART_CONTAINER:+, restarts $RESTART_CONTAINER}"
+    else
+        AUTO_SWITCH=0
+    fi
+}
+
 print_cron() {
-    [ "$ALERT_CHANNEL" = none ] && return 0
+    [ "$ALERT_CHANNEL" = none ] && [ "$AUTO_SWITCH" != 1 ] && return 0
     local self
     self=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
     echo
-    echo "To get alerts, run the monitor every 5 minutes (1-2 API requests per run)."
+    echo "For alerts and auto-switch, run the monitor every 5 minutes (1-3 API requests per run)."
     echo "TrueNAS: System -> Advanced Settings -> Cron Jobs -> Add, user root, command:"
     echo "    bash $self monitor --output $OUTPUT"
     echo "Other Linux: add that line to root's crontab (crontab -e) as"
     echo "    */5 * * * * bash $self monitor --output $OUTPUT"
+}
+
+# ── Auto-switch ─────────────────────────────────────────────────────────────
+# auto_switch <status json> — regenerate wg0.conf for the best healthy server
+# matching the saved filters (never the current one), save it as the new
+# server and restart the container. Sets SWITCH_TO on success; SWITCH_ERR
+# says why it failed, or what went wrong after the switch (restart).
+SWITCH_TO=""; SWITCH_ERR=""
+auto_switch() {
+    local old=$SERVER next out
+    STATUS=$1
+    next=$(server_rows "$COUNTRIES" "$MIN_BW" "$SORT" | awk -F'\t' -v cur="$old" '$1 != cur && !f { print $1; f = 1 }')
+    if [ -z "$next" ]; then
+        SWITCH_ERR="no healthy server with >= $MIN_BW Mbit/s in ${COUNTRIES:-any country}"
+        return 1
+    fi
+    [ -n "$AIRVPN_API_KEY" ] || { SWITCH_ERR="no API key saved in $ENV_FILE"; return 1; }
+    # Same device as now: its address is in the current wg0.conf, and
+    # generate checks the new config against it.
+    DEVICE_IP=$(sed -n 's/^Address *= *\([0-9.]*\).*/\1/p' "$OUTPUT" 2>/dev/null)
+    [ -n "$DEVICE_IP" ] || { SWITCH_ERR="cannot read the device address from $OUTPUT"; return 1; }
+    SERVER=$next
+    if ! out=$( (generate) 2>&1 ); then
+        SERVER=$old
+        SWITCH_ERR=$(tail -n 1 <<<"$out" | sed 's/^❌ //')
+        return 1
+    fi
+    echo "$out"
+    save_settings
+    SWITCH_TO=$next
+    if [ -n "$RESTART_CONTAINER" ]; then
+        if docker restart "$RESTART_CONTAINER" >/dev/null 2>&1; then
+            ok "Restarted $RESTART_CONTAINER"
+        else
+            SWITCH_ERR="docker restart $RESTART_CONTAINER failed; restart it by hand."
+        fi
+    fi
+    return 0
 }
 
 # ── Monitor (cron) ──────────────────────────────────────────────────────────
@@ -564,8 +650,24 @@ else:
     IFS=$'\x1f' read -r health load why label <<<"$target"
     echo "$(date '+%F %T') $label: health $health, load $load%"
 
-    if [ "$EVENT_SERVER_DOWN" = 1 ] && { [ "$health" = error ] || [ "$health" = missing ]; }; then
-        if [ "$health" = missing ]; then why="no longer listed by AirVPN"; fi
+    local down=0 msg
+    { [ "$health" = error ] || [ "$health" = missing ]; } && down=1
+    [ "$health" = missing ] && why="no longer listed by AirVPN"
+    if [ "$down" = 1 ] && [ "$AUTO_SWITCH" = 1 ] && [ "$SERVER_MODE" = server ]; then
+        if auto_switch "$status"; then
+            # The old server's alerts no longer apply: forget them without
+            # "all clear" messages and report the switch instead.
+            rm -f "$STATE_FILE"
+            msg="$label is down (${why:-health error}). wg0.conf now uses $SWITCH_TO."
+            if [ -n "$SWITCH_ERR" ]; then msg="$msg $SWITCH_ERR"
+            elif [ -n "$RESTART_CONTAINER" ]; then msg="$msg Restarted $RESTART_CONTAINER."; fi
+            send_alert "AirVPN switched from $label to $SWITCH_TO" "$msg"
+            echo "    switched from $label to $SWITCH_TO"
+            return 0
+        fi
+        conds+=("noswitch|AirVPN auto-switch failed|Could not switch away from $label: $SWITCH_ERR")
+    fi
+    if [ "$EVENT_SERVER_DOWN" = 1 ] && [ "$down" = 1 ]; then
         conds+=("down|AirVPN $label is down|$label is down: ${why:-health error}. Run airvpn-wg.sh to pick another server.")
     elif [ "$EVENT_SERVER_WARNING" = 1 ] && [ "$health" = warning ]; then
         conds+=("warning|AirVPN $label has a warning|${why:-AirVPN reports a warning for $label.}")
@@ -623,7 +725,7 @@ case "$CMD" in
         send_alert "AirVPN monitor test" "Test from airvpn-wg.sh on $(hostname)." && ok "Test alert sent via $ALERT_CHANNEL" ;;
     alerts)
         [ -f "$ENV_FILE" ] || die "No $ENV_FILE. Run setup first."
-        configure_alerts; save_settings; ok "Saved $ENV_FILE"; print_cron ;;
+        configure_alerts; configure_autoswitch; save_settings; ok "Saved $ENV_FILE"; print_cron ;;
     setup)
         info "AirVPN WireGuard config for $OUTPUT"
         ensure_key
@@ -638,6 +740,7 @@ case "$CMD" in
                     && SAVE_KEY=1 || SAVE_KEY=0
             fi
             yesno "Set up alerts?" "$([ "$ALERT_CHANNEL" = none ] && echo n || echo y)" && configure_alerts
+            configure_autoswitch
             save_settings
             ok "Settings saved in $ENV_FILE"
             print_cron
