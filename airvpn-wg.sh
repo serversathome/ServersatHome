@@ -9,7 +9,8 @@
 #   1. Device: pick one of the devices (keys) on your AirVPN account, or
 #      create a new one.
 #   2. Server: filter by your preferred countries and a minimum server
-#      bandwidth (AirVPN servers are 2000, 6000 or 20000 Mbit/s), healthy
+#      bandwidth (read from AirVPN's live list: currently 2000, 6000 or
+#      20000 Mbit/s; the default is the largest size on offer), healthy
 #      servers only. Default sort "balanced": measured ping + load +
 #      reliability (outages counted from AirVPN's session history, 90 days
 #      for the top 5, 10 days for the rest). A server refilling after a
@@ -18,8 +19,8 @@
 #      are also available.
 #   3. Generate: writes wg0.conf, backs up the previous one, and checks the
 #      config really belongs to the chosen device.
-#   4. Alerts (optional): pick a channel (AirVPN notification, ntfy,
-#      Discord, Gotify, Telegram) and the events you care about, then run
+#   4. Alerts (optional): pick a channel (ntfy, Discord, Gotify, Telegram)
+#      and the events you care about, then run
 #      "airvpn-wg.sh monitor" from cron.
 #   5. Auto-switch (optional): when the chosen server goes down, the monitor
 #      rewrites wg0.conf for the next healthy server matching the same
@@ -48,7 +49,7 @@ MAX_CALLS=160                # hard cap per run, far below AirVPN's ban limit
 MAX_HISTORY_CHECKS=40        # servers whose last 10 days of history are read (1 request each)
 DEEP_CHECKS=5                # top servers whose full RELIABILITY_DAYS are read
 RELIABILITY_DAYS=90          # 10 days per request, so 8 more requests per deep server
-OUTAGE_PENALTY=10            # balanced sort: 1 (weighted) outage per 30 days counts like 10% load
+OUTAGE_PENALTY=20            # balanced sort: 1 (weighted) outage per 30 days counts like 20% load
 SHORT_OUTAGE_WEIGHT=0.2      # a short outage (under ~20 min) counts as this much of one
 LONG_OUTAGE_HOURLY=0.5       # a long outage (30+ min) counts 1, plus this per hour beyond the first
 WG_PORTS="1637 47107 51820"  # AirVPN's WireGuard ports (UDP)
@@ -123,9 +124,8 @@ trap 'rm -rf "$CALLS_FILE" "$PING_FILE" "$REL_FILE" "$HIST_DIR"' EXIT
 # over the saved one.
 ENV_KEY=${AIRVPN_API_KEY:-}
 AIRVPN_API_KEY=""
-# SERVER_MODE: only "server" now; "country" in an older settings file is refused.
-DEVICE=""; SERVER_MODE=""; SERVER=""; WG_PORT=1637
-COUNTRIES=""; MIN_BW=20000; SORT=balanced
+DEVICE=""; SERVER=""; WG_PORT=1637
+COUNTRIES=""; MIN_BW=""; SORT=balanced   # MIN_BW "" = largest size AirVPN has
 ALERT_CHANNEL=none
 NTFY_URL=""; NTFY_TOKEN=""; DISCORD_WEBHOOK=""
 GOTIFY_URL=""; GOTIFY_TOKEN=""; TELEGRAM_TOKEN=""; TELEGRAM_CHAT_ID=""
@@ -133,7 +133,7 @@ EVENT_SERVER_DOWN=1; EVENT_SERVER_WARNING=1; EVENT_SERVER_LOAD=0; LOAD_THRESHOLD
 EVENT_DEVICE_OFFLINE=0; EVENT_EXPIRY=1; EXPIRY_DAYS=7; EVENT_RECOVERY=1
 AUTO_SWITCH=0; RESTART_CONTAINER=qbittorrent
 SAVE_KEY=1
-SETTINGS="AIRVPN_API_KEY DEVICE SERVER_MODE SERVER WG_PORT COUNTRIES MIN_BW SORT
+SETTINGS="AIRVPN_API_KEY DEVICE SERVER WG_PORT COUNTRIES MIN_BW SORT
 ALERT_CHANNEL NTFY_URL NTFY_TOKEN DISCORD_WEBHOOK GOTIFY_URL GOTIFY_TOKEN
 TELEGRAM_TOKEN TELEGRAM_CHAT_ID EVENT_SERVER_DOWN EVENT_SERVER_WARNING
 EVENT_SERVER_LOAD LOAD_THRESHOLD EVENT_DEVICE_OFFLINE EVENT_EXPIRY EXPIRY_DAYS
@@ -562,6 +562,12 @@ measure_pings() {
         >> "$PING_FILE"
 }
 
+# largest_size — the biggest bw_max among healthy servers in $STATUS: the
+# default minimum bandwidth when none is saved (sizes are never hardcoded).
+largest_size() {
+    jget 'max(s["bw_max"] for s in d["servers"] if s.get("health") == "ok")' <<<"$STATUS"
+}
+
 # country_rows <min_bw> — TSV: cc, name, healthy servers >= min_bw, all servers.
 country_rows() {
     MINBW="$1" python3 -c '
@@ -582,22 +588,41 @@ pick_server() {
     if [ -n "$ARG_SERVER" ]; then
         match=$(N="$ARG_SERVER" jget '[s["public_name"] for s in d["servers"] if s["public_name"].lower() == __import__("os").environ["N"].lower()][0]' <<<"$STATUS")
         [ -n "$match" ] || die "\"$ARG_SERVER\" is not an AirVPN server name (see https://airvpn.org/status/)."
-        SERVER_MODE=server; SERVER=$match
+        SERVER=$match
         set_server_label; ok "Server: $SERVER_LABEL"; return 0
     fi
 
     echo
-    echo "AirVPN servers come in 2000, 6000 and 20000 Mbit/s sizes."
+    # Sizes come from the live server list, so new or retired sizes show up
+    # as they are; with nothing saved the default is the largest size.
+    local sizes
+    sizes=$(jget '", ".join("%d (%d servers)" % (b, n) for b, n in sorted(__import__("collections").Counter(s["bw_max"] for s in d["servers"] if s.get("health") == "ok").items()))' <<<"$STATUS")
+    echo "AirVPN server sizes right now, in Mbit/s: ${sizes:-unknown}"
+    [ -n "$MIN_BW" ] || MIN_BW=$(largest_size)
     MIN_BW=$(ask "Minimum server bandwidth in Mbit/s (0 = any)" "$MIN_BW")
     [[ "$MIN_BW" =~ ^[0-9]+$ ]] || die "Bandwidth must be a number."
 
     echo
-    echo "Countries (healthy servers with >= $MIN_BW Mbit/s / all servers):"
-    country_rows "$MIN_BW" | awk -F'\t' '{ printf "  %s  %-22s %2d / %2d\n", $1, $2, $3, $4 }' | column -c "${COLUMNS:-100}" 2>/dev/null \
-        || country_rows "$MIN_BW" | awk -F'\t' '{ printf "  %s  %-22s %2d / %2d\n", $1, $2, $3, $4 }'
+    # Only countries with at least one healthy server that meets the bandwidth
+    # filter: there is no point picking one without.
+    local usable
+    usable=$(country_rows "$MIN_BW" | awk -F'\t' '$3 > 0')
+    [ -n "$usable" ] || die "No healthy AirVPN server has >= $MIN_BW Mbit/s right now. Run again with a lower minimum."
+    echo "Countries with healthy servers of >= $MIN_BW Mbit/s (matching / all servers):"
+    awk -F'\t' '{ printf "  %s  %-22s %2d / %2d\n", $1, $2, $3, $4 }' <<<"$usable" | column -c "${COLUMNS:-100}" 2>/dev/null \
+        || awk -F'\t' '{ printf "  %s  %-22s %2d / %2d\n", $1, $2, $3, $4 }' <<<"$usable"
     # Enter keeps the saved list, so "all" is the way back to every country.
-    local known cc saved=$COUNTRIES
-    known=$(country_rows 0 | cut -f1)
+    # Saved countries that no longer qualify (e.g. after raising the minimum)
+    # are dropped from it first, so Enter cannot loop on them.
+    local known all_codes cc saved="" dropped=""
+    known=$(cut -f1 <<<"$usable")
+    all_codes=$(country_rows 0 | cut -f1)
+    for cc in $COUNTRIES; do
+        if grep -qxF "$cc" <<<"$known"; then saved="$saved $cc"; else dropped="$dropped $cc"; fi
+    done
+    COUNTRIES=$(xargs <<<"$saved")
+    [ -n "$dropped" ] && echo "Dropped from your saved countries (no servers >= $MIN_BW Mbit/s):$dropped"
+    saved=$COUNTRIES
     while true; do
         if [ -n "$COUNTRIES" ]; then
             COUNTRIES=$(ask "Preferred country codes, space separated (Enter keeps, \"all\" = every country)" "$COUNTRIES")
@@ -609,7 +634,11 @@ pick_server() {
         cc=""
         for cc in $COUNTRIES; do grep -qxF "$cc" <<<"$known" || break; cc=""; done
         [ -z "$cc" ] && break
-        echo "Unknown country code: $cc"
+        if grep -qxF "$cc" <<<"$all_codes"; then
+            echo "$cc has no healthy servers with >= $MIN_BW Mbit/s; pick from the list."
+        else
+            echo "Unknown country code: $cc"
+        fi
         COUNTRIES=$saved
     done
 
@@ -661,7 +690,7 @@ pick_server() {
         echo "Type a number from the list."
     done
     line=$(sed -n "${choice}p" <<<"$rows")
-    SERVER_MODE=server; SERVER=$(cut -f1 <<<"$line")
+    SERVER=$(cut -f1 <<<"$line")
     set_server_label; ok "Server: $SERVER_LABEL"
 }
 
@@ -701,13 +730,9 @@ generate() {
 # ── Alerts ──────────────────────────────────────────────────────────────────
 # send_alert <title> <message> — returns non-zero if the channel refused it.
 send_alert() {
-    local title=$1 msg=$2 code r hdr=()
+    local title=$1 msg=$2 code hdr=()
     case "$ALERT_CHANNEL" in
         none) return 0 ;;
-        airvpn)
-            r=$(api notification subject="$title" body="$msg")
-            [ "$(result_of <<<"$r")" = ok ] && return 0
-            warn "AirVPN notification failed: $(result_of <<<"$r")"; return 1 ;;
         ntfy)
             [ -n "$NTFY_TOKEN" ] && hdr=(-H "Authorization: Bearer $NTFY_TOKEN")
             code=$(curl -sS -m 20 -o /dev/null -w '%{http_code}' "${hdr[@]}" \
@@ -732,24 +757,21 @@ configure_alerts() {
     echo
     echo "Alert channel:"
     echo "  1) None"
-    echo "  2) AirVPN notification (shows on airvpn.org; email if enabled in your"
-    echo "     AirVPN notification options under Air -> API)"
-    echo "  3) ntfy"
-    echo "  4) Discord webhook"
-    echo "  5) Gotify"
-    echo "  6) Telegram bot"
-    case "$ALERT_CHANNEL" in airvpn) c=2 ;; ntfy) c=3 ;; discord) c=4 ;; gotify) c=5 ;; telegram) c=6 ;; *) c=1 ;; esac
+    echo "  2) ntfy"
+    echo "  3) Discord webhook"
+    echo "  4) Gotify"
+    echo "  5) Telegram bot"
+    case "$ALERT_CHANNEL" in ntfy) c=2 ;; discord) c=3 ;; gotify) c=4 ;; telegram) c=5 ;; *) c=1 ;; esac
     case "$(ask "Channel" "$c")" in
-        2) ALERT_CHANNEL=airvpn ;;
-        3) ALERT_CHANNEL=ntfy
+        2) ALERT_CHANNEL=ntfy
            NTFY_URL=$(ask "ntfy topic URL (e.g. https://ntfy.sh/my-airvpn-alerts)" "$NTFY_URL")
            NTFY_TOKEN=$(ask "ntfy access token (empty if none)" "$NTFY_TOKEN") ;;
-        4) ALERT_CHANNEL=discord
+        3) ALERT_CHANNEL=discord
            DISCORD_WEBHOOK=$(ask "Discord webhook URL" "$DISCORD_WEBHOOK") ;;
-        5) ALERT_CHANNEL=gotify
+        4) ALERT_CHANNEL=gotify
            GOTIFY_URL=$(ask "Gotify URL (e.g. https://gotify.example.com)" "$GOTIFY_URL")
            GOTIFY_TOKEN=$(ask "Gotify application token" "$GOTIFY_TOKEN") ;;
-        6) ALERT_CHANNEL=telegram
+        5) ALERT_CHANNEL=telegram
            TELEGRAM_TOKEN=$(ask "Telegram bot token" "$TELEGRAM_TOKEN")
            TELEGRAM_CHAT_ID=$(ask "Telegram chat ID" "$TELEGRAM_CHAT_ID") ;;
         *) ALERT_CHANNEL=none ;;
@@ -786,7 +808,7 @@ configure_alerts() {
         esac
     done
     if needs_key_for_monitor && [ "$SAVE_KEY" != 1 ]; then
-        warn "The selected events/channel need the API key, so it will be saved in $ENV_FILE."
+        warn "The selected events need the API key, so it will be saved in $ENV_FILE."
         SAVE_KEY=1
     fi
     if yesno "Send a test alert now?" y; then
@@ -798,13 +820,13 @@ configure_alerts() {
 mark() { [ "$1" = 1 ] && echo x || echo " "; }
 
 needs_key_for_monitor() {
-    [ "$ALERT_CHANNEL" = airvpn ] || [ "$EVENT_DEVICE_OFFLINE" = 1 ] || [ "$EVENT_EXPIRY" = 1 ]
+    [ "$EVENT_DEVICE_OFFLINE" = 1 ] || [ "$EVENT_EXPIRY" = 1 ]
 }
 
 configure_autoswitch() {
     echo
     echo "Auto-switch: when $SERVER goes down, the monitor rewrites wg0.conf for the next"
-    echo "healthy server matching your filters (${COUNTRIES:-all countries}, >= $MIN_BW Mbit/s,"
+    echo "healthy server matching your filters (${COUNTRIES:-all countries}, >= ${MIN_BW:-the largest size} Mbit/s,"
     echo "sorted by $SORT) and restarts the container that uses it."
     if yesno "Enable auto-switch?" "$([ "$AUTO_SWITCH" = 1 ] && echo y || echo n)"; then
         AUTO_SWITCH=1
@@ -845,6 +867,7 @@ SWITCH_TO=""; SWITCH_ERR=""; SWITCH_WARN=""
 auto_switch() {
     local old=$SERVER next out
     STATUS=$1
+    [ -n "$MIN_BW" ] || MIN_BW=$(largest_size)
     # Same ranking as the menu (pings, outage history, reliability), read fresh.
     rank_servers "$old"
     next=$(head -n 1 <<<"$RANKED" | cut -f1)
@@ -887,7 +910,6 @@ auto_switch() {
 monitor() {
     [ -f "$ENV_FILE" ] || die "No $ENV_FILE. Run setup first."
     [ -n "$SERVER" ] || die "No server saved in $ENV_FILE. Run setup first."
-    [ "${SERVER_MODE:-server}" = server ] || die "$ENV_FILE uses a country hostname, which is no longer supported. Run setup again and pick a server."
     local status ui target conds=() line key title prev active=()
 
     status=$(api status)
@@ -997,7 +1019,7 @@ case "$CMD" in
             save_settings
         else
             if [ -z "$ENV_KEY" ]; then
-                yesno "Save the API key in $ENV_FILE (root only)? Needed for the monitor's device/expiry events and AirVPN alerts" y \
+                yesno "Save the API key in $ENV_FILE (root only)? Needed for the monitor's device/expiry events and auto-switch" y \
                     && SAVE_KEY=1 || SAVE_KEY=0
             fi
             yesno "Set up alerts?" "$([ "$ALERT_CHANNEL" = none ] && echo n || echo y)" && configure_alerts
