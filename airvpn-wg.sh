@@ -11,8 +11,7 @@
 #   2. Server: filter by your preferred countries and a minimum server
 #      bandwidth (AirVPN servers are 2000, 6000 or 20000 Mbit/s), healthy
 #      servers only, sorted by load, free bandwidth, users, measured ping
-#      or a ping + load balance. Or pick a whole
-#      country and let AirVPN choose a server at connect time.
+#      or a ping + load balance.
 #   3. Generate: writes wg0.conf, backs up the previous one, and checks the
 #      config really belongs to the chosen device.
 #   4. Alerts (optional): pick a channel (AirVPN notification, ntfy,
@@ -62,7 +61,7 @@ Options:
   -o, --output PATH   wg0.conf to write (default ./wg0.conf). airvpn-wg.env
                       and airvpn-wg.state live in the same directory.
   --device NAME       AirVPN device name (skips the device menu)
-  --server NAME|CC    server name (e.g. Menkent) or country code (e.g. nl)
+  --server NAME       AirVPN server name (e.g. Menkent)
                       (skips the server menu)
   --port PORT         WireGuard port: 1637 (default), 47107 or 51820
   -h, --help          this help
@@ -70,7 +69,7 @@ Options:
 The API key is read from airvpn-wg.env, or from AIRVPN_API_KEY in the
 environment, or asked for. With --device and --server, setup runs without
 menus (alerts are left as they are), e.g. from another script:
-  AIRVPN_API_KEY=... airvpn-wg.sh --output /path/wg0.conf --device truenas --server nl
+  AIRVPN_API_KEY=... airvpn-wg.sh --output /path/wg0.conf --device truenas --server Menkent
 EOF
 }
 
@@ -108,6 +107,7 @@ trap 'rm -f "$CALLS_FILE" "$PING_FILE"' EXIT
 # over the saved one.
 ENV_KEY=${AIRVPN_API_KEY:-}
 AIRVPN_API_KEY=""
+# SERVER_MODE: only "server" now; "country" in an older settings file is refused.
 DEVICE=""; SERVER_MODE=""; SERVER=""; WG_PORT=1637
 COUNTRIES=""; MIN_BW=20000; SORT=load
 ALERT_CHANNEL=none
@@ -364,13 +364,8 @@ pick_server() {
 
     if [ -n "$ARG_SERVER" ]; then
         match=$(N="$ARG_SERVER" jget '[s["public_name"] for s in d["servers"] if s["public_name"].lower() == __import__("os").environ["N"].lower()][0]' <<<"$STATUS")
-        if [ -n "$match" ]; then
-            SERVER_MODE=server; SERVER=$match
-        else
-            match=$(N="$ARG_SERVER" jget '[c["country_code"] for c in d["countries"] if c["country_code"] == __import__("os").environ["N"].lower()][0]' <<<"$STATUS")
-            [ -n "$match" ] || die "\"$ARG_SERVER\" is neither an AirVPN server name nor a country code."
-            SERVER_MODE=country; SERVER=$match
-        fi
+        [ -n "$match" ] || die "\"$ARG_SERVER\" is not an AirVPN server name (see https://airvpn.org/status/)."
+        SERVER_MODE=server; SERVER=$match
         set_server_label; ok "Server: $SERVER_LABEL"; return 0
     fi
 
@@ -436,33 +431,21 @@ pick_server() {
         echo
     done <<<"$rows"
     echo
-    grep -q $'\t-\t[01]\t[^\t]*$' <<<"$rows" && echo "Ping \"-\" = no answer (listed last)."
+    [ "$pinged" = 1 ] && grep -q $'\t-\t[01]\t[^\t]*$' <<<"$rows" && echo "Ping \"-\" = no answer (listed last)."
     grep -q $'\t1\t[^\t]*$' <<<"$rows" \
         && echo "recovering = under 5% load: usually just back from an outage that dropped its users (listed last)."
-    echo "Type a number to use that server."
-    local example=${COUNTRIES%% *}
-    echo "Advanced: type a country code (e.g. ${example:-us}) instead to use <cc>.vpn.airdns.org,"
-    echo "where AirVPN picks a server for you at every connect. It survives an outage on"
-    echo "its own but ignores your bandwidth filter. With auto-switch you don't need it."
-    choice=$(ask "Server" 1)
-    if [[ "$choice" =~ ^[0-9]+$ ]]; then
-        [ "$choice" -ge 1 ] && [ "$choice" -le "$i" ] || die "Invalid choice."
-        line=$(sed -n "${choice}p" <<<"$rows")
-        SERVER_MODE=server; SERVER=$(cut -f1 <<<"$line")
-    else
-        choice=$(tr 'A-Z' 'a-z' <<<"$choice")
-        country_rows 0 | cut -f1 | grep -qx "$choice" || die "Unknown country code: $choice"
-        SERVER_MODE=country; SERVER=$choice
-    fi
+    while true; do
+        choice=$(ask "Server number (1-$i)" 1)
+        [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "$i" ] && break
+        echo "Type a number from the list."
+    done
+    line=$(sed -n "${choice}p" <<<"$rows")
+    SERVER_MODE=server; SERVER=$(cut -f1 <<<"$line")
     set_server_label; ok "Server: $SERVER_LABEL"
 }
 
 set_server_label() {
-    if [ "$SERVER_MODE" = server ]; then
-        SERVER_LABEL="$SERVER ($(N="$SERVER" jget '[s["location"] + ", " + s["country_name"] for s in d["servers"] if s["public_name"] == __import__("os").environ["N"]][0]' <<<"$STATUS"))"
-    else
-        SERVER_LABEL="any server in $(N="$SERVER" jget '[c["country_name"] for c in d["countries"] if c["country_code"] == __import__("os").environ["N"]][0]' <<<"$STATUS") ($SERVER.vpn.airdns.org)"
-    fi
+    SERVER_LABEL="$SERVER ($(N="$SERVER" jget '[s["location"] + ", " + s["country_name"] for s in d["servers"] if s["public_name"] == __import__("os").environ["N"]][0]' <<<"$STATUS"))"
 }
 
 # ── Step 3: generate wg0.conf ───────────────────────────────────────────────
@@ -599,12 +582,6 @@ needs_key_for_monitor() {
 
 configure_autoswitch() {
     echo
-    if [ "$SERVER_MODE" != server ]; then
-        echo "Auto-switch needs a specific server; $SERVER.vpn.airdns.org already moves to"
-        echo "another server in that country whenever the tunnel reconnects."
-        AUTO_SWITCH=0
-        return 0
-    fi
     echo "Auto-switch: when $SERVER goes down, the monitor rewrites wg0.conf for the next"
     echo "healthy server matching your filters (${COUNTRIES:-all countries}, >= $MIN_BW Mbit/s,"
     echo "sorted by $SORT) and restarts the container that uses it."
@@ -685,6 +662,7 @@ auto_switch() {
 monitor() {
     [ -f "$ENV_FILE" ] || die "No $ENV_FILE. Run setup first."
     [ -n "$SERVER" ] || die "No server saved in $ENV_FILE. Run setup first."
+    [ "${SERVER_MODE:-server}" = server ] || die "$ENV_FILE uses a country hostname, which is no longer supported. Run setup again and pick a server."
     local status ui target conds=() line key title prev active=()
 
     status=$(api status)
@@ -692,16 +670,11 @@ monitor() {
         warn "Could not reach the AirVPN status API; no alerts sent this run."
         exit 2
     fi
-    target=$(MODE="$SERVER_MODE" N="$SERVER" python3 -c '
+    target=$(N="$SERVER" python3 -c '
 import json, os, sys
 d = json.load(sys.stdin)
-mode, n = os.environ["MODE"], os.environ["N"]
-if mode == "server":
-    m = [s for s in d["servers"] if s["public_name"] == n]
-    label = n
-else:
-    m = [c for c in d["countries"] if c["country_code"] == n]
-    label = m[0]["country_name"] if m else n
+label = os.environ["N"]
+m = [s for s in d["servers"] if s["public_name"] == label]
 if not m:
     print("\x1f".join(("missing", "0", "", label)))
 else:
@@ -716,7 +689,7 @@ else:
     local down=0 msg
     { [ "$health" = error ] || [ "$health" = missing ]; } && down=1
     [ "$health" = missing ] && why="no longer listed by AirVPN"
-    if [ "$down" = 1 ] && [ "$AUTO_SWITCH" = 1 ] && [ "$SERVER_MODE" = server ]; then
+    if [ "$down" = 1 ] && [ "$AUTO_SWITCH" = 1 ]; then
         if auto_switch "$status"; then
             # The old server's alerts no longer apply: forget them without
             # "all clear" messages and report the switch instead.
