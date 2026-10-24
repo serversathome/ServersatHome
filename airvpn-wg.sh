@@ -787,8 +787,8 @@ send_alert() {
 configure_alerts() {
     local c n flag
     echo
-    echo "Alert channel:"
-    echo "  1) None"
+    echo "Alerts (Enter = keep the choice in brackets):"
+    echo "  1) None (no alerts)"
     echo "  2) ntfy"
     echo "  3) Discord webhook"
     echo "  4) Gotify"
@@ -1115,7 +1115,7 @@ case "$CMD" in
             echo
             echo "Optional: a monitor (run from cron) can alert you about problems and switch"
             echo "servers automatically when this one goes down."
-            yesno "Set up alerts?" "$([ "$ALERT_CHANNEL" = none ] && echo n || echo y)" && configure_alerts
+            configure_alerts
             configure_autoswitch
             save_monitor_settings
             setup_cron
