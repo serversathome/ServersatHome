@@ -13,7 +13,8 @@
 #      other by name across stacks.
 #   3. If you choose to launch: gets qBittorrent's WireGuard config (paste a
 #      wg0.conf, or generate one from AirVPN with airvpn-wg.sh, which can also
-#      set up alerts and automatic server switching), then launches every
+#      set up alerts and automatic server switching) and asks for a forwarded
+#      port if your VPN gave you one, then launches every
 #      stack (including Dockge) and configures every app
 #      through its API in the order from wiki.serversatho.me/en/InstallInstructions:
 #
@@ -1006,6 +1007,7 @@ paste_wg() {
     local conf
     echo "Paste your WireGuard configuration below using SHIFT+INS (press ENTER then Ctrl+D when done):"
     conf=$(cat)
+    conf=${conf//$'\r'/}    # a config copied from Windows keeps CRLF line ends
     if [ -z "${conf//[[:space:]]/}" ]; then
         todo "No WireGuard configuration entered. qBittorrent will not start until $WG_FILE exists."
         return
@@ -1018,20 +1020,41 @@ paste_wg() {
     ok "WireGuard configuration saved to $WG_FILE"
 }
 
-# airvpn_wg — fetch airvpn-wg.sh (the copy next to this script if there is
-# one, else the repo's) into the wireguard folder and run it interactively.
-airvpn_wg() {
+# fetch_airvpn_wg — put the latest airvpn-wg.sh in the wireguard folder: the
+# repo's, else (offline) keep the one already there, else the copy next to
+# this script. Its monitor cron job runs that copy, so re-runs refresh it.
+# Prints what happened; returns 1 if there is no copy at all.
+fetch_airvpn_wg() {
     local local_copy
     local_copy="$(cd "$(dirname "$0")" && pwd)/airvpn-wg.sh"
-    if [ -f "$local_copy" ] && [ "$local_copy" != "$AIRVPN_WG" ]; then
-        cp "$local_copy" "$AIRVPN_WG"
-    elif ! curl -fsSL -m 60 "$AIRVPN_WG_URL" -o "$AIRVPN_WG.tmp" || ! mv "$AIRVPN_WG.tmp" "$AIRVPN_WG"; then
+    if curl -fsSL -m 60 "$AIRVPN_WG_URL" -o "$AIRVPN_WG.tmp" && grep -q '^# AirVPN WireGuard config generator' "$AIRVPN_WG.tmp"; then
+        if [ -f "$AIRVPN_WG" ] && cmp -s "$AIRVPN_WG.tmp" "$AIRVPN_WG"; then
+            rm -f "$AIRVPN_WG.tmp"
+        else
+            [ -f "$AIRVPN_WG" ] && ok "airvpn-wg.sh updated to the latest version (its monitor cron job runs it)"
+            mv "$AIRVPN_WG.tmp" "$AIRVPN_WG"
+        fi
+    else
         rm -f "$AIRVPN_WG.tmp"
-        [ -f "$AIRVPN_WG" ] || { todo "Could not download airvpn-wg.sh ($AIRVPN_WG_URL). Paste a wg0.conf into $WG_FILE, or download it and run: bash airvpn-wg.sh --output $WG_FILE"; return; }
-        warn "Could not download the latest airvpn-wg.sh; using the copy already in $QBITTORRENT_WIREGUARD_DIR."
+        # Offline: keep a working installed copy rather than swap in whatever
+        # sits next to this script, which may be older.
+        if [ -f "$AIRVPN_WG" ]; then
+            warn "Could not download the latest airvpn-wg.sh; keeping the copy in $QBITTORRENT_WIREGUARD_DIR."
+        elif [ -f "$local_copy" ]; then
+            warn "Could not download the latest airvpn-wg.sh; using the copy next to arr-complete.sh."
+            cp "$local_copy" "$AIRVPN_WG"
+        else
+            return 1
+        fi
     fi
     chown root:root "$AIRVPN_WG"
     chmod 700 "$AIRVPN_WG"
+}
+
+# airvpn_wg — fetch airvpn-wg.sh into the wireguard folder and run it
+# interactively.
+airvpn_wg() {
+    fetch_airvpn_wg || { todo "Could not download airvpn-wg.sh ($AIRVPN_WG_URL). Paste a wg0.conf into $WG_FILE, or download it and run: bash airvpn-wg.sh --output $WG_FILE"; return; }
     echo ""
     AIRVPN_WG_EMBEDDED=1 bash "$AIRVPN_WG" --output "$WG_FILE"
     if [ -s "$WG_FILE" ]; then
@@ -1044,7 +1067,10 @@ airvpn_wg() {
 WG_FROM_AIRVPN=0
 if [ -s "$WG_FILE" ]; then
     echo "WireGuard config already present at $WG_FILE (leaving it alone)."
-    [ -f "$AIRVPN_WG" ] && echo "  To pick another AirVPN server or change alerts: bash $AIRVPN_WG --output $WG_FILE"
+    if [ -f "$AIRVPN_WG" ]; then
+        fetch_airvpn_wg
+        echo "  To pick another AirVPN server or change alerts: bash $AIRVPN_WG --output $WG_FILE"
+    fi
 else
     echo ""
     echo "qBittorrent needs a WireGuard config (wg0.conf) for its VPN:"
