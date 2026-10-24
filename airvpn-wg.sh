@@ -35,9 +35,8 @@
 # uses 1 to 3, and the same as the menu when it auto-switches. Nothing is
 # cached between runs: the history is read fresh each time.
 #
-# Run in the TrueNAS shell as root, from a folder on a data pool (a reinstall
-# wipes the boot pool, so keep the script and wg0.conf under /mnt/<pool>):
-#   sudo su -c "wget https://raw.githubusercontent.com/serversathome/ServersatHome/refs/heads/main/airvpn-wg.sh && chmod +x airvpn-wg.sh && bash airvpn-wg.sh --output /mnt/<pool>/configs/qbittorrent/wireguard/wg0.conf"
+# Run in the TrueNAS shell as root:
+#   sudo su -c "wget https://raw.githubusercontent.com/serversathome/ServersatHome/refs/heads/main/airvpn-wg.sh && chmod +x airvpn-wg.sh && bash airvpn-wg.sh"
 #
 # Usage: see "airvpn-wg.sh --help".
 # ============================================================================
@@ -118,17 +117,6 @@ REL_FILE=$(mktemp)
 HIST_DIR=$(mktemp -d)
 HIST_NOW=$(date +%s)
 trap 'rm -rf "$CALLS_FILE" "$PING_FILE" "$REL_FILE" "$HIST_DIR"' EXIT
-
-# ── TrueNAS: keep files on a data pool ─────────────────────────────────────
-# A TrueNAS reinstall wipes the boot pool (/home, /root, ...); only data pools
-# under /mnt survive. warn_boot_pool <path> <what> warns when <path> is not
-# on one, since the settings, the key and the cron job's script would be lost.
-SELF=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
-warn_boot_pool() {
-    command -v midclt >/dev/null || return 0      # not TrueNAS
-    case "$1" in /mnt/*) return 0 ;; esac
-    warn "$2: $1 is on the TrueNAS boot pool, which a reinstall wipes. Use a data pool instead, e.g. /mnt/<pool>/configs/qbittorrent/wireguard/."
-}
 
 # ── Saved settings ──────────────────────────────────────────────────────────
 # Everything the menus remember, with defaults. A key in the environment wins
@@ -858,8 +846,8 @@ configure_autoswitch() {
 
 print_cron() {
     [ "$ALERT_CHANNEL" = none ] && [ "$AUTO_SWITCH" != 1 ] && return 0
-    local self=$SELF
-    warn_boot_pool "$self" "The script the cron job runs"
+    local self
+    self=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
     echo
     echo "For alerts and auto-switch, run the monitor every 5 minutes (1-3 API requests per run,"
     echo "plus up to about $(( MAX_HISTORY_CHECKS + DEEP_CHECKS * 8 )) when it switches servers)."
@@ -1022,7 +1010,6 @@ case "$CMD" in
         configure_alerts; configure_autoswitch; save_monitor_settings; print_cron ;;
     setup)
         info "AirVPN WireGuard config for $OUTPUT"
-        warn_boot_pool "$OUT_DIR" "wg0.conf and its settings (airvpn-wg.env)"
         ensure_key
         pick_device
         pick_server
