@@ -11,7 +11,8 @@
 #   2. Server: filter by your preferred countries and a minimum server
 #      bandwidth (AirVPN servers are 2000, 6000 or 20000 Mbit/s), healthy
 #      servers only, sorted by load, free bandwidth, users, measured ping
-#      or a ping + load balance.
+#      or a ping + load balance. Servers with an outage in the last 2 hours
+#      (read from AirVPN's session history) are listed last.
 #   3. Generate: writes wg0.conf, backs up the previous one, and checks the
 #      config really belongs to the chosen device.
 #   4. Alerts (optional): pick a channel (AirVPN notification, ntfy,
@@ -26,7 +27,8 @@
 # wg0.conf, readable by root only.
 #
 # AirVPN bans IPs that send more than 600 API requests in 10 minutes. This
-# script caps itself at MAX_CALLS requests per run; "monitor" uses 1 to 3.
+# script caps itself at MAX_CALLS requests per run; "monitor" uses 1 to 3
+# (an auto-switch adds one per candidate server checked, up to 40).
 #
 # Run in the TrueNAS shell as root:
 #   sudo su -c "wget https://raw.githubusercontent.com/serversathome/ServersatHome/refs/heads/main/airvpn-wg.sh && chmod +x airvpn-wg.sh && bash airvpn-wg.sh"
@@ -37,7 +39,9 @@
 set -uo pipefail
 
 API="https://airvpn.org/api"
-MAX_CALLS=40                 # hard cap per run, far below AirVPN's ban limit
+MAX_CALLS=100                # hard cap per run, far below AirVPN's ban limit
+MAX_OUTAGE_CHECKS=40         # servers whose outage history the menu checks (1 request each)
+RECENT_OUTAGE_MIN=120        # an outage this many minutes ago or less lists a server last
 WG_PORTS="1637 47107 51820"  # AirVPN's WireGuard ports (UDP)
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
@@ -100,7 +104,9 @@ STATE_FILE="$OUT_DIR/airvpn-wg.state"
 CALLS_FILE=$(mktemp)
 echo 0 > "$CALLS_FILE"
 PING_FILE=$(mktemp)
-trap 'rm -f "$CALLS_FILE" "$PING_FILE"' EXIT
+OUTAGE_FILE=$(mktemp)
+OUTAGE_DIR=$(mktemp -d)
+trap 'rm -rf "$CALLS_FILE" "$PING_FILE" "$OUTAGE_FILE" "$OUTAGE_DIR"' EXIT
 
 # ── Saved settings ──────────────────────────────────────────────────────────
 # Everything the menus remember, with defaults. A key in the environment wins
@@ -295,28 +301,37 @@ STATUS=""
 SERVER_LABEL=""
 
 # server_rows <countries> <min_bw> <sort> — healthy servers, TSV:
-# name, cc, location, load, bw, bw_max, users, ping ms ("-" if not
-# measured), recovering (1 = under 5% load), entry IP.
-# Pings come from $PING_FILE (see measure_pings); an unanswered ping sorts
-# last. Recovering servers sort last whatever the order: AirVPN drops a
-# server's users during an outage (packet loss, maintenance), so a server
-# that has just come back shows "ok" with almost no load and would otherwise
-# top the "lowest load" list.
+# name, cc, location, load, bw, bw_max, users, ping ms ("-" if not measured),
+# last outage (minutes ago, "none" in 24h, "?" unknown, "nc" not checked),
+# recent outage (1/0), entry IP. Every field is non-empty: read merges runs
+# of tabs.
+# Pings come from $PING_FILE (measure_pings), outages from $OUTAGE_FILE
+# (check_outages). Unanswered pings sort last; servers with an outage in the
+# last RECENT_OUTAGE_MIN minutes sort last whatever the order, since AirVPN
+# drops a server's users during an outage and a server that has just come
+# back would otherwise top the "lowest load" list.
 server_rows() {
-    CC="$1" MINBW="$2" SORTBY="$3" PINGS="$PING_FILE" python3 -c '
+    CC="$1" MINBW="$2" SORTBY="$3" PINGS="$PING_FILE" OUTAGES="$OUTAGE_FILE" RECENT="$RECENT_OUTAGE_MIN" python3 -c '
 import json, os, sys
 d = json.load(sys.stdin)
 cc = set(os.environ["CC"].lower().split())
 minbw = int(os.environ["MINBW"] or 0)
+recent_min = int(os.environ["RECENT"])
+def table(path):
+    out = {}
+    for line in open(path):
+        n, _, v = line.rstrip("\n").partition("\t")
+        out[n] = v
+    return out
 pings = {}
-for line in open(os.environ["PINGS"]):
-    n, _, ms = line.rstrip("\n").partition("\t")
+for n, v in table(os.environ["PINGS"]).items():
     try:
-        pings[n] = float(ms)
+        pings[n] = float(v)
     except ValueError:
         pass
+outages = table(os.environ["OUTAGES"])
 ping = lambda s: pings.get(s["public_name"], 9999)
-recovering = lambda s: s["currentload"] < 5
+recent = lambda s: outages.get(s["public_name"], "").isdigit() and int(outages[s["public_name"]]) <= recent_min
 rows = [s for s in d["servers"] if s.get("health") == "ok" and s.get("bw_max", 0) >= minbw
         and (not cc or s["country_code"] in cc)]
 key = {"load":     lambda s: (s["currentload"], -(s["bw_max"] - s["bw"])),
@@ -324,11 +339,68 @@ key = {"load":     lambda s: (s["currentload"], -(s["bw_max"] - s["bw"])),
        "users":    lambda s: (s.get("users", 0), s["currentload"]),
        "ping":     lambda s: (ping(s), s["currentload"]),
        "balanced": lambda s: (ping(s) + s["currentload"], ping(s))}[os.environ["SORTBY"]]
-for s in sorted(rows, key=lambda s: (recovering(s), key(s))):
+for s in sorted(rows, key=lambda s: (recent(s), key(s))):
     p = pings.get(s["public_name"])
+    o = outages.get(s["public_name"], "nc")
     print("\t".join([str(s.get(k, "")) for k in
           ("public_name", "country_code", "location", "currentload", "bw", "bw_max", "users")]
-          + ["%.0f" % p if p is not None else "-", "1" if recovering(s) else "0", s.get("ip_v4_in1", "")]))' <<<"$STATUS"
+          + ["%.0f" % p if p is not None else "-", o or "none", "1" if recent(s) else "0",
+             s.get("ip_v4_in1", "") or "-"]))' <<<"$STATUS"
+}
+
+# check_outages [max] — reads server_rows output on stdin and fetches the
+# last 24 hours of session counts for the first <max> servers (default
+# MAX_OUTAGE_CHECKS, one API request each) from the public "server" service.
+# Writes "name<TAB>minutes since the last outage" to $OUTAGE_FILE: empty =
+# none in 24h, "?" = could not check.
+# An outage is a missing 5-minute point or sessions under 25% of the median
+# of the previous 2 hours (servers with fewer than 20 sessions skip that
+# test). The packet-loss series is no use here: 5-minute averages read 0
+# through a 7-minute outage. A gap shared by 80%+ of the checked servers is
+# AirVPN's statistics, not an outage, and is ignored.
+check_outages() {
+    local n f
+    : > "$OUTAGE_FILE"
+    rm -f "$OUTAGE_DIR"/*.json
+    for n in $(cut -f1 | head -n "${1:-$MAX_OUTAGE_CHECKS}"); do
+        (api server name="$n" range=day panels=sessions) > "$OUTAGE_DIR/$n.json" 2>/dev/null
+    done
+    set -- "$OUTAGE_DIR"/*.json
+    [ -e "$1" ] || return 0
+    python3 -c '
+import json, os, statistics, sys
+from collections import Counter
+data, missing = {}, {}
+for f in sys.argv[1:]:
+    name = os.path.basename(f)[:-5]
+    try:
+        d = json.load(open(f))
+        ser = sorted((int(t), v) for t, v in list(d["panels"]["sessions"]["series"].values())[0])
+        step = int(d["window"]) * 1000
+        assert ser and step > 0
+    except Exception:
+        data[name] = None
+        continue
+    data[name] = (d, ser)
+    present = {t for t, _ in ser}
+    end = (int(d["to"]) * 1000 // step) * step - step   # last complete step
+    missing[name] = {t for t in range(ser[0][0], end + 1, step) if t not in present}
+shared = Counter(t for m in missing.values() for t in m)
+statgap = {t for t, c in shared.items() if len(missing) >= 3 and c >= 0.8 * len(missing)}
+for name, v in sorted(data.items()):
+    if v is None:
+        print(name + "\t?")
+        continue
+    d, ser = v
+    last = max((t for t in missing[name] if t not in statgap), default=None)
+    vals = [x for _, x in ser]
+    for i, (t, x) in enumerate(ser):
+        prev = vals[max(0, i - 24):i]
+        if len(prev) >= 6:
+            med = statistics.median(prev)
+            if med >= 20 and x < 0.25 * med:
+                last = t if last is None else max(last, t)
+    print(name + "\t" + ("" if last is None else str(max(0, int((int(d["to"]) * 1000 - last) / 60000)))))' "$@" > "$OUTAGE_FILE"
 }
 
 # measure_pings — reads server_rows output on stdin, pings every server's
@@ -340,7 +412,7 @@ measure_pings() {
         warn "ping is not installed; sorting by load instead."
         return 1
     fi
-    cut -f1,10 | awk -F'\t' '$2 != ""' | tr '\t' ' ' \
+    cut -f1,11 | awk -F'\t' '$2 != "-"' | awk -F'\t' '$2 != ""' | tr '\t' ' ' \
         | xargs -P 32 -L 1 sh -c 'ms=$(ping -c 3 -W 1 -q "$2" 2>/dev/null | sed -n "s#.*= *[0-9.]*/\([0-9.]*\)/.*#\1#p"); printf "%s\t%s\n" "$1" "$ms"' _ \
         >> "$PING_FILE"
 }
@@ -416,24 +488,35 @@ pick_server() {
         if measure_pings <<<"$rows"; then pinged=1; else SORT=load; fi
     fi
     rows=$(server_rows "$COUNTRIES" "$MIN_BW" "$SORT")
+    local nchk
+    nchk=$(wc -l <<<"$rows"); [ "$nchk" -gt "$MAX_OUTAGE_CHECKS" ] && nchk=$MAX_OUTAGE_CHECKS
+    echo "Checking the last 24h of $nchk servers for outages ($nchk API requests)..."
+    check_outages <<<"$rows"
+    rows=$(server_rows "$COUNTRIES" "$MIN_BW" "$SORT")
     echo
     printf '  %3s  %-14s %-3s %-26s %5s %15s %6s' "#" "Server" "CC" "Location" "Load" "Used/Max Mbit" "Users"
     [ "$pinged" = 1 ] && printf ' %6s' "Ping"
-    echo
+    printf '  %s\n' "Last outage"
     i=0
-    while IFS=$'\t' read -r name cc loc load bw bwmax users ms recovering _; do
+    while IFS=$'\t' read -r name cc loc load bw bwmax users ms outage recent _; do
         i=$(( i + 1 ))
         printf '  %3d) %-14s %-3s %-26.26s %4s%% %7s/%-7s %6s' "$i" "$name" "$cc" "$loc" "$load" "$bw" "$bwmax" "$users"
         if [ "$pinged" = 1 ]; then
             if [ "$ms" = - ]; then printf ' %6s' "-"; else printf ' %4sms' "$ms"; fi
         fi
-        [ "$recovering" = 1 ] && printf '  recovering'
+        case "$outage" in
+            none) printf '  none in 24h' ;;
+            nc)   printf '  not checked' ;;
+            \?)   printf '  unknown' ;;
+            *)    if [ "$outage" -lt 60 ]; then printf '  %sm ago' "$outage"; else printf '  %sh ago' "$(( outage / 60 ))"; fi ;;
+        esac
+        [ "$recent" = 1 ] && printf ' (listed last)'
         echo
     done <<<"$rows"
     echo
-    [ "$pinged" = 1 ] && grep -q $'\t-\t[01]\t[^\t]*$' <<<"$rows" && echo "Ping \"-\" = no answer (listed last)."
-    grep -q $'\t1\t[^\t]*$' <<<"$rows" \
-        && echo "recovering = under 5% load: usually just back from an outage that dropped its users (listed last)."
+    [ "$pinged" = 1 ] && awk -F'\t' '$8 == "-" { f = 1 } END { exit !f }' <<<"$rows" && echo "Ping \"-\" = no answer (listed last)."
+    awk -F'\t' '$10 == 1 { f = 1 } END { exit !f }' <<<"$rows" \
+        && echo "Servers with an outage in the last $(( RECENT_OUTAGE_MIN / 60 ))h are listed last: AirVPN dropped their users, so their low load is misleading."
     while true; do
         choice=$(ask "Server number (1-$i)" 1)
         [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "$i" ] && break
@@ -607,7 +690,8 @@ print_cron() {
     local self
     self=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
     echo
-    echo "For alerts and auto-switch, run the monitor every 5 minutes (1-3 API requests per run)."
+    echo "For alerts and auto-switch, run the monitor every 5 minutes (1-3 API requests per run,"
+    echo "plus up to $MAX_OUTAGE_CHECKS when it switches servers)."
     echo "TrueNAS: System -> Advanced Settings -> Cron Jobs -> Add, user root, command:"
     echo "    bash $self monitor --output $OUTPUT"
     echo "Other Linux: add that line to root's crontab (crontab -e) as"
@@ -626,6 +710,11 @@ auto_switch() {
     if [ "$SORT" = ping ] || [ "$SORT" = balanced ]; then
         server_rows "$COUNTRIES" "$MIN_BW" load | measure_pings
     fi
+    # Check every candidate's outage history like the menu does (one request
+    # each, up to MAX_OUTAGE_CHECKS; a switch is rare), so a server that has
+    # just come back from an outage is not picked for its low load. Checking
+    # only the top few is not enough: an outage often hits several servers.
+    server_rows "$COUNTRIES" "$MIN_BW" "$SORT" | awk -F'\t' -v cur="$old" '$1 != cur' | check_outages
     next=$(server_rows "$COUNTRIES" "$MIN_BW" "$SORT" | awk -F'\t' -v cur="$old" '$1 != cur && !f { print $1; f = 1 }')
     if [ -z "$next" ]; then
         SWITCH_ERR="no healthy server with >= $MIN_BW Mbit/s in ${COUNTRIES:-any country}"
