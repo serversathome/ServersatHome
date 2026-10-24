@@ -1011,7 +1011,7 @@ paste_wg() {
     conf=$(cat)
     conf=${conf//$'\r'/}    # a config copied from Windows keeps CRLF line ends
     if [ -z "${conf//[[:space:]]/}" ]; then
-        todo "No WireGuard configuration entered. qBittorrent will not start until $WG_FILE exists."
+        warn "No WireGuard configuration entered."
         return
     fi
     grep -q '^\[Interface\]' <<<"$conf" && grep -q '^\[Peer\]' <<<"$conf" \
@@ -1056,13 +1056,13 @@ fetch_airvpn_wg() {
 # airvpn_wg — fetch airvpn-wg.sh into the wireguard folder and run it
 # interactively.
 airvpn_wg() {
-    fetch_airvpn_wg || { todo "Could not download airvpn-wg.sh ($AIRVPN_WG_URL). Paste a wg0.conf into $WG_FILE, or download it and run: bash airvpn-wg.sh --output $WG_FILE"; return; }
+    fetch_airvpn_wg || { warn "Could not download airvpn-wg.sh ($AIRVPN_WG_URL)."; return; }
     echo ""
     AIRVPN_WG_EMBEDDED=1 bash "$AIRVPN_WG" --output "$WG_FILE"
     if [ -s "$WG_FILE" ]; then
         WG_FROM_AIRVPN=1
     else
-        todo "No WireGuard config was generated. Re-run: bash $AIRVPN_WG --output $WG_FILE (or paste one into that file)."
+        warn "No WireGuard config was generated."
     fi
 }
 
@@ -1085,11 +1085,21 @@ else
         case "$answer" in
             1) paste_wg; break ;;
             2) airvpn_wg; break ;;
-            3) todo "No WireGuard config yet. qBittorrent will not start until $WG_FILE exists (paste one there, or generate one: bash airvpn-wg.sh --output $WG_FILE)."; break ;;
+            3) break ;;
             *) echo "Please enter 1, 2 or 3." ;;
         esac
     done
     unset answer
+fi
+# Without a wg0.conf qBittorrent cannot bring its tunnel up: its stack is not
+# started and the steps that need it are skipped, with one note to finish.
+WG_MISSING=0
+if [ ! -s "$WG_FILE" ]; then
+    WG_MISSING=1
+    if [ -f "$AIRVPN_WG" ]; then wg_how="bash $AIRVPN_WG --output $WG_FILE"
+    else wg_how="wget -O airvpn-wg.sh $AIRVPN_WG_URL && bash airvpn-wg.sh --output $WG_FILE"; fi
+    todo "qBittorrent has no WireGuard config yet, so it was not started or configured. Put a wg0.conf at $WG_FILE (paste your provider's, or for AirVPN: $wg_how), then re-run arr-complete.sh to start and configure qBittorrent and connect Radarr, Sonarr and Qui to it."
+    warn "No WireGuard config: qBittorrent will not be started; the rest of the stack goes ahead."
 fi
 
 # Forwarded port: asked here, after the VPN config, since only a launch uses
@@ -1142,6 +1152,7 @@ fi
 # what Dockge expects to find).
 echo "Launching the stacks from $STACKS_PATH..."
 for stack in "${STACKS[@]}"; do
+    [ "$stack" = qbittorrent ] && [ "$WG_MISSING" = 1 ] && { echo "Not starting qbittorrent (no WireGuard config yet)."; continue; }
     docker compose -f "$STACKS_PATH/$stack/compose.yaml" up -d \
         || todo "The '$stack' stack did not launch. Check: docker compose -f $STACKS_PATH/$stack/compose.yaml logs"
 done
@@ -1262,6 +1273,7 @@ qb_diagnose() {
 # as a fallback, and the real error is printed either way.
 arr_add_qbittorrent() {
     local app="$1" base="$2" key="$3" cat_field="$4" category="$5" have schema body res host
+    if [ "$WG_MISSING" = 1 ]; then echo "    $app: qBittorrent download client skipped (qBittorrent has no WireGuard config yet)"; return 0; fi
     have=$(arr_api "$base" "$key" GET /api/v3/downloadclient | jpy "next((c for c in d if c['implementation']=='QBittorrent'), None)")
     if [ -n "$have" ]; then
         # Present from an earlier run: make sure "Remove Completed" is off.
@@ -1366,6 +1378,7 @@ qb_pref() { printf '%s' "$1" | jpy "d.get('$2')"; }
 
 configure_qbittorrent() {
     info "[1/12] qBittorrent"
+    if [ "$WG_MISSING" = 1 ]; then echo "    skipped: no WireGuard config yet (see the note at the end)"; return 0; fi
     if docker exec qbittorrent curl --version >/dev/null 2>&1; then QB_MODE="exec"; fi
     # QB_URL is used both from inside the container and from the host; inside
     # the container localhost:8080 is the WebUI itself, so the same URL works.
@@ -2381,53 +2394,58 @@ configure_qui() {
         http_ok && ok "Qui: logged in" || { todo "Qui: login failed (HTTP $(http_code)); configure it at $QUI_URL."; return 1; }
     fi
 
-    # qBittorrent instance, with local filesystem access (shared /media mount).
-    local inst
-    inst=$(qui_api GET /api/instances | jpy "next((i['id'] for i in d if i['host']=='$QB_INT'), None)")
-    if [ -z "$inst" ]; then
-        inst=$(qui_api POST /api/instances "$(jbuild '{"name": "qbittorrent", "host": "http://qbittorrent:8080", "username": os.environ["ADMIN_USER"], "password": os.environ["ADMIN_PASS"], "hasLocalFilesystemAccess": True}')" | jpy "d['id']")
-        [ -n "$inst" ] && ok "Qui: qBittorrent instance added" || { todo "Qui: could not add the qBittorrent instance (HTTP $(http_code))."; return 1; }
+    # Everything tied to the qBittorrent instance needs qBittorrent running.
+    if [ "$WG_MISSING" = 1 ]; then
+        echo "    Qui: qBittorrent instance, cross-seed and automations skipped (qBittorrent has no WireGuard config yet)"
     else
-        ok "Qui: qBittorrent instance already present"
+        # qBittorrent instance, with local filesystem access (shared /media mount).
+        local inst
+        inst=$(qui_api GET /api/instances | jpy "next((i['id'] for i in d if i['host']=='$QB_INT'), None)")
+        if [ -z "$inst" ]; then
+            inst=$(qui_api POST /api/instances "$(jbuild '{"name": "qbittorrent", "host": "http://qbittorrent:8080", "username": os.environ["ADMIN_USER"], "password": os.environ["ADMIN_PASS"], "hasLocalFilesystemAccess": True}')" | jpy "d['id']")
+            [ -n "$inst" ] && ok "Qui: qBittorrent instance added" || { todo "Qui: could not add the qBittorrent instance (HTTP $(http_code))."; return 1; }
+        else
+            ok "Qui: qBittorrent instance already present"
+        fi
+
+        # Hardlink cross-seed mode, flat layout, plus reannounce. One PUT.
+        # The update must carry the login again: Qui stores whatever username the
+        # PUT holds, and an empty one switches the instance to "no login", after
+        # which qBittorrent answers 403 and Qui backs off forever.
+        qui_api PUT "/api/instances/$inst" "$(jbuild '{"name": "qbittorrent", "host": "http://qbittorrent:8080", "username": os.environ["ADMIN_USER"], "password": os.environ["ADMIN_PASS"], "hasLocalFilesystemAccess": True, "useHardlinks": True, "useReflinks": False, "hardlinkBaseDir": "/media/downloads/crossseed", "hardlinkDirPreset": "flat", "fallbackToRegularMode": False, "reannounceSettings": {"enabled": True, "initialWaitSeconds": 15, "reannounceIntervalSeconds": 7, "maxAgeSeconds": 600, "maxRetries": 50, "aggressive": False, "monitorAll": True, "excludeCategories": False, "categories": [], "excludeTags": False, "tags": [], "excludeTrackers": False, "trackers": []}}')" >/dev/null
+        http_ok && ok "Qui: hardlink cross-seed mode (/media/downloads/crossseed, flat) + reannounce enabled" \
+                || warn "Qui: instance settings update returned HTTP $(http_code)"
+
+        # Qui backs off (up to an hour after an IP ban) when qBittorrent rejected
+        # it earlier. Re-activating the instance clears that state; the test then
+        # says right away whether Qui can log in.
+        local conn
+        qui_api PUT "/api/instances/$inst/status" '{"isActive": true}' >/dev/null
+        conn=$(qui_api POST "/api/instances/$inst/test")
+        if [ "$(printf '%s' "$conn" | jpy "d.get('connected')")" = "True" ]; then ok "Qui: connected to qBittorrent"; else
+            todo "Qui: cannot connect to qBittorrent: $(printf '%s' "$conn" | jpy "d.get('error') or d.get('message') or d")"; fi
+
+        # Cross-seed rules + RSS automation (wiki sections 3.1 and 3.3), and the
+        # post-injection "Max auto-start download": a new cross-seed that still
+        # has to fetch more than this many MiB stays paused for review.
+        qui_api PATCH /api/cross-seed/settings "$(I="$inst" jbuild '{"useCrossCategoryAffix": True, "categoryAffixMode": "suffix", "categoryAffix": ".cross", "skipPieceBoundarySafetyCheck": False, "enabled": True, "runIntervalMinutes": 90, "targetInstanceIds": [int(os.environ["I"])], "targetIndexerIds": [], "rssSourceExcludeTags": ["cross-seed"], "autoResumeMaxDownloadMb": 5}')" >/dev/null
+        http_ok && ok "Qui: cross-seed rules (.cross suffix, piece check on), RSS automation (90 min), max auto-start download 5 MiB" \
+                || warn "Qui: cross-seed settings returned HTTP $(http_code)"
+
+        # Auto-search on completion (wiki 3.4).
+        qui_api PUT "/api/cross-seed/completion/$inst" '{"enabled": true, "categories": [], "tags": [], "excludeCategories": [], "excludeTags": ["cross-seed"], "indexerIds": [], "bypassTorznabCache": false, "delaySeconds": 0}' >/dev/null
+        http_ok && ok "Qui: auto-search on completion enabled" || warn "Qui: completion settings returned HTTP $(http_code)"
+
+        # Automations from the wiki (section 4), added enabled.
+        qui_import_automation "$inst" '{"name":"Remove Unlinked","trackerPattern":"*","trackerDomains":["*"],"conditions":{"schemaVersion":"1","delete":{"enabled":true,"mode":"deleteWithFilesIncludeCrossSeeds","includeHardlinks":true,"condition":{"operator":"AND","conditions":[{"field":"HARDLINK_SCOPE","operator":"NOT_EQUAL","value":"outside_qbittorrent"},{"field":"COMPLETION_ON_AGE","operator":"GREATER_THAN_OR_EQUAL","value":"1296000"}]}}}}'
+        qui_import_automation "$inst" '{"name":"Unregistered","trackerPattern":"*","trackerDomains":["*"],"conditions":{"schemaVersion":"1","delete":{"enabled":true,"mode":"deleteWithFilesIncludeCrossSeeds","condition":{"operator":"AND","conditions":[{"field":"IS_UNREGISTERED","operator":"EQUAL","value":"true"},{"field":"COMPLETION_ON_AGE","operator":"GREATER_THAN_OR_EQUAL","value":"86400"}]}}}}'
+        qui_import_automation "$inst" '{"name":"Stalled","trackerPattern":"*","trackerDomains":["*"],"conditions":{"schemaVersion":"1","delete":{"enabled":true,"mode":"deleteWithFiles","condition":{"operator":"AND","conditions":[{"field":"PROGRESS","operator":"LESS_THAN_OR_EQUAL","value":"0.02"},{"field":"ADDED_ON_AGE","operator":"GREATER_THAN_OR_EQUAL","value":"3600"}]}}}}'
+        qui_import_automation "$inst" '{"name":"Tag Stalled (H&R Risk)","trackerPattern":"*","trackerDomains":["*"],"conditions":{"schemaVersion":"1","tag":{"enabled":true,"tags":["stuck-hr-risk"],"mode":"full","condition":{"operator":"AND","conditions":[{"field":"PROGRESS","operator":"GREATER_THAN_OR_EQUAL","value":"0.02"},{"field":"PROGRESS","operator":"LESS_THAN","value":"1"},{"field":"ADDED_ON_AGE","operator":"GREATER_THAN_OR_EQUAL","value":"172800"}]}}}}'
+
+        # Orphan scan (wiki 5).
+        qui_api PUT "/api/instances/$inst/orphan-scan/settings" '{"enabled": true}' >/dev/null
+        http_ok && ok "Qui: orphan scan enabled" || warn "Qui: orphan scan settings returned HTTP $(http_code)"
     fi
-
-    # Hardlink cross-seed mode, flat layout, plus reannounce. One PUT.
-    # The update must carry the login again: Qui stores whatever username the
-    # PUT holds, and an empty one switches the instance to "no login", after
-    # which qBittorrent answers 403 and Qui backs off forever.
-    qui_api PUT "/api/instances/$inst" "$(jbuild '{"name": "qbittorrent", "host": "http://qbittorrent:8080", "username": os.environ["ADMIN_USER"], "password": os.environ["ADMIN_PASS"], "hasLocalFilesystemAccess": True, "useHardlinks": True, "useReflinks": False, "hardlinkBaseDir": "/media/downloads/crossseed", "hardlinkDirPreset": "flat", "fallbackToRegularMode": False, "reannounceSettings": {"enabled": True, "initialWaitSeconds": 15, "reannounceIntervalSeconds": 7, "maxAgeSeconds": 600, "maxRetries": 50, "aggressive": False, "monitorAll": True, "excludeCategories": False, "categories": [], "excludeTags": False, "tags": [], "excludeTrackers": False, "trackers": []}}')" >/dev/null
-    http_ok && ok "Qui: hardlink cross-seed mode (/media/downloads/crossseed, flat) + reannounce enabled" \
-            || warn "Qui: instance settings update returned HTTP $(http_code)"
-
-    # Qui backs off (up to an hour after an IP ban) when qBittorrent rejected
-    # it earlier. Re-activating the instance clears that state; the test then
-    # says right away whether Qui can log in.
-    local conn
-    qui_api PUT "/api/instances/$inst/status" '{"isActive": true}' >/dev/null
-    conn=$(qui_api POST "/api/instances/$inst/test")
-    if [ "$(printf '%s' "$conn" | jpy "d.get('connected')")" = "True" ]; then ok "Qui: connected to qBittorrent"; else
-        todo "Qui: cannot connect to qBittorrent: $(printf '%s' "$conn" | jpy "d.get('error') or d.get('message') or d")"; fi
-
-    # Cross-seed rules + RSS automation (wiki sections 3.1 and 3.3), and the
-    # post-injection "Max auto-start download": a new cross-seed that still
-    # has to fetch more than this many MiB stays paused for review.
-    qui_api PATCH /api/cross-seed/settings "$(I="$inst" jbuild '{"useCrossCategoryAffix": True, "categoryAffixMode": "suffix", "categoryAffix": ".cross", "skipPieceBoundarySafetyCheck": False, "enabled": True, "runIntervalMinutes": 90, "targetInstanceIds": [int(os.environ["I"])], "targetIndexerIds": [], "rssSourceExcludeTags": ["cross-seed"], "autoResumeMaxDownloadMb": 5}')" >/dev/null
-    http_ok && ok "Qui: cross-seed rules (.cross suffix, piece check on), RSS automation (90 min), max auto-start download 5 MiB" \
-            || warn "Qui: cross-seed settings returned HTTP $(http_code)"
-
-    # Auto-search on completion (wiki 3.4).
-    qui_api PUT "/api/cross-seed/completion/$inst" '{"enabled": true, "categories": [], "tags": [], "excludeCategories": [], "excludeTags": ["cross-seed"], "indexerIds": [], "bypassTorznabCache": false, "delaySeconds": 0}' >/dev/null
-    http_ok && ok "Qui: auto-search on completion enabled" || warn "Qui: completion settings returned HTTP $(http_code)"
-
-    # Automations from the wiki (section 4), added enabled.
-    qui_import_automation "$inst" '{"name":"Remove Unlinked","trackerPattern":"*","trackerDomains":["*"],"conditions":{"schemaVersion":"1","delete":{"enabled":true,"mode":"deleteWithFilesIncludeCrossSeeds","includeHardlinks":true,"condition":{"operator":"AND","conditions":[{"field":"HARDLINK_SCOPE","operator":"NOT_EQUAL","value":"outside_qbittorrent"},{"field":"COMPLETION_ON_AGE","operator":"GREATER_THAN_OR_EQUAL","value":"1296000"}]}}}}'
-    qui_import_automation "$inst" '{"name":"Unregistered","trackerPattern":"*","trackerDomains":["*"],"conditions":{"schemaVersion":"1","delete":{"enabled":true,"mode":"deleteWithFilesIncludeCrossSeeds","condition":{"operator":"AND","conditions":[{"field":"IS_UNREGISTERED","operator":"EQUAL","value":"true"},{"field":"COMPLETION_ON_AGE","operator":"GREATER_THAN_OR_EQUAL","value":"86400"}]}}}}'
-    qui_import_automation "$inst" '{"name":"Stalled","trackerPattern":"*","trackerDomains":["*"],"conditions":{"schemaVersion":"1","delete":{"enabled":true,"mode":"deleteWithFiles","condition":{"operator":"AND","conditions":[{"field":"PROGRESS","operator":"LESS_THAN_OR_EQUAL","value":"0.02"},{"field":"ADDED_ON_AGE","operator":"GREATER_THAN_OR_EQUAL","value":"3600"}]}}}}'
-    qui_import_automation "$inst" '{"name":"Tag Stalled (H&R Risk)","trackerPattern":"*","trackerDomains":["*"],"conditions":{"schemaVersion":"1","tag":{"enabled":true,"tags":["stuck-hr-risk"],"mode":"full","condition":{"operator":"AND","conditions":[{"field":"PROGRESS","operator":"GREATER_THAN_OR_EQUAL","value":"0.02"},{"field":"PROGRESS","operator":"LESS_THAN","value":"1"},{"field":"ADDED_ON_AGE","operator":"GREATER_THAN_OR_EQUAL","value":"172800"}]}}}}'
-
-    # Orphan scan (wiki 5).
-    qui_api PUT "/api/instances/$inst/orphan-scan/settings" '{"enabled": true}' >/dev/null
-    http_ok && ok "Qui: orphan scan enabled" || warn "Qui: orphan scan settings returned HTTP $(http_code)"
 
     # *arr integrations (wiki 2.2) and private indexers from Prowlarr (wiki 2.1).
     [ -n "$RADARR_API_KEY" ] && qui_add_arr radarr "$RADARR_INT" "$RADARR_API_KEY"
