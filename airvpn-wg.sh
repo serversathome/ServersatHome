@@ -396,11 +396,13 @@ for s in sorted(rows, key=key):
 # makes sure each of the first <servers> servers has its last <chunks> x 10
 # days of session counts (15-minute steps) in $HIST_DIR: one request to the
 # public "server" service (no key) per 10-day chunk not read yet this run,
-# 6 at a time. Then rewrites $REL_FILE (analyze_history). Nothing is kept
-# after the run. If the requests would go over MAX_CALLS they are skipped
-# and those servers show as not checked.
+# 6 at a time. A request that fails (no answer, an error, or not a usable
+# history) is retried once, so one dropped request does not turn a server's
+# whole record into "unknown". Then rewrites $REL_FILE (analyze_history).
+# Nothing is kept after the run. Requests that would go over MAX_CALLS are
+# skipped (return 1) and those servers show as not checked.
 fetch_history() {
-    local n k to jobs=""
+    local n k to jobs="" failed
     for n in $(cut -f1 | head -n "$1"); do
         for k in $(seq 0 $(( $2 - 1 ))); do
             [ -s "$HIST_DIR/$n.$k.json" ] && continue
@@ -409,17 +411,46 @@ fetch_history() {
         done
     done
     if [ -n "$jobs" ]; then
-        if reserve_calls "$(grep -c . <<<"$jobs")"; then
-            printf '%s' "$jobs" | API="$API" HIST_DIR="$HIST_DIR" xargs -P 6 -L 1 sh -c \
-                'curl -sS -m 30 -G --data-urlencode "name=$1" --data-urlencode "from=$3" --data-urlencode "to=$4" \
-                     --data-urlencode window=900 --data-urlencode panels=sessions "$API/server/" > "$HIST_DIR/$1.$2.json" 2>/dev/null' _
-        else
+        if ! reserve_calls "$(grep -c . <<<"$jobs")"; then
             warn "Skipping outage history for some servers: it would go over $MAX_CALLS API requests this run."
             analyze_history
             return 1
         fi
+        download_history <<<"$jobs"
+        failed=$(bad_history <<<"$jobs")
+        if [ -n "$failed" ]; then
+            if reserve_calls "$(grep -c . <<<"$failed")"; then
+                download_history <<<"$failed"
+            else
+                warn "Not retrying $(grep -c . <<<"$failed") failed history request(s): it would go over $MAX_CALLS API requests this run."
+            fi
+        fi
     fi
     analyze_history
+}
+
+# download_history — reads "name chunk from to" lines on stdin and fetches
+# each into $HIST_DIR/<name>.<chunk>.json, 6 at a time (already counted).
+download_history() {
+    API="$API" HIST_DIR="$HIST_DIR" xargs -P 6 -L 1 sh -c \
+        'curl -sS -m 30 -G --data-urlencode "name=$1" --data-urlencode "from=$3" --data-urlencode "to=$4" \
+             --data-urlencode window=900 --data-urlencode panels=sessions "$API/server/" > "$HIST_DIR/$1.$2.json" 2>/dev/null' _
+}
+
+# bad_history — reads the same lines and prints those whose file is not a
+# usable 15-minute history (empty, not JSON, an API error, another step).
+bad_history() {
+    HIST_DIR="$HIST_DIR" python3 -c '
+import json, os, sys
+for line in sys.stdin:
+    f = line.split()
+    if len(f) != 4:
+        continue
+    try:
+        d = json.load(open(os.path.join(os.environ["HIST_DIR"], "%s.%s.json" % (f[0], f[1]))))
+        assert int(d["window"]) == 900 and "sessions" in d["panels"]
+    except Exception:
+        print(line.rstrip("\n"))'
 }
 
 # analyze_history — turns the session histories in $HIST_DIR into $REL_FILE,
