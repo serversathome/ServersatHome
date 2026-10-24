@@ -31,7 +31,8 @@
 #
 # AirVPN bans IPs that send more than 600 API requests in 10 minutes. This
 # script caps itself at MAX_CALLS requests per run. The server menu uses about
-# one per listed server plus 40 for the top 5's 90-day history; "monitor"
+# one per listed server plus 8 for each server whose 90 days are read (the
+# top 5, more when reading reshuffles the top; typically 40-120); "monitor"
 # uses 1 to 3, and the same as the menu when it auto-switches. Nothing is
 # cached between runs: the history is read fresh each time.
 #
@@ -44,9 +45,10 @@
 set -uo pipefail
 
 API="https://airvpn.org/api"
-MAX_CALLS=160                # hard cap per run, far below AirVPN's ban limit
+MAX_CALLS=200                # hard cap per run, far below AirVPN's ban limit
 MAX_HISTORY_CHECKS=40        # servers whose last 10 days of history are read (1 request each)
 DEEP_CHECKS=5                # top servers whose full RELIABILITY_DAYS are read
+DEEP_ROUNDS=5                # re-checks until the whole top DEEP_CHECKS has them
 RELIABILITY_DAYS=90          # 10 days per request, so 8 more requests per deep server
 OUTAGE_PENALTY=20            # ranking: 1 (weighted) outage per 30 days counts like 20% load
 SHORT_OUTAGE_WEIGHT=0.2      # a short outage (under ~20 min) counts as this much of one
@@ -410,6 +412,8 @@ fetch_history() {
                      --data-urlencode window=900 --data-urlencode panels=sessions "$API/server/" > "$HIST_DIR/$1.$2.json" 2>/dev/null' _
         else
             warn "Skipping outage history for some servers: it would go over $MAX_CALLS API requests this run."
+            analyze_history
+            return 1
         fi
     fi
     analyze_history
@@ -518,9 +522,17 @@ for name in sorted(files):
 # rank_servers [exclude] — sets RANKED to server_rows output for the saved
 # filters, best first, reading everything fresh: pings, 10
 # days of history for up to MAX_HISTORY_CHECKS servers, then RELIABILITY_DAYS
-# for the top DEEP_CHECKS (twice, in case the deep history reshuffles the
-# top). Sets PINGED=1 when pings were measured; returns 1 if nothing matches.
+# for the top DEEP_CHECKS. Reading a server's 90 days can push it out of the
+# top (flaky servers with a good ping get there on 10 clean days), letting in
+# one that only has 10 days, so this repeats until every server in the top
+# has its full history: up to DEEP_ROUNDS rounds, or until MAX_CALLS stops
+# it. Sets PINGED=1 when pings were measured; returns 1 if nothing matches.
 RANKED=""; PINGED=0
+# shallow_top — the servers in the top DEEP_CHECKS of server_rows output (on
+# stdin) that only have 10 days of history (unknown ones can't get more).
+shallow_top() {
+    head -n "$DEEP_CHECKS" | awk -F'\t' '$13 == 0 && $8 != "unknown" { print $1 }'
+}
 rank_servers() {
     local exclude=${1-} rows n round chunks=$(( (RELIABILITY_DAYS + 9) / 10 ))
     PINGED=0
@@ -532,12 +544,12 @@ rank_servers() {
     n=$(wc -l <<<"$rows"); [ "$n" -gt "$MAX_HISTORY_CHECKS" ] && n=$MAX_HISTORY_CHECKS
     echo "Reading 10 days of outage history for $n servers ($n API requests)..."
     fetch_history "$MAX_HISTORY_CHECKS" 1 <<<"$rows"
-    for round in 1 2; do
+    for round in $(seq 1 "$DEEP_ROUNDS"); do
         rows=$(server_rows "$COUNTRIES" "$MIN_BW" "$exclude")
-        n=$(head -n "$DEEP_CHECKS" <<<"$rows" | awk -F'\t' '$13 == 0 && $8 != "unknown"' | wc -l)
+        n=$(shallow_top <<<"$rows" | wc -l)
         [ "$n" -gt 0 ] || break
         echo "Reading $RELIABILITY_DAYS days of history for $n of the top $DEEP_CHECKS ($(( n * (chunks - 1) )) API requests)..."
-        fetch_history "$DEEP_CHECKS" "$chunks" <<<"$rows"
+        fetch_history "$DEEP_CHECKS" "$chunks" <<<"$rows" || break
     done
     RANKED=$(server_rows "$COUNTRIES" "$MIN_BW" "$exclude")
 }
@@ -665,6 +677,9 @@ pick_server() {
     [ "$PINGED" = 1 ] && awk -F'\t' '$7 == "-" { f = 1 } END { exit !f }' <<<"$rows" && echo "Ping \"-\" = no answer."
     [ "$adjusted" = 1 ] && echo "~ = load once its users are back: it had an outage in the last few hours, so its current load is misleadingly low."
     echo "Outages: from AirVPN's session history, $RELIABILITY_DAYS days for the top $DEEP_CHECKS and 10 days for the others."
+    local shallow
+    shallow=$(shallow_top <<<"$rows" | xargs)
+    [ -n "$shallow" ] && warn "Only 10 days of history for $shallow (stopped by the re-check or request limit), so their rank is less certain."
     echo "  long = down ~30 min or more (counts fully, more if it lasted hours); short = under ~20 min (counts $SHORT_OUTAGE_WEIGHT)."
     [ "$unknown" -gt 0 ] && warn "Could not read the outage history of $unknown server(s); they are ranked as unreliable. If every server shows unknown, AirVPN's server API may have changed."
     while true; do
