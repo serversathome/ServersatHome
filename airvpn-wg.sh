@@ -38,7 +38,9 @@
 # cached between runs: the history is read fresh each time.
 #
 # Run in the TrueNAS shell as root:
-#   sudo su -c "wget https://raw.githubusercontent.com/serversathome/ServersatHome/refs/heads/main/airvpn-wg.sh && chmod +x airvpn-wg.sh && bash airvpn-wg.sh"
+# (wget -O replaces an older copy; plain wget would save airvpn-wg.sh.1 and
+# run the old one):
+#   sudo su -c "wget -O airvpn-wg.sh https://raw.githubusercontent.com/serversathome/ServersatHome/refs/heads/main/airvpn-wg.sh && chmod +x airvpn-wg.sh && bash airvpn-wg.sh"
 #
 # Usage: see "airvpn-wg.sh --help".
 # ============================================================================
@@ -209,6 +211,13 @@ result_of() { jget 'd.get("result")'; }
 # forever, which could loop between menus.
 # Prompts run inside $(...), where die would only end the subshell, so this
 # signals the main script ($$ is its PID even in a subshell).
+# tty_read <read args...> — read from the terminal, or stop if there is none.
+# The terminal is checked first, quietly: read prints its prompt on stderr, so
+# stderr must not be silenced around the read itself.
+tty_read() {
+    { : </dev/tty; } 2>/dev/null || no_tty
+    read "$@" </dev/tty || no_tty
+}
 no_tty() {
     echo "❌ No terminal to ask on. Run airvpn-wg.sh interactively, or give --device and --server." >&2
     kill -s TERM $$
@@ -216,7 +225,7 @@ no_tty() {
 }
 ask() {
     local a
-    read -rp "$1${2:+ [$2]}: " a 2>/dev/null </dev/tty || no_tty
+    tty_read -rp "$1${2:+ [$2]}: " a
     printf '%s' "${a:-$2}"
 }
 # ask_or_back <prompt> <default> — like ask, but returns 1 (go back) for "b",
@@ -224,7 +233,7 @@ ask() {
 ask_or_back() {
     local a hint
     if [ -n "$2" ]; then hint=" (b = back)"; else hint=" (Enter = back)"; fi
-    read -rp "$1$hint${2:+ [$2]}: " a 2>/dev/null </dev/tty || no_tty
+    tty_read -rp "$1$hint${2:+ [$2]}: " a
     case "$a" in b|B|back) return 1 ;; esac
     a=${a:-$2}
     [ -n "$a" ] || return 1
@@ -241,7 +250,7 @@ USERINFO=""
 ensure_key() {
     if [ -z "$AIRVPN_API_KEY" ]; then
         echo "Create an API key at https://airvpn.org/apisettings/ (and activate it)."
-        read -rsp "AirVPN API key: " AIRVPN_API_KEY 2>/dev/null </dev/tty || no_tty; echo
+        tty_read -rsp "AirVPN API key: " AIRVPN_API_KEY; echo
     fi
     [ -n "$AIRVPN_API_KEY" ] || die "No API key."
     USERINFO=$(api userinfo)
