@@ -1049,9 +1049,7 @@ else
     echo ""
     echo "qBittorrent needs a WireGuard config (wg0.conf) for its VPN:"
     echo "  1) Paste a wg0.conf from your VPN provider"
-    echo "  2) Generate one from AirVPN: pick a device and a server ranked on load, reliability"
-    echo "     and ping, with optional alerts and automatic server switching"
-    echo "     (needs an AirVPN API key from https://airvpn.org/apisettings/)"
+    echo "  2) Auto-generate a wg0.conf for me (AirVPN only, needs an API key)"
     echo "  3) Skip for now"
     while :; do
         # End of input (nothing left to read) counts as skip instead of looping.
