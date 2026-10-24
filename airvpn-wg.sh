@@ -208,36 +208,37 @@ for x in d.get("devices", []):
 }
 
 create_device() {
-    local name before list rows newid i cur
+    local name resp newid i cur r
     name=$(ask "Name for the new device (letters, digits, - and _)" "")
     [[ "$name" =~ ^[A-Za-z0-9_-]+$ ]] || die "Invalid device name."
-    before=$(cut -f2 <<<"$1")
-    list=$(api devices action=add name="$name")
-    [ "$(result_of <<<"$list")" = ok ] || die "AirVPN refused to add a device: $(result_of <<<"$list")"
-    # Adding is not done in realtime: AirVPN queues it. Poll the list until a
-    # new device shows up "ready" (every 10s, up to 3 minutes).
+    # The generator picks devices by name, so names must stay unique.
+    cut -f1 <<<"$1" | grep -qxF "$name" && die "A device named $name already exists."
+    resp=$(api devices action=add)
+    [ "$(result_of <<<"$resp")" = ok ] || die "AirVPN refused to add a device: $(result_of <<<"$resp")"
+    newid=$(jget 'd["id"]' <<<"$resp")
+    [ -n "$newid" ] || die "AirVPN did not return the new device's id."
+    # AirVPN queues the add (status "create") and names it "New device"; its
+    # keys are usually ready within 15s. Poll every 10s for up to 2 minutes,
+    # then rename it (modify is immediate).
     echo "Device requested, waiting for AirVPN to create its keys..." >&2
-    for i in $(seq 1 18); do
+    for i in $(seq 1 12); do
         sleep 10
-        rows=$(api devices action=list | device_rows)
-        newid=$(awk -F'\t' 'NR==FNR{old[$1]=1; next} !($2 in old){print $2; exit}' <(printf '%s\n' "$before") <(printf '%s\n' "$rows"))
-        if [ -n "$newid" ]; then
-            cur=$(awk -F'\t' -v id="$newid" '$2==id' <<<"$rows")
-            if [ "$(cut -f3 <<<"$cur")" = ready ]; then
-                if [ "$(cut -f1 <<<"$cur")" != "$name" ]; then
-                    api devices action=modify id="$newid" name="$name" >/dev/null
-                    rows=$(api devices action=list | device_rows)
-                    cur=$(awk -F'\t' -v id="$newid" '$2==id' <<<"$rows")
-                fi
-                DEVICE=$(cut -f1 <<<"$cur"); DEVICE_IP=$(cut -f4 <<<"$cur")
-                [ "$DEVICE" = "$name" ] || warn "AirVPN named the device \"$DEVICE\"; rename it in the Client Area if you like."
-                ok "Device $DEVICE created ($DEVICE_IP)"
-                return 0
+        cur=$(api devices action=list | device_rows | awk -F'\t' -v id="$newid" '$2==id')
+        if [ "$(cut -f3 <<<"$cur")" = ready ]; then
+            r=$(api devices action=modify id="$newid" name="$name")
+            if [ "$(result_of <<<"$r")" = ok ]; then
+                DEVICE=$name
+            else
+                DEVICE=$(cut -f1 <<<"$cur")
+                warn "Could not rename the device ($(result_of <<<"$r")); it is called \"$DEVICE\"."
             fi
+            DEVICE_IP=$(cut -f4 <<<"$cur")
+            ok "Device $DEVICE created ($DEVICE_IP)"
+            return 0
         fi
         [ $(( i % 3 )) -eq 0 ] && echo "    ... still waiting ($(( i * 10 ))s)" >&2
     done
-    die "AirVPN has not finished creating the device after 3 minutes. Re-run the script and pick it from the list."
+    die "AirVPN has not finished creating the device after 2 minutes. Re-run the script and pick it from the list."
 }
 
 pick_device() {
