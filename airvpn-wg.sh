@@ -19,11 +19,12 @@
 #   3. Generate: writes wg0.conf, backs up the previous one, and checks the
 #      config really belongs to the chosen device.
 #   4. Alerts (optional): pick a channel (ntfy, Discord, Gotify, Telegram)
-#      and the events you care about, then run
-#      "airvpn-wg.sh monitor" from cron.
+#      and the events you care about.
 #   5. Auto-switch (optional): when the chosen server goes down, the monitor
-#      rewrites wg0.conf for the next healthy server matching the same
-#      filters (countries, bandwidth, sort) and restarts the container.
+#      rewrites wg0.conf for the best healthy server matching the same
+#      filters (countries, bandwidth; same ranking) and restarts the
+#      container. With alerts or auto-switch on, the monitor's cron job
+#      ("airvpn-wg.sh monitor", every 5 minutes) is added automatically.
 #
 # Needs an AirVPN API key: https://airvpn.org/apisettings/ (premium account).
 # Settings (key, choices, alert channel) are kept in airvpn-wg.env next to
@@ -68,7 +69,8 @@ usage() {
 Usage: airvpn-wg.sh [command] [options]
 
 Commands:
-  setup        (default) pick a device and server, write wg0.conf, set up alerts
+  setup        (default) pick a device and server, write wg0.conf, set up
+               alerts and auto-switch
   alerts       change the alert channel, events and auto-switch only
   test-alert   send a test message to the configured channel
   monitor      check the chosen server once, alert on changes and
@@ -113,6 +115,7 @@ OUT_DIR=$(cd "$(dirname "$OUTPUT")" 2>/dev/null && pwd) || die "Directory for $O
 OUTPUT="$OUT_DIR/$(basename "$OUTPUT")"
 ENV_FILE="$OUT_DIR/airvpn-wg.env"
 STATE_FILE="$OUT_DIR/airvpn-wg.state"
+SWITCH_FAILED_FILE="$OUT_DIR/airvpn-wg.switch-failed"   # last failed auto-switch
 
 CALLS_FILE=$(mktemp)
 echo 0 > "$CALLS_FILE"
@@ -121,6 +124,7 @@ REL_FILE=$(mktemp)
 HIST_DIR=$(mktemp -d)
 HIST_NOW=$(date +%s)
 trap 'rm -rf "$CALLS_FILE" "$PING_FILE" "$REL_FILE" "$HIST_DIR"' EXIT
+trap 'exit 1' TERM    # no_tty stops the whole script from inside $(...)
 
 # ── Saved settings ──────────────────────────────────────────────────────────
 # Everything the menus remember, with defaults. A key in the environment wins
@@ -200,10 +204,19 @@ if v is not None:
 result_of() { jget 'd.get("result")'; }
 
 # ── Prompts ─────────────────────────────────────────────────────────────────
-# ask <prompt> <default> — prints the answer (the default on Enter).
+# ask <prompt> <default> — prints the answer (the default on Enter). With no
+# terminal to read from (or end of input) it stops instead of taking defaults
+# forever, which could loop between menus.
+# Prompts run inside $(...), where die would only end the subshell, so this
+# signals the main script ($$ is its PID even in a subshell).
+no_tty() {
+    echo "❌ No terminal to ask on. Run airvpn-wg.sh interactively, or give --device and --server." >&2
+    kill -s TERM $$
+    exit 1
+}
 ask() {
     local a
-    read -rp "$1${2:+ [$2]}: " a </dev/tty
+    read -rp "$1${2:+ [$2]}: " a 2>/dev/null </dev/tty || no_tty
     printf '%s' "${a:-$2}"
 }
 # ask_or_back <prompt> <default> — like ask, but returns 1 (go back) for "b",
@@ -211,7 +224,7 @@ ask() {
 ask_or_back() {
     local a hint
     if [ -n "$2" ]; then hint=" (b = back)"; else hint=" (Enter = back)"; fi
-    read -rp "$1$hint${2:+ [$2]}: " a </dev/tty
+    read -rp "$1$hint${2:+ [$2]}: " a 2>/dev/null </dev/tty || no_tty
     case "$a" in b|B|back) return 1 ;; esac
     a=${a:-$2}
     [ -n "$a" ] || return 1
@@ -228,7 +241,7 @@ USERINFO=""
 ensure_key() {
     if [ -z "$AIRVPN_API_KEY" ]; then
         echo "Create an API key at https://airvpn.org/apisettings/ (and activate it)."
-        read -rsp "AirVPN API key: " AIRVPN_API_KEY </dev/tty; echo
+        read -rsp "AirVPN API key: " AIRVPN_API_KEY 2>/dev/null </dev/tty || no_tty; echo
     fi
     [ -n "$AIRVPN_API_KEY" ] || die "No API key."
     USERINFO=$(api userinfo)
@@ -319,6 +332,7 @@ pick_device() {
             echo "   n) Create a new device"
             local def=1
             [ -n "$DEVICE" ] && def=$(awk -F'\t' -v n="$DEVICE" '$1==n{print NR}' <<<"$rows")
+            [ "$i" -eq 0 ] && def=n    # no devices yet: create one
             while :; do
                 choice=$(ask "Device" "${def:-1}")
                 if [[ "$choice" =~ ^[Nn]$ ]]; then
@@ -597,7 +611,7 @@ shallow_top() {
     head -n "$DEEP_CHECKS" | awk -F'\t' '$13 == 0 && $8 != "unknown" { print $1 }'
 }
 rank_servers() {
-    local exclude=${1-} rows n round chunks=$(( (RELIABILITY_DAYS + 9) / 10 ))
+    local exclude=${1-} rows n chunks=$(( (RELIABILITY_DAYS + 9) / 10 ))
     PINGED=0
     rows=$(server_rows "$COUNTRIES" "$MIN_BW" "$exclude")
     [ -n "$rows" ] || { RANKED=""; return 1; }
@@ -607,7 +621,7 @@ rank_servers() {
     n=$(wc -l <<<"$rows"); [ "$n" -gt "$MAX_HISTORY_CHECKS" ] && n=$MAX_HISTORY_CHECKS
     echo "Reading 10 days of outage history for $n servers ($n API requests)..."
     fetch_history "$MAX_HISTORY_CHECKS" 1 <<<"$rows"
-    for round in $(seq 1 "$DEEP_ROUNDS"); do
+    for _ in $(seq 1 "$DEEP_ROUNDS"); do
         rows=$(server_rows "$COUNTRIES" "$MIN_BW" "$exclude")
         n=$(shallow_top <<<"$rows" | wc -l)
         [ "$n" -gt 0 ] || break
@@ -832,7 +846,7 @@ send_alert() {
 }
 
 configure_alerts() {
-    local c n flag
+    local c n
     echo
     echo "Alerts (Enter = keep the choice in brackets):"
     echo "  1) None (no alerts)"
@@ -847,7 +861,8 @@ configure_alerts() {
     while :; do
         case "$(ask "Channel" "$c")" in
             2) v1=$(ask_or_back "ntfy topic URL (e.g. https://ntfy.sh/my-airvpn-alerts)" "$NTFY_URL") || continue
-               v2=$(ask "ntfy access token (empty if none)" "$NTFY_TOKEN")
+               v2=$(ask "ntfy access token (Enter if none${NTFY_TOKEN:+, \"none\" to clear the saved one})" "$NTFY_TOKEN")
+               [ "$v2" = none ] && v2=""
                ALERT_CHANNEL=ntfy NTFY_URL=$v1 NTFY_TOKEN=$v2 ;;
             3) v1=$(ask_or_back "Discord webhook URL" "$DISCORD_WEBHOOK") || continue
                ALERT_CHANNEL=discord DISCORD_WEBHOOK=$v1 ;;
@@ -1065,6 +1080,12 @@ auto_switch() {
     local old=$SERVER next out
     STATUS=$1
     [ -n "$MIN_BW" ] || MIN_BW=$(largest_size)
+    # Cheap checks before the ranking, which costs up to ~100 requests.
+    [ -n "$AIRVPN_API_KEY" ] || { SWITCH_ERR="no API key saved in $ENV_FILE"; return 1; }
+    # Same device as now: its address is in the current wg0.conf, and
+    # generate checks the new config against it.
+    DEVICE_IP=$(sed -n 's/^Address *= *\([0-9.]*\).*/\1/p' "$OUTPUT" 2>/dev/null)
+    [ -n "$DEVICE_IP" ] || { SWITCH_ERR="cannot read the device address from $OUTPUT"; return 1; }
     # Same ranking as the menu (pings, outage history, reliability), read fresh.
     rank_servers "$old"
     next=$(head -n 1 <<<"$RANKED" | cut -f1)
@@ -1072,11 +1093,6 @@ auto_switch() {
         SWITCH_ERR="no healthy server with >= $MIN_BW Mbit/s in ${COUNTRIES:-any country}"
         return 1
     fi
-    [ -n "$AIRVPN_API_KEY" ] || { SWITCH_ERR="no API key saved in $ENV_FILE"; return 1; }
-    # Same device as now: its address is in the current wg0.conf, and
-    # generate checks the new config against it.
-    DEVICE_IP=$(sed -n 's/^Address *= *\([0-9.]*\).*/\1/p' "$OUTPUT" 2>/dev/null)
-    [ -n "$DEVICE_IP" ] || { SWITCH_ERR="cannot read the device address from $OUTPUT"; return 1; }
     case "$(head -n 1 <<<"$RANKED" | cut -f8)" in
         ok|new) ;;
         *) SWITCH_WARN="Its outage history could not be read, so its reliability is not verified." ;;
@@ -1133,8 +1149,14 @@ else:
     local down=0 msg
     { [ "$health" = error ] || [ "$health" = missing ]; } && down=1
     [ "$health" = missing ] && why="no longer listed by AirVPN"
-    if [ "$down" = 1 ] && [ "$AUTO_SWITCH" = 1 ]; then
+    # A failed switch (e.g. no matching server) is retried every 30 minutes,
+    # not on every 5-minute run: each attempt reads the history again.
+    if [ "$down" = 1 ] && [ "$AUTO_SWITCH" = 1 ] && [ -n "$(find "$SWITCH_FAILED_FILE" -mmin -30 2>/dev/null)" ]; then
+        echo "    auto-switch failed less than 30 minutes ago ($(cat "$SWITCH_FAILED_FILE" 2>/dev/null)); retrying later"
+        conds+=("noswitch|AirVPN auto-switch failed|Could not switch away from $label: $(cat "$SWITCH_FAILED_FILE" 2>/dev/null)")
+    elif [ "$down" = 1 ] && [ "$AUTO_SWITCH" = 1 ]; then
         if auto_switch "$status"; then
+            rm -f "$SWITCH_FAILED_FILE"
             # The old server's alerts no longer apply: forget them without
             # "all clear" messages and report the switch instead.
             rm -f "$STATE_FILE"
@@ -1145,8 +1167,10 @@ else:
             echo "    switched from $label to $SWITCH_TO"
             return 0
         fi
+        printf '%s\n' "$SWITCH_ERR" > "$SWITCH_FAILED_FILE"
         conds+=("noswitch|AirVPN auto-switch failed|Could not switch away from $label: $SWITCH_ERR")
     fi
+    [ "$down" = 0 ] && rm -f "$SWITCH_FAILED_FILE"
     if [ "$EVENT_SERVER_DOWN" = 1 ] && [ "$down" = 1 ]; then
         conds+=("down|AirVPN $label is down|$label is down: ${why:-health error}. Run airvpn-wg.sh to pick another server.")
     elif [ "$EVENT_SERVER_WARNING" = 1 ] && [ "$health" = warning ]; then
@@ -1182,7 +1206,7 @@ else:
         if grep -q "^$key|" <<<"$prev"; then
             active+=("$key|$title")
         elif send_alert "$title" "${line#*|*|}"; then
-            echo "    alert sent: $title"
+            if [ "$ALERT_CHANNEL" = none ]; then echo "    $title"; else echo "    alert sent: $title"; fi
             active+=("$key|$title")
         fi
     done
@@ -1190,7 +1214,7 @@ else:
         [ -n "$key" ] || continue
         printf '%s\n' "${conds[@]}" | grep -q "^$key|" && continue
         if [ "$EVENT_RECOVERY" = 1 ]; then
-            send_alert "All clear: $title" "Resolved: $title" && echo "    all clear sent: $title"
+            send_alert "All clear: $title" "Resolved: $title" && [ "$ALERT_CHANNEL" != none ] && echo "    all clear sent: $title"
         fi
     done <<<"$prev"
     if [ ${#active[@]} -gt 0 ]; then printf '%s\n' "${active[@]}" > "$STATE_FILE"; else rm -f "$STATE_FILE"; fi

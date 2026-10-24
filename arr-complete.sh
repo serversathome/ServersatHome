@@ -13,7 +13,8 @@
 #      other by name across stacks.
 #   3. If you choose to launch: gets qBittorrent's WireGuard config (paste a
 #      wg0.conf, or generate one from AirVPN with airvpn-wg.sh, which can also
-#      set up alerts and automatic server switching), then launches every
+#      set up alerts and automatic server switching) and asks for a forwarded
+#      port if your VPN gave you one, then launches every
 #      stack (including Dockge) and configures every app
 #      through its API in the order from wiki.serversatho.me/en/InstallInstructions:
 #
@@ -1006,6 +1007,7 @@ paste_wg() {
     local conf
     echo "Paste your WireGuard configuration below using SHIFT+INS (press ENTER then Ctrl+D when done):"
     conf=$(cat)
+    conf=${conf//$'\r'/}    # a config copied from Windows keeps CRLF line ends
     if [ -z "${conf//[[:space:]]/}" ]; then
         todo "No WireGuard configuration entered. qBittorrent will not start until $WG_FILE exists."
         return
@@ -1019,8 +1021,8 @@ paste_wg() {
 }
 
 # fetch_airvpn_wg — put the latest airvpn-wg.sh in the wireguard folder: the
-# repo's, else (offline) the copy next to this script, else keep the one
-# already there. Its monitor cron job runs that copy, so re-runs refresh it.
+# repo's, else (offline) keep the one already there, else the copy next to
+# this script. Its monitor cron job runs that copy, so re-runs refresh it.
 # Prints what happened; returns 1 if there is no copy at all.
 fetch_airvpn_wg() {
     local local_copy
@@ -1034,11 +1036,13 @@ fetch_airvpn_wg() {
         fi
     else
         rm -f "$AIRVPN_WG.tmp"
-        if [ -f "$local_copy" ] && [ "$local_copy" != "$AIRVPN_WG" ]; then
+        # Offline: keep a working installed copy rather than swap in whatever
+        # sits next to this script, which may be older.
+        if [ -f "$AIRVPN_WG" ]; then
+            warn "Could not download the latest airvpn-wg.sh; keeping the copy in $QBITTORRENT_WIREGUARD_DIR."
+        elif [ -f "$local_copy" ]; then
             warn "Could not download the latest airvpn-wg.sh; using the copy next to arr-complete.sh."
             cp "$local_copy" "$AIRVPN_WG"
-        elif [ -f "$AIRVPN_WG" ]; then
-            warn "Could not download the latest airvpn-wg.sh; keeping the copy in $QBITTORRENT_WIREGUARD_DIR."
         else
             return 1
         fi
