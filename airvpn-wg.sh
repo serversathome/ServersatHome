@@ -48,7 +48,9 @@ MAX_CALLS=160                # hard cap per run, far below AirVPN's ban limit
 MAX_HISTORY_CHECKS=40        # servers whose last 10 days of history are read (1 request each)
 DEEP_CHECKS=5                # top servers whose full RELIABILITY_DAYS are read
 RELIABILITY_DAYS=90          # 10 days per request, so 8 more requests per deep server
-OUTAGE_PENALTY=10            # balanced sort: 1 outage per 30 days counts like 10% load
+OUTAGE_PENALTY=10            # balanced sort: 1 (weighted) outage per 30 days counts like 10% load
+SHORT_OUTAGE_WEIGHT=0.2      # a short outage (under ~20 min) counts as this much of one
+LONG_OUTAGE_HOURLY=0.5       # a long outage (30+ min) counts 1, plus this per hour beyond the first
 WG_PORTS="1637 47107 51820"  # AirVPN's WireGuard ports (UDP)
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
@@ -321,15 +323,17 @@ SERVER_LABEL=""
 #   7 ping ms ("-" not measured or no answer)
 #   8 history: ok | new (server younger than the history read) | unknown
 #     (could not read it) | nc (not checked)
-#   9 outages  10 days of history  11 outages per 30 days  12 deep (1 = full
-#     RELIABILITY_DAYS read)  13 entry IP
+#   9 long outages  10 short outages  11 days of history
+#   12 weighted outages per 30 days  13 deep (1 = full RELIABILITY_DAYS read)
+#   14 entry IP
 # Pings come from $PING_FILE (measure_pings), history from $REL_FILE
 # (fetch_history).
 # Ranked load: AirVPN drops a server's users during an outage, so for a few
 # hours afterwards its load is misleadingly low. For a server with an outage
 # in the last 6 hours whose users are still below 90% of its usual sessions,
 # the load is scaled up to what it will be with those sessions back.
-# Balanced = ping ms + ranked load % + OUTAGE_PENALTY per outage per 30 days;
+# Balanced = ping ms + ranked load % + OUTAGE_PENALTY per weighted outage per
+# 30 days (see analyze_history);
 # a server whose history is unknown or unchecked counts as 3 outages per 30
 # days, so it is never ranked as reliable. History shorter than 10 days
 # counts as 10 days, so one outage on a brand-new server is not a 15/month
@@ -352,8 +356,8 @@ for line in open(os.environ["PINGS"]):
 rel = {}
 for line in open(os.environ["REL"]):
     f = line.rstrip("\n").split("\t")
-    if len(f) == 8:
-        rel[f[0]] = f[1:]   # status outages days rate30 normal last_min deep
+    if len(f) == 9:
+        rel[f[0]] = f[1:]   # status long short days rate30 normal last_min deep
 rows = [s for s in d["servers"] if s.get("health") == "ok" and s.get("bw_max", 0) >= minbw
         and (not cc or s["country_code"] in cc) and s["public_name"] != os.environ["EXCLUDE"]]
 per_user = [s["currentload"] / s["users"] for s in rows if s.get("users", 0) >= 50]
@@ -361,16 +365,16 @@ fleet_ratio = statistics.median(per_user) if per_user else None
 def ranked_load(s):
     load, users = s["currentload"], s.get("users", 0)
     r = rel.get(s["public_name"])
-    if not r or r[0] not in ("ok", "new") or not r[5].isdigit() or int(r[5]) > 360:
+    if not r or r[0] not in ("ok", "new") or not r[6].isdigit() or int(r[6]) > 360:
         return load
-    normal = int(r[4])
+    normal = int(r[5])
     if normal < 20 or users >= 0.9 * normal:
         return load
     ratio = load / users if users >= 10 else fleet_ratio
     return load if ratio is None else min(100, max(load, round(normal * ratio)))
 def rate(s):
     r = rel.get(s["public_name"])
-    return float(r[3]) if r and r[0] in ("ok", "new") else 3.0
+    return float(r[4]) if r and r[0] in ("ok", "new") else 3.0
 ping = lambda s: pings.get(s["public_name"], 9999)
 key = {"load":     lambda s: (ranked_load(s), -s["bw_max"]),
        "free":     lambda s: (-s["bw_max"] * (100 - ranked_load(s)), ranked_load(s)),
@@ -381,7 +385,7 @@ for s in sorted(rows, key=key):
     n = s["public_name"]
     p = pings.get(n)
     r = rel.get(n)
-    hist = [r[0], r[1], r[2], r[3], r[6]] if r else ["nc", "0", "0", "-", "0"]
+    hist = [r[0], r[1], r[2], r[3], r[4], r[7]] if r else ["nc", "0", "0", "0", "-", "0"]
     print("\t".join([n, s["country_code"], s.get("location") or "-", str(s["currentload"]),
                      str(ranked_load(s)), str(s.get("users", 0)),
                      "%.0f" % p if p is not None else "-"] + hist + [s.get("ip_v4_in1") or "-"]))' <<<"$STATUS"
@@ -416,18 +420,25 @@ fetch_history() {
 }
 
 # analyze_history — turns the session histories in $HIST_DIR into $REL_FILE,
-# TSV: name, status (ok/new/unknown), outages, days of history, outages per
-# 30 days, usual sessions, minutes since the last outage ("none"), deep (1/0).
+# TSV: name, status (ok/new/unknown), long outages, short outages, days of
+# history, weighted outages per 30 days, usual sessions, minutes since the
+# last outage ("none"), deep (1/0).
 # An outage shows as missing 15-minute points and/or sessions under 25% of
 # the median of the previous 4 hours (only tested above 20 sessions); points
 # less than 2 hours apart are one outage. A gap shared by 80%+ of the servers
 # covering that moment is AirVPN's statistics, not an outage. (The packet
 # loss series is no use: its averages read 0 straight through an outage.)
+# Length: 2+ missing points in a row (no data for ~30 min or more) is a long
+# outage, weighted 1 + LONG_OUTAGE_HOURLY per hour beyond the first; at most
+# one missing point (an 11-minute outage showed as exactly one) or just a dip
+# in sessions is short, weighted SHORT_OUTAGE_WEIGHT. Accurate to about the
+# 15-minute step.
 analyze_history() {
     python3 -c '
 import glob, json, os, statistics, sys
 from collections import Counter, defaultdict
 hist_dir, now = sys.argv[1], int(sys.argv[2]) * 1000
+short_w, hourly_w = float(sys.argv[3]), float(sys.argv[4])
 STEP, HOUR, DAY = 900000, 3600000, 86400000
 files = defaultdict(dict)
 for f in glob.glob(os.path.join(hist_dir, "*.json")):
@@ -465,7 +476,7 @@ shared = Counter(t for m in missing.values() for t in m)
 statgap = {t for t, c in shared.items() if cover[t] >= 3 and c >= 0.8 * cover[t]}
 for name in sorted(files):
     if name not in series:
-        print("\t".join([name, "unknown", "0", "0", "-", "0", "none", "0"]))
+        print("\t".join([name, "unknown", "0", "0", "0", "-", "0", "none", "0"]))
         continue
     pts = series[name]
     flagged = {t for t in missing[name] if t not in statgap}
@@ -476,19 +487,36 @@ for name in sorted(files):
             med = statistics.median(prev)
             if med >= 20 and v < 0.25 * med:
                 flagged.add(t)
-    events, last = [], None
+    groups, last = [], None
     for t in sorted(flagged):
         if last is None or t - last > 2 * HOUR:
-            events.append(t)
+            groups.append([])
+        groups[-1].append(t)
         last = t
+    events = [g[0] for g in groups]
+    gaps = missing[name] - statgap
+    n_long = n_short = 0
+    weight = 0.0
+    for g in groups:
+        run = best = 0
+        for t in g:
+            if t in gaps:
+                run = run + 1 if t - STEP in gaps else 1
+                best = max(best, run)
+        if best >= 2:
+            n_long += 1
+            weight += 1 + hourly_w * max(0.0, best * STEP / HOUR - 1)
+        else:
+            n_short += 1
+            weight += short_w
     days = max(0.0, (now - pts[0][0]) / DAY)
-    rate30 = len(events) / max(days, 10.0) * 30
+    rate30 = weight / max(days, 10.0) * 30
     recent = [v for t, v in pts if t >= now - 3 * DAY and not any(0 <= t - e <= 3 * HOUR for e in events)]
     normal = statistics.median(recent or vals)
     status = "unknown" if name in failed else ("new" if pts[0][0] > start[name] + DAY else "ok")
-    print("\t".join([name, status, str(len(events)), str(int(round(days))), "%.2f" % rate30,
+    print("\t".join([name, status, str(n_long), str(n_short), str(int(round(days))), "%.2f" % rate30,
                      str(int(normal)), str(int((now - last) / 60000)) if last else "none",
-                     "1" if len(files[name]) > 1 else "0"]))' "$HIST_DIR" "$HIST_NOW" > "$REL_FILE"
+                     "1" if len(files[name]) > 1 else "0"]))' "$HIST_DIR" "$HIST_NOW" "$SHORT_OUTAGE_WEIGHT" "$LONG_OUTAGE_HOURLY" > "$REL_FILE"
 }
 
 # rank_servers [exclude] — sets RANKED to server_rows output for the saved
@@ -512,7 +540,7 @@ rank_servers() {
     fetch_history "$MAX_HISTORY_CHECKS" 1 <<<"$rows"
     for round in 1 2; do
         rows=$(server_rows "$COUNTRIES" "$MIN_BW" "$SORT" "$exclude")
-        n=$(head -n "$DEEP_CHECKS" <<<"$rows" | awk -F'\t' '$12 == 0 && $8 != "unknown"' | wc -l)
+        n=$(head -n "$DEEP_CHECKS" <<<"$rows" | awk -F'\t' '$13 == 0 && $8 != "unknown"' | wc -l)
         [ "$n" -gt 0 ] || break
         echo "Reading $RELIABILITY_DAYS days of history for $n of the top $DEEP_CHECKS ($(( n * (chunks - 1) )) API requests)..."
         fetch_history "$DEEP_CHECKS" "$chunks" <<<"$rows"
@@ -529,7 +557,7 @@ measure_pings() {
         warn "ping is not installed, so ping is left out of the ranking."
         return 1
     fi
-    cut -f1,13 | awk -F'\t' '$2 != "-"' | tr '\t' ' ' \
+    cut -f1,14 | awk -F'\t' '$2 != "-"' | tr '\t' ' ' \
         | xargs -P 32 -L 1 sh -c 'ms=$(ping -c 3 -W 1 -q "$2" 2>/dev/null | sed -n "s#.*= *[0-9.]*/\([0-9.]*\)/.*#\1#p"); printf "%s\t%s\n" "$1" "$ms"' _ \
         >> "$PING_FILE"
 }
@@ -606,7 +634,7 @@ pick_server() {
     printf '  %s\n' "Outages"
     i=0
     local adjusted=0 unknown=0
-    while IFS=$'\t' read -r name cc loc load rload users ms hist outs days _ _ _; do
+    while IFS=$'\t' read -r name cc loc load rload users ms hist long short days _ _ _; do
         i=$(( i + 1 ))
         if [ "$rload" != "$load" ]; then load="~$rload"; adjusted=1; fi
         printf '  %3d) %-14s %-3s %-22.22s %4s%% %6s' "$i" "$name" "$cc" "$loc" "$load" "$users"
@@ -614,8 +642,8 @@ pick_server() {
             if [ "$ms" = - ]; then printf ' %6s' "-"; else printf ' %4sms' "$ms"; fi
         fi
         case "$hist" in
-            ok)      printf '  %s in %sd' "$outs" "$days" ;;
-            new)     if [ "$days" -lt 10 ]; then printf '  %s in %sd (new server)' "$outs" "$days"; else printf '  %s in %sd' "$outs" "$days"; fi ;;
+            ok|new)  printf '  %s long, %s short in %sd' "$long" "$short" "$days"
+                     [ "$hist" = new ] && [ "$days" -lt 10 ] && printf ' (new server)' ;;
             unknown) printf '  unknown'; unknown=$(( unknown + 1 )) ;;
             *)       printf '  not checked' ;;
         esac
@@ -625,6 +653,7 @@ pick_server() {
     [ "$PINGED" = 1 ] && awk -F'\t' '$7 == "-" { f = 1 } END { exit !f }' <<<"$rows" && echo "Ping \"-\" = no answer."
     [ "$adjusted" = 1 ] && echo "~ = load once its users are back: it had an outage in the last few hours, so its current load is misleadingly low."
     echo "Outages: from AirVPN's session history, $RELIABILITY_DAYS days for the top $DEEP_CHECKS and 10 days for the others."
+    echo "  long = down ~30 min or more (counts fully, more if it lasted hours); short = under ~20 min (counts $SHORT_OUTAGE_WEIGHT)."
     [ "$unknown" -gt 0 ] && warn "Could not read the outage history of $unknown server(s); they are ranked as unreliable. If every server shows unknown, AirVPN's server API may have changed."
     while true; do
         choice=$(ask "Server number (1-$i)" 1)
