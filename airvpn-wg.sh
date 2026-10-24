@@ -11,12 +11,11 @@
 #   2. Server: filter by your preferred countries and a minimum server
 #      bandwidth (read from AirVPN's live list: currently 2000, 6000 or
 #      20000 Mbit/s; the default is the largest size on offer), healthy
-#      servers only. Default sort "balanced": measured ping + load +
-#      reliability (outages counted from AirVPN's session history, 90 days
-#      for the top 5, 10 days for the rest). A server refilling after a
-#      recent outage is ranked on its load once users are back, not on its
-#      misleadingly low current load. Load, bandwidth, users or ping alone
-#      are also available.
+#      servers only, ranked on measured ping + load + reliability (outages
+#      counted from AirVPN's session history, 90 days for the top 5, 10 days
+#      for the rest). A server refilling after a recent outage is ranked on
+#      its load once users are back, not on its misleadingly low current
+#      load. The list shows every figure, so any server can still be picked.
 #   3. Generate: writes wg0.conf, backs up the previous one, and checks the
 #      config really belongs to the chosen device.
 #   4. Alerts (optional): pick a channel (ntfy, Discord, Gotify, Telegram)
@@ -36,8 +35,9 @@
 # uses 1 to 3, and the same as the menu when it auto-switches. Nothing is
 # cached between runs: the history is read fresh each time.
 #
-# Run in the TrueNAS shell as root:
-#   sudo su -c "wget https://raw.githubusercontent.com/serversathome/ServersatHome/refs/heads/main/airvpn-wg.sh && chmod +x airvpn-wg.sh && bash airvpn-wg.sh"
+# Run in the TrueNAS shell as root, from a folder on a data pool (a reinstall
+# wipes the boot pool, so keep the script and wg0.conf under /mnt/<pool>):
+#   sudo su -c "wget https://raw.githubusercontent.com/serversathome/ServersatHome/refs/heads/main/airvpn-wg.sh && chmod +x airvpn-wg.sh && bash airvpn-wg.sh --output /mnt/<pool>/configs/qbittorrent/wireguard/wg0.conf"
 #
 # Usage: see "airvpn-wg.sh --help".
 # ============================================================================
@@ -49,7 +49,7 @@ MAX_CALLS=160                # hard cap per run, far below AirVPN's ban limit
 MAX_HISTORY_CHECKS=40        # servers whose last 10 days of history are read (1 request each)
 DEEP_CHECKS=5                # top servers whose full RELIABILITY_DAYS are read
 RELIABILITY_DAYS=90          # 10 days per request, so 8 more requests per deep server
-OUTAGE_PENALTY=20            # balanced sort: 1 (weighted) outage per 30 days counts like 20% load
+OUTAGE_PENALTY=20            # ranking: 1 (weighted) outage per 30 days counts like 20% load
 SHORT_OUTAGE_WEIGHT=0.2      # a short outage (under ~20 min) counts as this much of one
 LONG_OUTAGE_HOURLY=0.5       # a long outage (30+ min) counts 1, plus this per hour beyond the first
 WG_PORTS="1637 47107 51820"  # AirVPN's WireGuard ports (UDP)
@@ -119,21 +119,31 @@ HIST_DIR=$(mktemp -d)
 HIST_NOW=$(date +%s)
 trap 'rm -rf "$CALLS_FILE" "$PING_FILE" "$REL_FILE" "$HIST_DIR"' EXIT
 
+# ── TrueNAS: keep files on a data pool ─────────────────────────────────────
+# A TrueNAS reinstall wipes the boot pool (/home, /root, ...); only data pools
+# under /mnt survive. warn_boot_pool <path> <what> warns when <path> is not
+# on one, since the settings, the key and the cron job's script would be lost.
+SELF=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
+warn_boot_pool() {
+    command -v midclt >/dev/null || return 0      # not TrueNAS
+    case "$1" in /mnt/*) return 0 ;; esac
+    warn "$2: $1 is on the TrueNAS boot pool, which a reinstall wipes. Use a data pool instead, e.g. /mnt/<pool>/configs/qbittorrent/wireguard/."
+}
+
 # ── Saved settings ──────────────────────────────────────────────────────────
 # Everything the menus remember, with defaults. A key in the environment wins
 # over the saved one.
 ENV_KEY=${AIRVPN_API_KEY:-}
 AIRVPN_API_KEY=""
 DEVICE=""; SERVER=""; WG_PORT=1637
-COUNTRIES=""; MIN_BW=""; SORT=balanced   # MIN_BW "" = largest size AirVPN has
+COUNTRIES=""; MIN_BW=""   # MIN_BW "" = largest size AirVPN has
 ALERT_CHANNEL=none
 NTFY_URL=""; NTFY_TOKEN=""; DISCORD_WEBHOOK=""
 GOTIFY_URL=""; GOTIFY_TOKEN=""; TELEGRAM_TOKEN=""; TELEGRAM_CHAT_ID=""
 EVENT_SERVER_DOWN=1; EVENT_SERVER_WARNING=1; EVENT_SERVER_LOAD=0; LOAD_THRESHOLD=90
 EVENT_DEVICE_OFFLINE=0; EVENT_EXPIRY=1; EXPIRY_DAYS=7; EVENT_RECOVERY=1
 AUTO_SWITCH=0; RESTART_CONTAINER=qbittorrent
-SAVE_KEY=1
-SETTINGS="AIRVPN_API_KEY DEVICE SERVER WG_PORT COUNTRIES MIN_BW SORT
+SETTINGS="AIRVPN_API_KEY DEVICE SERVER WG_PORT COUNTRIES MIN_BW
 ALERT_CHANNEL NTFY_URL NTFY_TOKEN DISCORD_WEBHOOK GOTIFY_URL GOTIFY_TOKEN
 TELEGRAM_TOKEN TELEGRAM_CHAT_ID EVENT_SERVER_DOWN EVENT_SERVER_WARNING
 EVENT_SERVER_LOAD LOAD_THRESHOLD EVENT_DEVICE_OFFLINE EVENT_EXPIRY EXPIRY_DAYS
@@ -149,7 +159,8 @@ save_settings() {
     {
         echo "# airvpn-wg.sh settings, written $(date '+%Y-%m-%d %H:%M'). Contains secrets."
         for v in $SETTINGS; do
-            if [ "$v" = AIRVPN_API_KEY ] && [ "$SAVE_KEY" != 1 ]; then echo "AIRVPN_API_KEY=''"; continue; fi
+            # The key is only kept when the monitor needs it (see key_reasons).
+            if [ "$v" = AIRVPN_API_KEY ] && [ -z "$(key_reasons)" ]; then echo "AIRVPN_API_KEY=''"; continue; fi
             printf '%s=%q\n' "$v" "${!v}"
         done
     } > "$tmp"
@@ -317,8 +328,8 @@ pick_device() {
 STATUS=""
 SERVER_LABEL=""
 
-# server_rows <countries> <min_bw> <sort> [exclude] — healthy servers, best
-# first, TSV (every field non-empty: read merges runs of tabs):
+# server_rows <countries> <min_bw> [exclude] — healthy servers, best first
+# (lowest score, below), TSV (every field non-empty: read merges runs of tabs):
 #   1 name  2 cc  3 location  4 load %  5 ranked load %  6 users
 #   7 ping ms ("-" not measured or no answer)
 #   8 history: ok | new (server younger than the history read) | unknown
@@ -332,14 +343,15 @@ SERVER_LABEL=""
 # hours afterwards its load is misleadingly low. For a server with an outage
 # in the last 6 hours whose users are still below 90% of its usual sessions,
 # the load is scaled up to what it will be with those sessions back.
-# Balanced = ping ms + ranked load % + OUTAGE_PENALTY per weighted outage per
-# 30 days (see analyze_history);
+# Score = ping ms + ranked load % + OUTAGE_PENALTY per weighted outage per
+# 30 days (see analyze_history); without ping every server gets the same
+# ping, so load and reliability decide;
 # a server whose history is unknown or unchecked counts as 3 outages per 30
 # days, so it is never ranked as reliable. History shorter than 10 days
 # counts as 10 days, so one outage on a brand-new server is not a 15/month
 # rate.
 server_rows() {
-    CC="$1" MINBW="$2" SORTBY="$3" EXCLUDE="${4-}" PINGS="$PING_FILE" REL="$REL_FILE" \
+    CC="$1" MINBW="$2" EXCLUDE="${3-}" PINGS="$PING_FILE" REL="$REL_FILE" \
     PENALTY="$OUTAGE_PENALTY" python3 -c '
 import json, os, statistics, sys
 d = json.load(sys.stdin)
@@ -376,11 +388,7 @@ def rate(s):
     r = rel.get(s["public_name"])
     return float(r[4]) if r and r[0] in ("ok", "new") else 3.0
 ping = lambda s: pings.get(s["public_name"], 9999)
-key = {"load":     lambda s: (ranked_load(s), -s["bw_max"]),
-       "free":     lambda s: (-s["bw_max"] * (100 - ranked_load(s)), ranked_load(s)),
-       "users":    lambda s: (s.get("users", 0), ranked_load(s)),
-       "ping":     lambda s: (ping(s), ranked_load(s)),
-       "balanced": lambda s: (ping(s) + ranked_load(s) + penalty * rate(s), ping(s))}[os.environ["SORTBY"]]
+key = lambda s: (ping(s) + ranked_load(s) + penalty * rate(s), ping(s))
 for s in sorted(rows, key=key):
     n = s["public_name"]
     p = pings.get(n)
@@ -520,7 +528,7 @@ for name in sorted(files):
 }
 
 # rank_servers [exclude] — sets RANKED to server_rows output for the saved
-# filters, best first, reading everything fresh: pings (ping/balanced), 10
+# filters, best first, reading everything fresh: pings, 10
 # days of history for up to MAX_HISTORY_CHECKS servers, then RELIABILITY_DAYS
 # for the top DEEP_CHECKS (twice, in case the deep history reshuffles the
 # top). Sets PINGED=1 when pings were measured; returns 1 if nothing matches.
@@ -528,24 +536,22 @@ RANKED=""; PINGED=0
 rank_servers() {
     local exclude=${1-} rows n round chunks=$(( (RELIABILITY_DAYS + 9) / 10 ))
     PINGED=0
-    rows=$(server_rows "$COUNTRIES" "$MIN_BW" load "$exclude")
+    rows=$(server_rows "$COUNTRIES" "$MIN_BW" "$exclude")
     [ -n "$rows" ] || { RANKED=""; return 1; }
-    if [ "$SORT" = ping ] || [ "$SORT" = balanced ]; then
-        echo "Pinging $(wc -l <<<"$rows") servers..."
-        if measure_pings <<<"$rows"; then PINGED=1; elif [ "$SORT" = ping ]; then SORT=load; fi
-    fi
-    rows=$(server_rows "$COUNTRIES" "$MIN_BW" "$SORT" "$exclude")
+    echo "Pinging $(wc -l <<<"$rows") servers..."
+    measure_pings <<<"$rows" && PINGED=1
+    rows=$(server_rows "$COUNTRIES" "$MIN_BW" "$exclude")
     n=$(wc -l <<<"$rows"); [ "$n" -gt "$MAX_HISTORY_CHECKS" ] && n=$MAX_HISTORY_CHECKS
     echo "Reading 10 days of outage history for $n servers ($n API requests)..."
     fetch_history "$MAX_HISTORY_CHECKS" 1 <<<"$rows"
     for round in 1 2; do
-        rows=$(server_rows "$COUNTRIES" "$MIN_BW" "$SORT" "$exclude")
+        rows=$(server_rows "$COUNTRIES" "$MIN_BW" "$exclude")
         n=$(head -n "$DEEP_CHECKS" <<<"$rows" | awk -F'\t' '$13 == 0 && $8 != "unknown"' | wc -l)
         [ "$n" -gt 0 ] || break
         echo "Reading $RELIABILITY_DAYS days of history for $n of the top $DEEP_CHECKS ($(( n * (chunks - 1) )) API requests)..."
         fetch_history "$DEEP_CHECKS" "$chunks" <<<"$rows"
     done
-    RANKED=$(server_rows "$COUNTRIES" "$MIN_BW" "$SORT" "$exclude")
+    RANKED=$(server_rows "$COUNTRIES" "$MIN_BW" "$exclude")
 }
 
 # measure_pings — reads server_rows output on stdin, pings every server's
@@ -581,7 +587,7 @@ for c in sorted(d["countries"], key=lambda c: c["country_name"]):
 }
 
 pick_server() {
-    local match rows i choice line sort_choice
+    local match rows i choice line
     STATUS=$(api status)
     [ "$(result_of <<<"$STATUS")" = ok ] || die "Could not read AirVPN server status."
 
@@ -643,21 +649,10 @@ pick_server() {
     done
 
     echo
-    echo "Sort by:"
-    echo "  1) lowest load"
-    echo "  2) most free bandwidth"
-    echo "  3) fewest users"
-    echo "  4) lowest ping from this machine"
-    echo "  5) balanced (recommended): ping + load + reliability"
-    echo "     1 ms of ping = 1% load = 1/$OUTAGE_PENALTY of an outage per month"
-    case "$SORT" in load) sort_choice=1 ;; free) sort_choice=2 ;; users) sort_choice=3 ;; ping) sort_choice=4 ;; *) sort_choice=5 ;; esac
-    case "$(ask "Sort" "$sort_choice")" in
-        1) SORT=load ;; 2) SORT=free ;; 3) SORT=users ;; 4) SORT=ping ;; *) SORT=balanced ;;
-    esac
-
     rank_servers || die "No healthy server matches those filters. Lower the bandwidth or add countries."
     rows=$RANKED
     echo
+    echo "Ranked best first on ping + load + reliability (1 ms of ping = 1% load = 1/$OUTAGE_PENALTY of an outage per month):"
     printf '  %3s  %-14s %-3s %-22s %5s %6s' "#" "Server" "CC" "Location" "Load" "Users"
     [ "$PINGED" = 1 ] && printf ' %6s' "Ping"
     printf '  %s\n' "Outages"
@@ -807,10 +802,6 @@ configure_alerts() {
             *) echo "Pick 1-6." ;;
         esac
     done
-    if needs_key_for_monitor && [ "$SAVE_KEY" != 1 ]; then
-        warn "The selected events need the API key, so it will be saved in $ENV_FILE."
-        SAVE_KEY=1
-    fi
     if yesno "Send a test alert now?" y; then
         send_alert "AirVPN monitor test" "Test from airvpn-wg.sh on $(hostname): alerts for $DEVICE work." \
             && ok "Test alert sent via $ALERT_CHANNEL"
@@ -819,25 +810,45 @@ configure_alerts() {
 
 mark() { [ "$1" = 1 ] && echo x || echo " "; }
 
-needs_key_for_monitor() {
-    [ "$EVENT_DEVICE_OFFLINE" = 1 ] || [ "$EVENT_EXPIRY" = 1 ]
+# key_reasons — what the cron monitor needs the API key for, comma separated;
+# empty when nothing does (alerts off or only server events, no auto-switch),
+# in which case the key is not saved.
+key_reasons() {
+    local r=()
+    [ "$AUTO_SWITCH" = 1 ] && r+=("auto-switch")
+    if [ "$ALERT_CHANNEL" != none ]; then
+        [ "$EVENT_DEVICE_OFFLINE" = 1 ] && r+=("device offline alerts")
+        [ "$EVENT_EXPIRY" = 1 ] && r+=("expiry alerts")
+    fi
+    local IFS=,
+    echo "${r[*]}" | sed 's/,/, /g'
+}
+
+# save_monitor_settings — after the alert/auto-switch questions: make sure a
+# key is at hand if the monitor needs one, save, and say what was kept.
+save_monitor_settings() {
+    local why
+    why=$(key_reasons)
+    [ -n "$why" ] && [ -z "$AIRVPN_API_KEY" ] && ensure_key
+    save_settings
+    if [ -n "$why" ]; then
+        ok "Settings and API key saved in $ENV_FILE (root only); the monitor needs the key for $why."
+    else
+        ok "Settings saved in $ENV_FILE (no API key: alerts and auto-switch don't need it)."
+    fi
 }
 
 configure_autoswitch() {
     echo
     echo "Auto-switch: when $SERVER goes down, the monitor rewrites wg0.conf for the next"
-    echo "healthy server matching your filters (${COUNTRIES:-all countries}, >= ${MIN_BW:-the largest size} Mbit/s,"
-    echo "sorted by $SORT) and restarts the container that uses it."
+    echo "best healthy server matching your filters (${COUNTRIES:-all countries}, >= ${MIN_BW:-the largest size} Mbit/s;"
+    echo "ping + load + reliability, as in the list) and restarts the container that uses it."
     if yesno "Enable auto-switch?" "$([ "$AUTO_SWITCH" = 1 ] && echo y || echo n)"; then
         AUTO_SWITCH=1
         RESTART_CONTAINER=$(ask "Container to restart after a switch (\"none\" = don't restart)" "${RESTART_CONTAINER:-none}")
         [ "$RESTART_CONTAINER" = none ] && RESTART_CONTAINER=""
         if [ -n "$RESTART_CONTAINER" ] && command -v docker >/dev/null && ! docker inspect "$RESTART_CONTAINER" >/dev/null 2>&1; then
             warn "No container named $RESTART_CONTAINER right now; a switch will still rewrite wg0.conf."
-        fi
-        if [ "$SAVE_KEY" != 1 ]; then
-            warn "Auto-switch needs the API key, so it will be saved in $ENV_FILE."
-            SAVE_KEY=1
         fi
         ok "Auto-switch on${RESTART_CONTAINER:+, restarts $RESTART_CONTAINER}"
     else
@@ -847,8 +858,8 @@ configure_autoswitch() {
 
 print_cron() {
     [ "$ALERT_CHANNEL" = none ] && [ "$AUTO_SWITCH" != 1 ] && return 0
-    local self
-    self=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
+    local self=$SELF
+    warn_boot_pool "$self" "The script the cron job runs"
     echo
     echo "For alerts and auto-switch, run the monitor every 5 minutes (1-3 API requests per run,"
     echo "plus up to about $(( MAX_HISTORY_CHECKS + DEEP_CHECKS * 8 )) when it switches servers)."
@@ -1008,9 +1019,10 @@ case "$CMD" in
         send_alert "AirVPN monitor test" "Test from airvpn-wg.sh on $(hostname)." && ok "Test alert sent via $ALERT_CHANNEL" ;;
     alerts)
         [ -f "$ENV_FILE" ] || die "No $ENV_FILE. Run setup first."
-        configure_alerts; configure_autoswitch; save_settings; ok "Saved $ENV_FILE"; print_cron ;;
+        configure_alerts; configure_autoswitch; save_monitor_settings; print_cron ;;
     setup)
         info "AirVPN WireGuard config for $OUTPUT"
+        warn_boot_pool "$OUT_DIR" "wg0.conf and its settings (airvpn-wg.env)"
         ensure_key
         pick_device
         pick_server
@@ -1018,14 +1030,12 @@ case "$CMD" in
         if [ -n "$ARG_DEVICE" ] && [ -n "$ARG_SERVER" ]; then
             save_settings
         else
-            if [ -z "$ENV_KEY" ]; then
-                yesno "Save the API key in $ENV_FILE (root only)? Needed for the monitor's device/expiry events and auto-switch" y \
-                    && SAVE_KEY=1 || SAVE_KEY=0
-            fi
+            echo
+            echo "Optional: a monitor (run from cron) can alert you about problems and switch"
+            echo "servers automatically when this one goes down."
             yesno "Set up alerts?" "$([ "$ALERT_CHANNEL" = none ] && echo n || echo y)" && configure_alerts
             configure_autoswitch
-            save_settings
-            ok "Settings saved in $ENV_FILE"
+            save_monitor_settings
             print_cron
         fi
         echo
