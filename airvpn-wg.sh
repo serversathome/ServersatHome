@@ -45,6 +45,9 @@
 set -uo pipefail
 
 API="https://airvpn.org/api"
+# Where AirVPN chooses web and/or email delivery for API notifications
+# (Air -> API). The link in AirVPN's own API docs is an old URL that 404s.
+AIRVPN_NOTIFY_URL="https://airvpn.org/notifications/options/"
 MAX_CALLS=160                # hard cap per run, far below AirVPN's ban limit
 MAX_HISTORY_CHECKS=40        # servers whose last 10 days of history are read (1 request each)
 DEEP_CHECKS=5                # top servers whose full RELIABILITY_DAYS are read
@@ -762,8 +765,8 @@ configure_alerts() {
     echo
     echo "Alert channel:"
     echo "  1) None"
-    echo "  2) AirVPN notification (shows on airvpn.org; email if enabled in your"
-    echo "     AirVPN notification options under Air -> API)"
+    echo "  2) AirVPN notification (shows on airvpn.org; also emailed if you enable it"
+    echo "     under Air -> API at $AIRVPN_NOTIFY_URL)"
     echo "  3) ntfy"
     echo "  4) Discord webhook"
     echo "  5) Gotify"
@@ -821,11 +824,23 @@ configure_alerts() {
     fi
     if yesno "Send a test alert now?" y; then
         send_alert "AirVPN monitor test" "Test from airvpn-wg.sh on $(hostname): alerts for $DEVICE work." \
-            && ok "Test alert sent via $ALERT_CHANNEL"
+            && test_alert_sent
     fi
 }
 
 mark() { [ "$1" = 1 ] && echo x || echo " "; }
+
+# AirVPN answers "ok" once it has stored the notification; whether it is also
+# emailed depends on a setting the API cannot read, so say so instead of
+# claiming it was delivered.
+test_alert_sent() {
+    if [ "$ALERT_CHANNEL" = airvpn ]; then
+        ok "AirVPN accepted the test alert: check the bell on airvpn.org."
+        echo "      Email only arrives if enabled under Air -> API at $AIRVPN_NOTIFY_URL"
+    else
+        ok "Test alert sent via $ALERT_CHANNEL"
+    fi
+}
 
 needs_key_for_monitor() {
     [ "$ALERT_CHANNEL" = airvpn ] || [ "$EVENT_DEVICE_OFFLINE" = 1 ] || [ "$EVENT_EXPIRY" = 1 ]
@@ -1014,7 +1029,7 @@ case "$CMD" in
         monitor ;;
     test-alert)
         [ "$ALERT_CHANNEL" != none ] || die "No alert channel configured. Run: airvpn-wg.sh alerts --output $OUTPUT"
-        send_alert "AirVPN monitor test" "Test from airvpn-wg.sh on $(hostname)." && ok "Test alert sent via $ALERT_CHANNEL" ;;
+        send_alert "AirVPN monitor test" "Test from airvpn-wg.sh on $(hostname)." && test_alert_sent ;;
     alerts)
         [ -f "$ENV_FILE" ] || die "No $ENV_FILE. Run setup first."
         configure_alerts; configure_autoswitch; save_settings; ok "Saved $ENV_FILE"; print_cron ;;
