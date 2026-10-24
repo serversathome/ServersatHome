@@ -45,9 +45,6 @@
 set -uo pipefail
 
 API="https://airvpn.org/api"
-# Where AirVPN chooses web and/or email delivery for API notifications
-# (Air -> API). The link in AirVPN's own API docs is an old URL that 404s.
-AIRVPN_NOTIFY_URL="https://airvpn.org/notifications/options/"
 MAX_CALLS=160                # hard cap per run, far below AirVPN's ban limit
 MAX_HISTORY_CHECKS=40        # servers whose last 10 days of history are read (1 request each)
 DEEP_CHECKS=5                # top servers whose full RELIABILITY_DAYS are read
@@ -765,8 +762,8 @@ configure_alerts() {
     echo
     echo "Alert channel:"
     echo "  1) None"
-    echo "  2) AirVPN notification (shows on airvpn.org; also emailed if you enable it"
-    echo "     under Air -> API at $AIRVPN_NOTIFY_URL)"
+    echo "  2) AirVPN notification (the bell on airvpn.org only: AirVPN has no email"
+    echo "     option for these, so pick 3-6 for alerts that reach your phone)"
     echo "  3) ntfy"
     echo "  4) Discord webhook"
     echo "  5) Gotify"
@@ -830,13 +827,12 @@ configure_alerts() {
 
 mark() { [ "$1" = 1 ] && echo x || echo " "; }
 
-# AirVPN answers "ok" once it has stored the notification; whether it is also
-# emailed depends on a setting the API cannot read, so say so instead of
-# claiming it was delivered.
+# AirVPN answers "ok" once it has stored the notification, which only shows
+# in the site's bell: its API docs mention an email option under Air -> API,
+# but the notification settings page has none (and the docs' link 404s).
 test_alert_sent() {
     if [ "$ALERT_CHANNEL" = airvpn ]; then
-        ok "AirVPN accepted the test alert: check the bell on airvpn.org."
-        echo "      Email only arrives if enabled under Air -> API at $AIRVPN_NOTIFY_URL"
+        ok "AirVPN accepted the test alert: check the bell on airvpn.org (no email is sent)."
     else
         ok "Test alert sent via $ALERT_CHANNEL"
     fi
