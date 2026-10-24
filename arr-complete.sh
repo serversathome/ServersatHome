@@ -199,7 +199,7 @@ for pool in "$CONFIG_POOL" "$MEDIA_POOL"; do
 done
 echo "Configs/stacks pool: $CONFIG_POOL    Media pool: $MEDIA_POOL"
 
-# ── Login and VPN port ──────────────────────────────────────────────────────
+# ── Login ───────────────────────────────────────────────────────────────────
 # One username and password for every app. The answers are kept in a
 # root-only file inside the configs dataset so a re-run offers them as the
 # defaults (the apps already hold that login; a different one would lock the
@@ -227,16 +227,6 @@ while :; do
     read -rsp "  Repeat the password: " answer2; echo
     if [ "$answer" != "$answer2" ]; then echo "  They differ; try again."; continue; fi
     ADMIN_PASS="$answer"; break
-done
-echo ""
-echo "qBittorrent VPN port forwarding (optional): if your VPN provider gave you a fixed"
-echo "forwarded port, enter it and qBittorrent listens on it. Enter for none."
-while :; do
-    read -rp "  Forwarded port [${QB_FORWARDED_PORT:-none}]: " answer
-    [ -z "$answer" ] && break
-    if [ "$answer" = none ]; then QB_FORWARDED_PORT=""; break; fi
-    if [[ "$answer" =~ ^[0-9]+$ ]] && [ "$answer" -ge 1 ] && [ "$answer" -le 65535 ]; then QB_FORWARDED_PORT="$answer"; break; fi
-    echo "  A number between 1 and 65535, Enter for none, or 'none' to clear a saved one."
 done
 unset answer answer2
 
@@ -608,10 +598,15 @@ create_directory() {
 
 # ── Datasets ────────────────────────────────────────────────────────────────
 create_dataset "$CONFIG_POOL" "configs"
-{
-    echo "# Answers from the last run of arr-complete.sh (root only). Delete to be asked afresh."
-    printf 'ADMIN_USER=%q\nADMIN_PASS=%q\nQB_FORWARDED_PORT=%q\n' "$ADMIN_USER" "$ADMIN_PASS" "$QB_FORWARDED_PORT"
-} > "$SETUP_STATE_FILE" && chmod 600 "$SETUP_STATE_FILE"
+# save_answers — keep the answers for re-runs (again after the forwarded port,
+# which is only asked when launching).
+save_answers() {
+    {
+        echo "# Answers from the last run of arr-complete.sh (root only). Delete to be asked afresh."
+        printf 'ADMIN_USER=%q\nADMIN_PASS=%q\nQB_FORWARDED_PORT=%q\n' "$ADMIN_USER" "$ADMIN_PASS" "$QB_FORWARDED_PORT"
+    } > "$SETUP_STATE_FILE" && chmod 600 "$SETUP_STATE_FILE"
+}
+save_answers
 for dataset in "${CONFIG_DATASETS[@]}"; do
     if [ "$dataset" = "seerr" ]; then
         create_dataset "$CONFIG_POOL" "configs/$dataset" "1000:1000"
@@ -822,6 +817,9 @@ $JELLYFIN_GPU_ENV
 $JELLYFIN_GPU_BLOCK
 EOF
 
+# A function, because the forwarded port is only asked when launching: the
+# stack is written now with the saved port and rewritten if it changes.
+write_qbittorrent_stack() {
 write_stack qbittorrent <<EOF
 services:
   qbittorrent:
@@ -846,8 +844,8 @@ services:
       - VPN_LAN_NETWORK=$CIDR_NETWORK,10.8.0.0/24
       - VPN_LAN_LEAK_ENABLED=false
       - VPN_EXPOSE_PORTS_ON_LAN=
-      # false for a plain WireGuard config, or the fixed forwarded port the
-      # script asked for (qBittorrent then listens on it); "true" only works
+      # false for a plain WireGuard config, or the fixed forwarded port asked
+      # for when launching (qBittorrent then listens on it); "true" only works
       # together with VPN_PROVIDER=proton or pia.
       - VPN_AUTO_PORT_FORWARD=${QB_FORWARDED_PORT:-false}
       - VPN_PORT_REDIRECTS=
@@ -865,6 +863,8 @@ services:
       - $CONFIGS_PATH/qbittorrent:/config
       - $MEDIA_PATH:/media
 EOF
+}
+write_qbittorrent_stack
 
 write_stack qui <<EOF
 services:
@@ -1064,6 +1064,29 @@ else
         esac
     done
     unset answer
+fi
+
+# Forwarded port: asked here, after the VPN config, since only a launch uses
+# it. qBittorrent's stack was written with the saved value; it is rewritten
+# (backing up the old file, as write_stack does) only if the answer changes.
+echo ""
+echo "qBittorrent VPN port forwarding (optional): if your VPN provider gave you a fixed"
+echo "forwarded port (AirVPN: Client Area -> Forwarded Ports), enter it and qBittorrent"
+echo "listens on it. Enter keeps the value in brackets."
+QB_PORT_WRITTEN=$QB_FORWARDED_PORT
+while :; do
+    read -rp "  Forwarded port [${QB_FORWARDED_PORT:-none}]: " answer || break
+    [ -z "$answer" ] && break
+    if [ "$answer" = none ]; then QB_FORWARDED_PORT=""; break; fi
+    if [[ "$answer" =~ ^[0-9]+$ ]] && [ "$answer" -ge 1 ] && [ "$answer" -le 65535 ]; then QB_FORWARDED_PORT="$answer"; break; fi
+    echo "  A number between 1 and 65535, Enter to keep, or 'none' for no forwarded port."
+done
+unset answer
+if [ "$QB_FORWARDED_PORT" != "$QB_PORT_WRITTEN" ]; then
+    write_qbittorrent_stack
+    save_answers
+    if [ -n "$QB_FORWARDED_PORT" ]; then ok "qBittorrent stack updated for forwarded port $QB_FORWARDED_PORT"
+    else ok "qBittorrent stack updated: no forwarded port"; fi
 fi
 
 # The shared network, once.
