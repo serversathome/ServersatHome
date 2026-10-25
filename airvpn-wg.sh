@@ -118,31 +118,61 @@ done
 command -v curl >/dev/null || die "curl is required."
 command -v python3 >/dev/null || die "python3 is required."
 
-# wg_in_use [exclude] — "container<TAB>path" for every running container that
-# has a wireguard/wg0.conf under one of its mounts (e.g. qbittorrent with
-# .../configs/qbittorrent/wireguard/wg0.conf): read from the mounts and the
-# file existing, never guessed. [exclude] leaves out that wg0.conf.
+# wg_in_use [exclude] — "container<TAB>path<TAB>note" for every container that
+# uses a WireGuard client config: a known in-container path (hotio
+# /config/wireguard/wg0.conf, gluetun /gluetun/wireguard/wg0.conf, linuxserver
+# /config/wg_confs/wg0.conf, /etc/wireguard/wg0.conf) mapped back through its
+# mounts, never guessed. Server configs (no Endpoint, e.g. wg-easy) are left
+# out. Stopped containers count too (a bad wg0.conf is a common reason), and a
+# hotio container with VPN_ENABLED=true is listed even before its wg0.conf
+# exists. [exclude] leaves out that wg0.conf.
 wg_in_use() {
     local ids
     command -v docker >/dev/null || return 0
-    ids=$(docker ps -q 2>/dev/null)
+    ids=$(docker ps -aq 2>/dev/null)
     [ -n "$ids" ] || return 0
     # shellcheck disable=SC2086
     docker inspect $ids 2>/dev/null | EXCLUDE="${1-}" python3 -c '
-import json, os, sys
+import json, os, re, sys
+KNOWN = ["/config/wireguard/wg0.conf", "/gluetun/wireguard/wg0.conf",
+         "/config/wg_confs/wg0.conf", "/etc/wireguard/wg0.conf"]
 skip = os.path.realpath(os.environ["EXCLUDE"]) if os.environ["EXCLUDE"] else None
+def client(f):
+    try:
+        with open(f, errors="replace") as fh:
+            return re.search(r"^\s*Endpoint\s*=", fh.read(), re.M | re.I) is not None
+    except OSError:
+        return False
 seen = set()
 try:
-    for c in json.load(sys.stdin):
-        for m in c.get("Mounts", []):
-            src = m.get("Source") or ""
-            for f in (os.path.join(src, "wireguard", "wg0.conf"), os.path.join(src, "wg0.conf")):
-                f = os.path.realpath(f)
-                if os.path.isfile(f) and f != skip and (c["Name"], f) not in seen:
-                    seen.add((c["Name"], f))
-                    print(c["Name"].lstrip("/") + "\t" + f)
+    containers = json.load(sys.stdin)
 except Exception:
-    pass'
+    containers = []
+for c in containers:
+    name = c.get("Name", "").lstrip("/")
+    running = (c.get("State") or {}).get("Running")
+    env = (c.get("Config") or {}).get("Env") or []
+    vpn = any(e.lower() == "vpn_enabled=true" for e in env)
+    for m in c.get("Mounts", []):
+        src, dst = m.get("Source") or "", (m.get("Destination") or "").rstrip("/")
+        if not src or not dst:
+            continue
+        for k in KNOWN:
+            if k != dst and not k.startswith(dst + "/"):
+                continue
+            f = os.path.realpath(src + k[len(dst):])
+            if f == skip or f in seen:
+                continue
+            if os.path.isfile(f):
+                if not client(f):
+                    continue
+                note = "used by " + name + ("" if running else ", stopped")
+            elif vpn and k == KNOWN[0] and os.path.isdir(src):
+                note = name + " expects it; not created yet"
+            else:
+                continue
+            seen.add(f)
+            print(name + "\t" + f + "\t" + note)'
 }
 
 # Without --output the default is ./wg0.conf in the current folder, which is
@@ -152,9 +182,9 @@ if [ "$OUTPUT_GIVEN" = 0 ] && { [ "$CMD" = setup ] || [ "$CMD" = alerts ]; } && 
     in_use=$(wg_in_use "$OUTPUT")
     if [ -n "$in_use" ]; then
         echo "No --output given, so the default is $(cd "$(dirname "$OUTPUT")" 2>/dev/null && pwd)/wg0.conf."
-        echo "WireGuard configs used by running containers:"
+        echo "WireGuard configs used by your containers:"
         i=0
-        while IFS=$'\t' read -r c f; do i=$(( i + 1 )); printf '  %d) %s (used by %s)\n' "$i" "$f" "$c"; done <<<"$in_use"
+        while IFS=$'\t' read -r c f n; do i=$(( i + 1 )); printf '  %d) %s (%s)\n' "$i" "$f" "$n"; done <<<"$in_use"
         echo "  0) Keep the default ($(cd "$(dirname "$OUTPUT")" 2>/dev/null && pwd)/wg0.conf)"
         while :; do
             { : </dev/tty; } 2>/dev/null || break
@@ -166,7 +196,7 @@ if [ "$OUTPUT_GIVEN" = 0 ] && { [ "$CMD" = setup ] || [ "$CMD" = alerts ]; } && 
             fi
             echo "Type a number from the list."
         done
-        unset in_use i c f pick
+        unset in_use i c f n pick
     fi
 fi
 
