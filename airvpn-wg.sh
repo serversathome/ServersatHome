@@ -95,11 +95,11 @@ EOF
 }
 
 # ── Arguments ───────────────────────────────────────────────────────────────
-CMD=setup; OUTPUT="./wg0.conf"; ARG_DEVICE=""; ARG_SERVER=""; ARG_PORT=""
+CMD=setup; OUTPUT="./wg0.conf"; OUTPUT_GIVEN=0; ARG_DEVICE=""; ARG_SERVER=""; ARG_PORT=""
 while [ $# -gt 0 ]; do
     case "$1" in
         setup|alerts|test-alert|monitor) CMD=$1 ;;
-        -o|--output) OUTPUT=${2-}; shift ;;
+        -o|--output) OUTPUT=${2-}; OUTPUT_GIVEN=1; shift ;;
         --device)    ARG_DEVICE=${2-}; shift ;;
         --server)    ARG_SERVER=${2-}; shift ;;
         --port)      ARG_PORT=${2-}; shift ;;
@@ -112,6 +112,58 @@ done
 
 command -v curl >/dev/null || die "curl is required."
 command -v python3 >/dev/null || die "python3 is required."
+
+# wg_in_use [exclude] — "container<TAB>path" for every running container that
+# has a wireguard/wg0.conf under one of its mounts (e.g. qbittorrent with
+# .../configs/qbittorrent/wireguard/wg0.conf): read from the mounts and the
+# file existing, never guessed. [exclude] leaves out that wg0.conf.
+wg_in_use() {
+    local ids
+    command -v docker >/dev/null || return 0
+    ids=$(docker ps -q 2>/dev/null)
+    [ -n "$ids" ] || return 0
+    # shellcheck disable=SC2086
+    docker inspect $ids 2>/dev/null | EXCLUDE="${1-}" python3 -c '
+import json, os, sys
+skip = os.path.realpath(os.environ["EXCLUDE"]) if os.environ["EXCLUDE"] else None
+seen = set()
+try:
+    for c in json.load(sys.stdin):
+        for m in c.get("Mounts", []):
+            src = m.get("Source") or ""
+            for f in (os.path.join(src, "wireguard", "wg0.conf"), os.path.join(src, "wg0.conf")):
+                f = os.path.realpath(f)
+                if os.path.isfile(f) and f != skip and (c["Name"], f) not in seen:
+                    seen.add((c["Name"], f))
+                    print(c["Name"].lstrip("/") + "\t" + f)
+except Exception:
+    pass'
+}
+
+# Without --output the default is ./wg0.conf in the current folder, which is
+# easy to get wrong (e.g. running from a home folder). If a running container
+# already uses a wg0.conf, offer that file instead.
+if [ "$OUTPUT_GIVEN" = 0 ] && { [ "$CMD" = setup ] || [ "$CMD" = alerts ]; } && [ -z "${AIRVPN_WG_EMBEDDED:-}" ]; then
+    in_use=$(wg_in_use "$OUTPUT")
+    if [ -n "$in_use" ]; then
+        echo "No --output given, so the default is $(cd "$(dirname "$OUTPUT")" 2>/dev/null && pwd)/wg0.conf."
+        echo "WireGuard configs used by running containers:"
+        i=0
+        while IFS=$'\t' read -r c f; do i=$(( i + 1 )); printf '  %d) %s (used by %s)\n' "$i" "$f" "$c"; done <<<"$in_use"
+        echo "  0) Keep the default ($(cd "$(dirname "$OUTPUT")" 2>/dev/null && pwd)/wg0.conf)"
+        while :; do
+            { : </dev/tty; } 2>/dev/null || break
+            read -rp "Which wg0.conf? [1]: " pick </dev/tty || break
+            pick=${pick:-1}
+            [ "$pick" = 0 ] && break
+            if [[ "$pick" =~ ^[0-9]+$ ]] && [ "$pick" -le "$i" ]; then
+                OUTPUT=$(sed -n "${pick}p" <<<"$in_use" | cut -f2); break
+            fi
+            echo "Type a number from the list."
+        done
+        unset in_use i c f pick
+    fi
+fi
 
 OUT_DIR=$(cd "$(dirname "$OUTPUT")" 2>/dev/null && pwd) || die "Directory for $OUTPUT does not exist."
 OUTPUT="$OUT_DIR/$(basename "$OUTPUT")"
@@ -1311,7 +1363,13 @@ case "$CMD" in
         elif restart_users; then
             info "Done."
         else
-            info "Done. No running container uses $OUT_DIR; restart whatever uses wg0.conf to switch over."
+            others=$(wg_in_use "$OUTPUT" | awk -F'\t' '{ printf "%s%s uses %s", (NR > 1 ? "; " : ""), $1, $2 }')
+            if [ -n "$others" ]; then
+                warn "No running container uses $OUTPUT ($others). To change that one: $(cd "$(dirname "$0")" && pwd)/$(basename "$0") --output <its wg0.conf>"
+                info "Done."
+            else
+                info "Done. No running container uses $OUT_DIR; restart whatever uses wg0.conf to switch over."
+            fi
         fi
         ;;
 esac
