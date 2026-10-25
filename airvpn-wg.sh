@@ -94,6 +94,11 @@ menus (alerts are left as they are), e.g. from another script:
 EOF
 }
 
+# This script's own path (SCRIPT_PATH becomes the copy next to wg0.conf once
+# install_self has put it there; the cron job runs that copy).
+SELF=$(cd "$(dirname "$0")" 2>/dev/null && pwd)/$(basename "$0")
+SCRIPT_PATH=$SELF
+
 # ── Arguments ───────────────────────────────────────────────────────────────
 CMD=setup; OUTPUT="./wg0.conf"; OUTPUT_GIVEN=0; ARG_DEVICE=""; ARG_SERVER=""; ARG_PORT=""
 while [ $# -gt 0 ]; do
@@ -1116,6 +1121,29 @@ configure_autoswitch() {
     fi
 }
 
+# install_self — keep the script next to wg0.conf (and its settings), so the
+# cron job runs it from there and nothing depends on where it was downloaded.
+# The downloaded copy is then removed ("moved"), unless it serves another
+# wg0.conf itself (an airvpn-wg.env beside it), e.g. arr-complete's copy run
+# with --output elsewhere.
+install_self() {
+    local dest="$OUT_DIR/airvpn-wg.sh"
+    [ -f "$SELF" ] || return 0      # run from a pipe: nothing to copy
+    if [ "$(realpath "$SELF")" = "$(realpath -m "$dest")" ]; then SCRIPT_PATH=$dest; return 0; fi
+    if cp "$SELF" "$dest.tmp" && chmod 700 "$dest.tmp" && mv "$dest.tmp" "$dest"; then
+        chown root:root "$dest" 2>/dev/null
+        SCRIPT_PATH=$dest
+        if [ ! -f "$(dirname "$SELF")/airvpn-wg.env" ] && rm -f "$SELF"; then
+            ok "Moved airvpn-wg.sh to $OUT_DIR, next to wg0.conf"
+        else
+            ok "Copied airvpn-wg.sh to $OUT_DIR, next to wg0.conf"
+        fi
+    else
+        rm -f "$dest.tmp"
+        warn "Could not copy airvpn-wg.sh to $OUT_DIR; it stays at $SELF."
+    fi
+}
+
 # setup_cron — the monitor only works from cron, so add, update or remove its
 # job to match the settings: needed when alerts or auto-switch are on. On
 # TrueNAS the job goes through the middleware (midclt), so it shows under
@@ -1123,17 +1151,18 @@ configure_autoswitch() {
 # goes in root's crontab. Each job is tagged with its wg0.conf, so re-running
 # updates it instead of adding another. Falls back to printing the line.
 setup_cron() {
-    local self cmd tag want=0 ids line
-    self=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
-    cmd="bash $(printf '%q' "$self") monitor --output $(printf '%q' "$OUTPUT")"
-    tag="airvpn-wg monitor: $OUTPUT"
+    local cmd tag oldtag want=0 ids line
+    cmd="bash $(printf '%q' "$SCRIPT_PATH") monitor --output $(printf '%q' "$OUTPUT")"
+    tag="AirVPN monitor for $OUTPUT (airvpn-wg.sh: alerts and auto-switch)"
+    oldtag="airvpn-wg monitor: $OUTPUT"     # earlier versions' description: still matched
     { [ "$ALERT_CHANNEL" != none ] || [ "$AUTO_SWITCH" = 1 ]; } && want=1
     echo
     if command -v midclt >/dev/null; then
-        ids=$(midclt call cronjob.query 2>/dev/null | TAG="$tag" python3 -c '
+        ids=$(midclt call cronjob.query 2>/dev/null | TAG="$tag" OLDTAG="$oldtag" python3 -c '
 import json, os, sys
 try:
-    print(" ".join(str(j["id"]) for j in json.load(sys.stdin) if j.get("description") == os.environ["TAG"]))
+    tags = (os.environ["TAG"], os.environ["OLDTAG"])
+    print(" ".join(str(j["id"]) for j in json.load(sys.stdin) if j.get("description") in tags))
 except Exception:
     sys.exit(1)') || { warn "Could not read the TrueNAS cron jobs."; cron_manual "$cmd" "$want"; return; }
         if [ "$want" = 0 ]; then
@@ -1155,7 +1184,7 @@ print(json.dumps({"user": "root", "command": os.environ["CMD"], "description": o
         # Read the whole crontab before writing it back, keeping every other
         # line: piping "crontab -l" straight into "crontab -" can lose them.
         local current
-        current=$(crontab -l 2>/dev/null | grep -vF "# $tag")
+        current=$(crontab -l 2>/dev/null | grep -vF -e "# $tag" -e "# $oldtag")
         line=$( { [ -n "$current" ] && printf '%s\n' "$current"; [ "$want" = 1 ] && echo "*/5 * * * * $cmd >/dev/null # $tag"; } | crontab - 2>&1 ) \
             || { warn "Could not update the crontab: $line"; cron_manual "$cmd" "$want"; return; }
         if [ "$want" = 1 ]; then ok "Added to root's crontab: the monitor runs every 5 minutes"; else ok "No monitor cron job needed (alerts and auto-switch are off)"; fi
@@ -1334,13 +1363,14 @@ case "$CMD" in
         send_alert "AirVPN monitor test" "Test from airvpn-wg.sh on $(hostname)." && ok "Test alert sent via $ALERT_CHANNEL" ;;
     alerts)
         [ -f "$ENV_FILE" ] || die "No $ENV_FILE. Run setup first."
-        configure_monitor; save_monitor_settings; setup_cron ;;
+        configure_monitor; save_monitor_settings; install_self; setup_cron ;;
     setup)
         info "AirVPN WireGuard config for $OUTPUT"
         ensure_key
         pick_device
         pick_server
         generate
+        install_self
         if [ -n "$ARG_DEVICE" ] && [ -n "$ARG_SERVER" ]; then
             save_settings
         else
@@ -1350,7 +1380,7 @@ case "$CMD" in
             configure_monitor
             save_monitor_settings
             setup_cron
-            echo "To change alerts or auto-switch later: bash $(cd "$(dirname "$0")" && pwd)/$(basename "$0") alerts --output $OUTPUT"
+            echo "To change alerts or auto-switch later: bash $SCRIPT_PATH alerts --output $OUTPUT"
         fi
         echo
         # A new wg0.conf only takes effect when the container using it
@@ -1365,7 +1395,7 @@ case "$CMD" in
         else
             others=$(wg_in_use "$OUTPUT" | awk -F'\t' '{ printf "%s%s uses %s", (NR > 1 ? "; " : ""), $1, $2 }')
             if [ -n "$others" ]; then
-                warn "No running container uses $OUTPUT ($others). To change that one: $(cd "$(dirname "$0")" && pwd)/$(basename "$0") --output <its wg0.conf>"
+                warn "No running container uses $OUTPUT ($others). To change that one: bash $SCRIPT_PATH --output <its wg0.conf>"
                 info "Done."
             else
                 info "Done. No running container uses $OUT_DIR; restart whatever uses wg0.conf to switch over."
