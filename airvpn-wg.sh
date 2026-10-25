@@ -1147,22 +1147,26 @@ install_self() {
 # setup_cron — the monitor only works from cron, so add, update or remove its
 # job to match the settings: needed when alerts or auto-switch are on. On
 # TrueNAS the job goes through the middleware (midclt), so it shows under
-# System -> Advanced Settings -> Cron Jobs and survives updates; elsewhere it
-# goes in root's crontab. Each job is tagged with its wg0.conf, so re-running
-# updates it instead of adding another. Falls back to printing the line.
+# System -> Advanced Settings -> Cron Jobs (described "AirVPN monitor") and
+# survives updates; elsewhere it goes in root's crontab. A job is recognised
+# by its command, which ends in "monitor --output <this wg0.conf>" (or by
+# the description earlier versions gave it), so re-running updates it
+# instead of adding another, and separate wg0.conf files keep separate jobs.
+# Falls back to printing the line.
 setup_cron() {
-    local cmd tag oldtag want=0 ids line
-    cmd="bash $(printf '%q' "$SCRIPT_PATH") monitor --output $(printf '%q' "$OUTPUT")"
-    tag="AirVPN monitor for $OUTPUT (airvpn-wg.sh: alerts and auto-switch)"
+    local cmd mine tag="AirVPN monitor" oldtag want=0 ids line
+    mine="monitor --output $(printf '%q' "$OUTPUT")"
+    cmd="bash $(printf '%q' "$SCRIPT_PATH") $mine"
     oldtag="airvpn-wg monitor: $OUTPUT"     # earlier versions' description: still matched
     { [ "$ALERT_CHANNEL" != none ] || [ "$AUTO_SWITCH" = 1 ]; } && want=1
     echo
     if command -v midclt >/dev/null; then
-        ids=$(midclt call cronjob.query 2>/dev/null | TAG="$tag" OLDTAG="$oldtag" python3 -c '
+        ids=$(midclt call cronjob.query 2>/dev/null | MINE="$mine" OLDTAG="$oldtag" python3 -c '
 import json, os, sys
 try:
-    tags = (os.environ["TAG"], os.environ["OLDTAG"])
-    print(" ".join(str(j["id"]) for j in json.load(sys.stdin) if j.get("description") in tags))
+    print(" ".join(str(j["id"]) for j in json.load(sys.stdin)
+                   if (j.get("command") or "").endswith(" " + os.environ["MINE"])
+                   or j.get("description") == os.environ["OLDTAG"]))
 except Exception:
     sys.exit(1)') || { warn "Could not read the TrueNAS cron jobs."; cron_manual "$cmd" "$want"; return; }
         if [ "$want" = 0 ]; then
@@ -1184,7 +1188,7 @@ print(json.dumps({"user": "root", "command": os.environ["CMD"], "description": o
         # Read the whole crontab before writing it back, keeping every other
         # line: piping "crontab -l" straight into "crontab -" can lose them.
         local current
-        current=$(crontab -l 2>/dev/null | grep -vF -e "# $tag" -e "# $oldtag")
+        current=$(crontab -l 2>/dev/null | grep -vF -e " $mine >/dev/null" -e "# $oldtag")
         line=$( { [ -n "$current" ] && printf '%s\n' "$current"; [ "$want" = 1 ] && echo "*/5 * * * * $cmd >/dev/null # $tag"; } | crontab - 2>&1 ) \
             || { warn "Could not update the crontab: $line"; cron_manual "$cmd" "$want"; return; }
         if [ "$want" = 1 ]; then ok "Added to root's crontab: the monitor runs every 5 minutes"; else ok "No monitor cron job needed (alerts and auto-switch are off)"; fi
