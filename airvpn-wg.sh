@@ -65,6 +65,7 @@ info() { echo ">>> $*"; }
 ok()   { echo "    ✔ $*"; }
 warn() { echo "⚠️  $*" >&2; }
 die()  { echo "❌ $*" >&2; exit 1; }
+q()    { printf '%q' "$1"; }   # a path quoted for a command the user copies
 
 usage() {
     cat <<'EOF'
@@ -1140,7 +1141,7 @@ configure_autoswitch() {
                 echo "No container named $RESTART_CONTAINER. Containers here: $names"
             else
                 echo "No container named $RESTART_CONTAINER: there are no containers on this machine yet."
-                echo "Type none, or set up the containers first and add it later with: airvpn-wg.sh alerts --output $OUTPUT"
+                echo "Type none, or set up the containers first and add it later with: bash $(q "$SCRIPT_PATH") alerts --output $(q "$OUTPUT")"
             fi
             def=""
         done
@@ -1393,7 +1394,7 @@ case "$CMD" in
     monitor)
         monitor ;;
     test-alert)
-        [ "$ALERT_CHANNEL" != none ] || die "No alert channel configured. Run: airvpn-wg.sh alerts --output $OUTPUT"
+        [ "$ALERT_CHANNEL" != none ] || die "No alert channel configured. Run: bash $(q "$SCRIPT_PATH") alerts --output $(q "$OUTPUT")"
         send_alert "AirVPN monitor test" "Test from airvpn-wg.sh on $(hostname)." && ok "Test alert sent via $ALERT_CHANNEL" ;;
     alerts)
         [ -f "$ENV_FILE" ] || die "No $ENV_FILE. Run setup first."
@@ -1414,7 +1415,7 @@ case "$CMD" in
             configure_monitor
             save_monitor_settings
             setup_cron
-            echo "To change alerts or auto-switch later: bash $SCRIPT_PATH alerts --output $OUTPUT"
+            echo "To change alerts or auto-switch later: bash $(q "$SCRIPT_PATH") alerts --output $(q "$OUTPUT")"
         fi
         echo
         # A new wg0.conf only takes effect when the container using it
@@ -1429,7 +1430,7 @@ case "$CMD" in
         else
             others=$(wg_in_use "$OUTPUT" | awk -F'\t' '{ printf "%s%s uses %s", (NR > 1 ? "; " : ""), $1, $2 }')
             if [ -n "$others" ]; then
-                warn "No running container uses $OUTPUT ($others). To change that one: bash $SCRIPT_PATH --output <its wg0.conf>"
+                warn "No running container uses $OUTPUT ($others). To change that one: bash $(q "$SCRIPT_PATH") --output <its wg0.conf>"
                 info "Done."
             else
                 info "Done. No running container uses $OUT_DIR; restart whatever uses wg0.conf to switch over."
