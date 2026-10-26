@@ -58,6 +58,7 @@ QB_FORWARDED_PORT=""   # fixed forwarded port from the VPN provider, if any
 info() { echo ">>> $*"; }
 ok()   { echo "    ✔ $*"; }
 warn() { echo "⚠️  $*"; }
+q() { printf '%q' "$1"; }   # a path quoted for a command the user copies
 die()  { echo "❌ $*" >&2; exit 1; }
 
 # wait_for <description> <timeout-seconds> <command...>
@@ -195,10 +196,13 @@ else
     MEDIA_POOL="$CHOSEN_POOL"
 fi
 
-# Dataset names need to be lowercase with no spaces for the rest of the stack.
+# Capitals and spaces in a pool name go against best practice but work: every
+# path below is quoted. A colon can't work: Docker splits volumes on it.
 for pool in "$CONFIG_POOL" "$MEDIA_POOL"; do
-    [[ "$pool" =~ ^[a-z0-9][a-z0-9_.-]*$ ]] \
-        || die "Pool name '$pool' must be lowercase with no spaces. Rename the pool or create a compliant one."
+    case "$pool" in
+        *:*) die "Pool name '$pool' contains a colon, which Docker volume paths can't handle. Use another pool." ;;
+        *[[:upper:][:space:]]*) warn "Pool name '$pool' has capitals or spaces. That works, but lowercase with no spaces is safer for other tools." ;;
+    esac
 done
 echo "Configs/stacks pool: $CONFIG_POOL    Media pool: $MEDIA_POOL"
 
@@ -676,7 +680,7 @@ services:
       - PGID=568
       - TZ=$TZ_VALUE
     volumes:
-      - $CONFIGS_PATH/prowlarr:/config
+      - "$CONFIGS_PATH/prowlarr:/config"
 EOF
 
 write_stack radarr <<EOF
@@ -692,8 +696,8 @@ services:
       - PGID=568
       - TZ=$TZ_VALUE
     volumes:
-      - $CONFIGS_PATH/radarr:/config
-      - $MEDIA_PATH:/media
+      - "$CONFIGS_PATH/radarr:/config"
+      - "$MEDIA_PATH:/media"
 EOF
 
 write_stack sonarr <<EOF
@@ -709,8 +713,8 @@ services:
       - PGID=568
       - TZ=$TZ_VALUE
     volumes:
-      - $CONFIGS_PATH/sonarr:/config
-      - $MEDIA_PATH:/media
+      - "$CONFIGS_PATH/sonarr:/config"
+      - "$MEDIA_PATH:/media"
 EOF
 
 write_stack seerr <<EOF
@@ -735,7 +739,7 @@ services:
       retries: 3
     restart: unless-stopped
     volumes:
-      - $CONFIGS_PATH/seerr:/app/config
+      - "$CONFIGS_PATH/seerr:/app/config"
 EOF
 
 # Trawl replaces FlareSolverr: it serves the same FlareSolverr API on 8191
@@ -763,7 +767,7 @@ services:
     ports:
       - 8191:8191
     volumes:
-      - $CONFIGS_PATH/trawl:/data/metrics
+      - "$CONFIGS_PATH/trawl:/data/metrics"
 EOF
 
 write_stack profilarr <<EOF
@@ -775,7 +779,7 @@ services:
     ports:
       - "6868:6868"
     volumes:
-      - $CONFIGS_PATH/profilarr:/config
+      - "$CONFIGS_PATH/profilarr:/config"
     environment:
       - PUID=568
       - PGID=568
@@ -796,8 +800,8 @@ services:
       - PGID=568
       - TZ=$TZ_VALUE
     volumes:
-      - $CONFIGS_PATH/bazarr:/config
-      - $MEDIA_PATH:/media
+      - "$CONFIGS_PATH/bazarr:/config"
+      - "$MEDIA_PATH:/media"
 EOF
 
 # The GPU lines come from the detection above (empty when there is no GPU).
@@ -815,8 +819,8 @@ $JELLYFIN_GPU_ENV
       - '8096:8096'
     restart: unless-stopped
     volumes:
-      - $CONFIGS_PATH/jellyfin:/config
-      - $MEDIA_PATH:/media
+      - "$CONFIGS_PATH/jellyfin:/config"
+      - "$MEDIA_PATH:/media"
 $JELLYFIN_GPU_BLOCK
 EOF
 
@@ -863,8 +867,8 @@ services:
       - net.ipv4.conf.all.src_valid_mark=1
       - net.ipv6.conf.all.disable_ipv6=1
     volumes:
-      - $CONFIGS_PATH/qbittorrent:/config
-      - $MEDIA_PATH:/media
+      - "$CONFIGS_PATH/qbittorrent:/config"
+      - "$MEDIA_PATH:/media"
 EOF
 }
 write_qbittorrent_stack
@@ -879,8 +883,8 @@ services:
     ports:
       - "7476:7476"
     volumes:
-      - $CONFIGS_PATH/qui:/config
-      - $MEDIA_PATH:/media
+      - "$CONFIGS_PATH/qui:/config"
+      - "$MEDIA_PATH:/media"
 EOF
 
 # Tracearr per wiki.serversatho.me/en/tracearr: the supervised image bundles
@@ -903,9 +907,9 @@ services:
       - TZ=$TZ_VALUE
       - LOG_LEVEL=info
     volumes:
-      - $CONFIGS_PATH/tracearr/postgres:/data/postgres
-      - $CONFIGS_PATH/tracearr/redis:/data/redis
-      - $CONFIGS_PATH/tracearr/data:/data/tracearr
+      - "$CONFIGS_PATH/tracearr/postgres:/data/postgres"
+      - "$CONFIGS_PATH/tracearr/redis:/data/redis"
+      - "$CONFIGS_PATH/tracearr/data:/data/tracearr"
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://127.0.0.1:3000/health"]
@@ -933,7 +937,7 @@ services:
       - '8888:8080'
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - $CONFIGS_PATH/dozzle:/data
+      - "$CONFIGS_PATH/dozzle:/data"
       - /proc:/host/proc:ro
 EOF
 
@@ -970,10 +974,10 @@ services:
       - 5001:5001
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - $CONFIGS_PATH/dockge:/app/data
-      - $STACKS_PATH:$STACKS_PATH
+      - "$CONFIGS_PATH/dockge:/app/data"
+      - "$STACKS_PATH:$STACKS_PATH"
     environment:
-      - DOCKGE_STACKS_DIR=$STACKS_PATH
+      - "DOCKGE_STACKS_DIR=$STACKS_PATH"
       - PUID=568
       - PGID=568
       - DOCKGE_ENABLE_CONSOLE=true
@@ -987,7 +991,7 @@ read -rp "Would you like to launch AND auto-configure the Docker containers now?
 if [[ ! "$LAUNCH_CONTAINERS" =~ ^[Yy]([Ee][Ss])?$ ]]; then
     echo "Docker containers were not launched. To start a stack by hand:"
     echo "  docker network create $DOCKER_NETWORK   (once)"
-    echo "  docker compose -f $STACKS_PATH/<container>/compose.yaml up -d"
+    echo "  docker compose -f $(q "$STACKS_PATH")/<container>/compose.yaml up -d"
     exit 0
 fi
 
@@ -1071,7 +1075,7 @@ if [ -s "$WG_FILE" ]; then
     echo "WireGuard config already present at $WG_FILE (leaving it alone)."
     if [ -f "$AIRVPN_WG" ]; then
         fetch_airvpn_wg
-        echo "  To pick another AirVPN server or change alerts: bash $AIRVPN_WG --output $WG_FILE"
+        echo "  To pick another AirVPN server or change alerts: bash $(q "$AIRVPN_WG") --output $(q "$WG_FILE")"
     fi
 else
     echo ""
@@ -1096,8 +1100,8 @@ fi
 WG_MISSING=0
 if [ ! -s "$WG_FILE" ]; then
     WG_MISSING=1
-    if [ -f "$AIRVPN_WG" ]; then wg_how="bash $AIRVPN_WG --output $WG_FILE"
-    else wg_how="wget -O airvpn-wg.sh $AIRVPN_WG_URL && bash airvpn-wg.sh --output $WG_FILE"; fi
+    if [ -f "$AIRVPN_WG" ]; then wg_how="bash $(q "$AIRVPN_WG") --output $(q "$WG_FILE")"
+    else wg_how="wget -O airvpn-wg.sh $AIRVPN_WG_URL && bash airvpn-wg.sh --output $(q "$WG_FILE")"; fi
     todo "qBittorrent has no WireGuard config yet, so it was not started or configured. Put a wg0.conf at $WG_FILE (paste your provider's, or for AirVPN: $wg_how), then re-run arr-complete.sh to start and configure qBittorrent and connect Radarr, Sonarr and Qui to it."
     warn "No WireGuard config: qBittorrent will not be started; the rest of the stack goes ahead."
 fi
@@ -1154,7 +1158,7 @@ echo "Launching the stacks from $STACKS_PATH..."
 for stack in "${STACKS[@]}"; do
     [ "$stack" = qbittorrent ] && [ "$WG_MISSING" = 1 ] && { echo "Not starting qbittorrent (no WireGuard config yet)."; continue; }
     docker compose -f "$STACKS_PATH/$stack/compose.yaml" up -d \
-        || todo "The '$stack' stack did not launch. Check: docker compose -f $STACKS_PATH/$stack/compose.yaml logs"
+        || todo "The '$stack' stack did not launch. Check: docker compose -f $(q "$STACKS_PATH/$stack/compose.yaml") logs"
 done
 echo "Stacks launched."
 
@@ -2668,7 +2672,7 @@ fi
 if [ "$ADMIN_PASS" = changeme ]; then echo "  CHANGE THESE before exposing anything beyond your LAN."; fi
 echo "  (Your answers are kept root-only in $SETUP_STATE_FILE for re-runs.)"
 [ -n "$QB_FORWARDED_PORT" ] && echo "  qBittorrent listens on forwarded port $QB_FORWARDED_PORT (VPN_AUTO_PORT_FORWARD)."
-[ "$WG_FROM_AIRVPN" = 1 ] && echo "  qBittorrent's WireGuard config came from AirVPN; to change server, alerts or auto-switch: bash $AIRVPN_WG --output $WG_FILE"
+[ "$WG_FROM_AIRVPN" = 1 ] && echo "  qBittorrent's WireGuard config came from AirVPN; to change server, alerts or auto-switch: bash $(q "$AIRVPN_WG") --output $(q "$WG_FILE")"
 echo "  Stacks: $STACKS_PATH/<container>/compose.yaml, managed from Dockge at http://$HOST_IP:5001"
 if [ "$GPU_VENDOR" = "none" ]; then
     echo "  Jellyfin transcoding: software (no usable GPU found).${GPU_NOTE:+ $GPU_NOTE}"

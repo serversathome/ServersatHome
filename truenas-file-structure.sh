@@ -33,6 +33,7 @@ ADMIN_EMAIL="admin@admin.com"
 info() { echo ">>> $*"; }
 ok()   { echo "    ✔ $*"; }
 warn() { echo "⚠️  $*"; }
+q() { printf '%q' "$1"; }   # a path quoted for a command the user copies
 die()  { echo "❌ $*" >&2; exit 1; }
 
 # wait_for <description> <timeout-seconds> <command...>
@@ -166,10 +167,13 @@ else
     MEDIA_POOL="$CHOSEN_POOL"
 fi
 
-# Dataset names need to be lowercase with no spaces for the rest of the stack.
+# Capitals and spaces in a pool name go against best practice but work: every
+# path below is quoted. A colon can't work: Docker splits volumes on it.
 for pool in "$CONFIG_POOL" "$MEDIA_POOL"; do
-    [[ "$pool" =~ ^[a-z0-9][a-z0-9_.-]*$ ]] \
-        || die "Pool name '$pool' must be lowercase with no spaces. Rename the pool or create a compliant one."
+    case "$pool" in
+        *:*) die "Pool name '$pool' contains a colon, which Docker volume paths can't handle. Use another pool." ;;
+        *[[:upper:][:space:]]*) warn "Pool name '$pool' has capitals or spaces. That works, but lowercase with no spaces is safer for other tools." ;;
+    esac
 done
 echo "Configs pool: $CONFIG_POOL    Media pool: $MEDIA_POOL"
 
@@ -297,7 +301,7 @@ services:
       - PGID=568
       - TZ=$TZ_VALUE
     volumes:
-      - /mnt/$CONFIG_POOL/configs/prowlarr:/config
+      - "/mnt/$CONFIG_POOL/configs/prowlarr:/config"
 
   radarr:
     image: lscr.io/linuxserver/radarr:latest
@@ -310,8 +314,8 @@ services:
       - PGID=568
       - TZ=$TZ_VALUE
     volumes:
-      - /mnt/$CONFIG_POOL/configs/radarr:/config
-      - /mnt/$MEDIA_POOL/media:/media
+      - "/mnt/$CONFIG_POOL/configs/radarr:/config"
+      - "/mnt/$MEDIA_POOL/media:/media"
 
   sonarr:
     image: lscr.io/linuxserver/sonarr:latest
@@ -324,8 +328,8 @@ services:
       - PGID=568
       - TZ=$TZ_VALUE
     volumes:
-      - /mnt/$CONFIG_POOL/configs/sonarr:/config
-      - /mnt/$MEDIA_POOL/media:/media
+      - "/mnt/$CONFIG_POOL/configs/sonarr:/config"
+      - "/mnt/$MEDIA_POOL/media:/media"
 
   seerr:
     # Runs as UID 1000 internally and ignores "user:"; its config dataset is
@@ -347,7 +351,7 @@ services:
       retries: 3
     restart: unless-stopped
     volumes:
-      - /mnt/$CONFIG_POOL/configs/seerr:/app/config
+      - "/mnt/$CONFIG_POOL/configs/seerr:/app/config"
 
   flaresolverr:
     image: ghcr.io/flaresolverr/flaresolverr:latest
@@ -368,7 +372,7 @@ services:
     ports:
       - "6868:6868"
     volumes:
-      - /mnt/$CONFIG_POOL/configs/profilarr:/config
+      - "/mnt/$CONFIG_POOL/configs/profilarr:/config"
     environment:
       - PUID=568
       - PGID=568
@@ -386,8 +390,8 @@ services:
       - PGID=568
       - TZ=$TZ_VALUE
     volumes:
-      - /mnt/$CONFIG_POOL/configs/bazarr:/config
-      - /mnt/$MEDIA_POOL/media:/media
+      - "/mnt/$CONFIG_POOL/configs/bazarr:/config"
+      - "/mnt/$MEDIA_POOL/media:/media"
 
   jellyfin:
     container_name: jellyfin
@@ -400,8 +404,8 @@ services:
       - '8096:8096'
     restart: unless-stopped
     volumes:
-      - /mnt/$CONFIG_POOL/configs/jellyfin:/config
-      - /mnt/$MEDIA_POOL/media:/media
+      - "/mnt/$CONFIG_POOL/configs/jellyfin:/config"
+      - "/mnt/$MEDIA_POOL/media:/media"
 
   qbittorrent:
     container_name: qbittorrent
@@ -441,8 +445,8 @@ services:
       - net.ipv4.conf.all.src_valid_mark=1
       - net.ipv6.conf.all.disable_ipv6=1
     volumes:
-      - /mnt/$CONFIG_POOL/configs/qbittorrent:/config
-      - /mnt/$MEDIA_POOL/media:/media
+      - "/mnt/$CONFIG_POOL/configs/qbittorrent:/config"
+      - "/mnt/$MEDIA_POOL/media:/media"
 
   qui:
     image: ghcr.io/autobrr/qui:latest
@@ -452,8 +456,8 @@ services:
     ports:
       - "7476:7476"
     volumes:
-      - /mnt/$CONFIG_POOL/configs/qui:/config
-      - /mnt/$MEDIA_POOL/media:/media
+      - "/mnt/$CONFIG_POOL/configs/qui:/config"
+      - "/mnt/$MEDIA_POOL/media:/media"
 
   dozzle:
     # Dozzle 11+: runs as 568, needs the Docker socket's group and a /data
@@ -471,7 +475,7 @@ services:
       - '8888:8080'
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - /mnt/$CONFIG_POOL/configs/dozzle:/data
+      - "/mnt/$CONFIG_POOL/configs/dozzle:/data"
       - /proc:/host/proc:ro
 
   watchtower:
@@ -499,7 +503,7 @@ echo "Datasets and directories are in place."
 read -rp "Would you like to launch AND auto-configure the Docker containers now? (yes/no): " LAUNCH_CONTAINERS
 if [[ ! "$LAUNCH_CONTAINERS" =~ ^[Yy]([Ee][Ss])?$ ]]; then
     echo "Docker containers were not launched. You can start them manually by running:"
-    echo "cd $DOCKER_COMPOSE_PATH && docker compose up -d"
+    echo "cd $(q "$DOCKER_COMPOSE_PATH") && docker compose up -d"
     exit 0
 fi
 
