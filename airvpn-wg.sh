@@ -119,7 +119,8 @@ done
 command -v curl >/dev/null || die "curl is required."
 command -v python3 >/dev/null || die "python3 is required."
 
-# wg_in_use [exclude] — "container<TAB>path<TAB>note" for every container that
+# wg_in_use [exclude] — "container<TAB>path<TAB>note<TAB>running (1/0)" for
+# every container that
 # uses a WireGuard client config: a known in-container path (hotio
 # /config/wireguard/wg0.conf, gluetun /gluetun/wireguard/wg0.conf, linuxserver
 # /config/wg_confs/wg0.conf, /etc/wireguard/wg0.conf) mapped back through its
@@ -162,7 +163,7 @@ for c in containers:
             if k != dst and not k.startswith(dst + "/"):
                 continue
             f = os.path.realpath(src + k[len(dst):])
-            if f == skip or f in seen:
+            if f == skip or (name, f) in seen:
                 continue
             if os.path.isfile(f):
                 if not client(f):
@@ -172,8 +173,8 @@ for c in containers:
                 note = name + " expects it; not created yet"
             else:
                 continue
-            seen.add(f)
-            print(name + "\t" + f + "\t" + note)'
+            seen.add((name, f))
+            print("\t".join((name, f, note, "1" if running else "0")))'
 }
 
 # Without --output the default is ./wg0.conf in the current folder, which is
@@ -185,7 +186,7 @@ if [ "$OUTPUT_GIVEN" = 0 ] && { [ "$CMD" = setup ] || [ "$CMD" = alerts ]; } && 
         echo "No --output given, so the default is $(cd "$(dirname "$OUTPUT")" 2>/dev/null && pwd)/wg0.conf."
         echo "WireGuard configs used by your containers:"
         i=0
-        while IFS=$'\t' read -r c f n; do i=$(( i + 1 )); printf '  %d) %s (%s)\n' "$i" "$f" "$n"; done <<<"$in_use"
+        while IFS=$'\t' read -r c f n _; do i=$(( i + 1 )); printf '  %d) %s (%s)\n' "$i" "$f" "$n"; done <<<"$in_use"
         echo "  0) Keep the default ($(cd "$(dirname "$OUTPUT")" 2>/dev/null && pwd)/wg0.conf)"
         while :; do
             { : </dev/tty; } 2>/dev/null || break
@@ -919,34 +920,20 @@ generate() {
     ok "Wrote $OUTPUT (WireGuard, Linux, IPv4 only, $(sed -n 's/^Endpoint *= *//p' <<<"$conf"))"
 }
 
-# containers_using <dir> — running containers with <dir> (or a folder above
-# it) mounted, e.g. qbittorrent for .../configs/qbittorrent/wireguard. Found
-# from the mounts, not guessed from names.
+# containers_using <wg0.conf> — running containers that use exactly this
+# file: the same mount mapping as wg_in_use, so a container that only mounts a
+# folder above it (a whole pool or configs root) doesn't count.
 containers_using() {
-    local ids
-    command -v docker >/dev/null || return 0
-    ids=$(docker ps -q 2>/dev/null)
-    [ -n "$ids" ] || return 0
-    # shellcheck disable=SC2086
-    docker inspect $ids 2>/dev/null | DIR="$1" python3 -c '
-import json, os, sys
-target = os.path.realpath(os.environ["DIR"])
-try:
-    for c in json.load(sys.stdin):
-        for m in c.get("Mounts", []):
-            src = os.path.realpath(m.get("Source") or "/nonexistent")
-            if src != "/" and (target == src or target.startswith(src.rstrip("/") + "/")):
-                print(c["Name"].lstrip("/"))
-                break
-except Exception:
-    pass'
+    local target
+    target=$(realpath -m "$1")
+    wg_in_use | awk -F'\t' -v t="$target" '$2 == t && $4 == 1 { print $1 }'
 }
 
 # restart_users — after a new wg0.conf, restart the running containers that
 # use it so they switch over. Returns 1 if there is none to restart.
 restart_users() {
     local names n
-    names=$(containers_using "$OUT_DIR")
+    names=$(containers_using "$OUTPUT")
     [ -n "$names" ] || return 1
     for n in $names; do
         if docker restart "$n" >/dev/null 2>&1; then ok "Restarted $n so it uses the new wg0.conf"
@@ -1126,7 +1113,7 @@ configure_autoswitch() {
         # this wg0.conf mounted instead.
         if [ -z "${AIRVPN_WG_EMBEDDED:-}" ] && [ -n "$RESTART_CONTAINER" ] && command -v docker >/dev/null \
             && ! docker inspect "$RESTART_CONTAINER" >/dev/null 2>&1; then
-            detected=$(containers_using "$OUT_DIR" | head -n 1)
+            detected=$(containers_using "$OUTPUT" | head -n 1)
             [ -n "$detected" ] && def=$detected
         fi
         while :; do
