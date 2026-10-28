@@ -2,6 +2,7 @@
 # ==========================================
 # Proxmox NVMe-oF Auto Setup for TrueNAS
 # Fully Automated and User-Friendly
+# Version 2.0 (2026-10): Proxmox VE 9 / TrueNAS 25.10+
 # ==========================================
 
 # Color output
@@ -34,8 +35,20 @@ while true; do
     fi
 done
 
-apt install -y nvme-cli
+if ! apt-get install -y nvme-cli; then
+    echo_error "Failed to install nvme-cli."
+    exit 1
+fi
 
+# Load the NVMe/TCP initiator now and on every boot (it pulls in nvme-fabrics)
+modprobe nvme-tcp || { echo_error "Could not load the nvme-tcp kernel module."; exit 1; }
+echo "nvme-tcp" > /etc/modules-load.d/nvme-tcp.conf
+
+# TrueNAS subsystems that don't "Allow any host" must list this NQN as an allowed host
+if [[ -s /etc/nvme/hostnqn ]]; then
+    echo_info "This host's NQN (add it to the subsystem's allowed hosts in TrueNAS if needed):"
+    echo "    $(cat /etc/nvme/hostnqn)"
+fi
 
 # Discover targets
 echo_info "Discovering NVMe-oF targets on $TRUENAS_IP..."
@@ -43,6 +56,7 @@ DISCOVERY=$(nvme discover -t tcp -a "$TRUENAS_IP" -s 4420 2>&1)
 if [[ $? -ne 0 ]]; then
     echo_error "Failed to discover targets."
     echo "$DISCOVERY"
+    echo_info "Check that the NVMe-oF service is running in TrueNAS, the port is 4420/TCP, and this host is allowed."
     exit 1
 fi
 
@@ -95,16 +109,26 @@ DEVICES_BEFORE=$(lsblk -ndo NAME | grep -E '^nvme[0-9]+n[0-9]+$' || true)
 
 # Connect
 echo_info "Connecting to NVMe-oF target..."
-nvme connect -t "$TRANSPORT" -a "$TRADDR" -s 4420 -n "$NQN" 2>&1
+if ! nvme connect -t "$TRANSPORT" -a "$TRADDR" -s 4420 -n "$NQN" 2>&1; then
+    echo_info "nvme connect returned an error (it does this if the target is already connected); checking for its device..."
+fi
 sleep 5
 
 # Find new device
 DEVICES_AFTER=$(lsblk -ndo NAME | grep -E '^nvme[0-9]+n[0-9]+$' || true)
 DEVICE=$(comm -13 <(echo "$DEVICES_BEFORE" | sort) <(echo "$DEVICES_AFTER" | sort) | head -n1)
 
-# If no new device found, just take the first nvme device (likely already connected)
+# If no new device appeared (e.g. already connected), find the namespace that
+# belongs to the selected NQN. Never fall back to "the first nvme disk": on a
+# host with a local NVMe boot drive that would be the boot disk.
 if [[ -z "$DEVICE" ]]; then
-    DEVICE=$(lsblk -ndo NAME | grep -E '^nvme[0-9]+n[0-9]+$' | head -n1)
+    for blk in /sys/block/nvme*n*; do
+        [[ -e "$blk/device/subsysnqn" ]] || continue
+        if [[ "$(cat "$blk/device/subsysnqn")" == "$NQN" ]]; then
+            DEVICE=$(basename "$blk")
+            break
+        fi
+    done
 fi
 
 if [[ -z "$DEVICE" ]]; then
@@ -185,10 +209,11 @@ SERVICE_NAME="nvme-connect-${POOL_NAME}"
 cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<EOF
 [Unit]
 Description=Connect NVMe-oF for ${POOL_NAME}
+# Network storage: start once the network is up. (The old DefaultDependencies=no +
+# Before=zfs-import.target ordering formed a boot ordering cycle with
+# network-online.target, which systemd breaks by dropping one of the jobs.)
 After=network-online.target
 Wants=network-online.target
-DefaultDependencies=no
-Before=zfs-import.target
 
 [Service]
 Type=oneshot
@@ -200,7 +225,7 @@ StandardOutput=journal
 StandardError=journal
 
 [Install]
-WantedBy=sysinit.target
+WantedBy=multi-user.target
 EOF
 
 ZPOOL_SERVICE="zpool-import-${POOL_NAME}"
@@ -209,29 +234,36 @@ cat > "/etc/systemd/system/${ZPOOL_SERVICE}.service" <<EOF
 Description=Import ZFS pool ${POOL_NAME}
 After=${SERVICE_NAME}.service
 Requires=${SERVICE_NAME}.service
-DefaultDependencies=no
-Before=zfs-mount.service zfs.target
+After=zfs-import.target
+# Import before Proxmox autostarts guests that may live on this pool
+Before=pve-guests.service
 
 [Service]
 Type=oneshot
 ExecStartPre=/bin/sleep 5
 ExecStart=/sbin/zpool import -f -N ${POOL_NAME}
 ExecStartPost=/sbin/zfs mount -a
+# Export before the NVMe-oF link is torn down at shutdown (units stop in reverse order)
+ExecStop=/sbin/zpool export ${POOL_NAME}
 RemainAfterExit=yes
 StandardOutput=journal
 StandardError=journal
 
 [Install]
-WantedBy=zfs.target
+WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
 systemctl enable "${SERVICE_NAME}.service"
 systemctl enable "${ZPOOL_SERVICE}.service"
 
-# Also mask the zfs-import-cache service to prevent conflicts
-echo_info "Disabling zfs-import-cache.service to prevent conflicts..."
-systemctl mask zfs-import-cache.service
+# zfs-import-cache.service is left alone: it imports this host's OTHER pools at
+# boot, and this pool is already kept out of the cache file (cachefile=none).
+# Earlier versions of this script masked it; warn if that is still in place.
+if [[ "$(systemctl is-enabled zfs-import-cache.service 2>/dev/null)" == "masked" ]]; then
+    echo_info "zfs-import-cache.service is masked (an older version of this script did that)."
+    echo_info "Your other ZFS pools won't import at boot until you run: systemctl unmask zfs-import-cache.service"
+fi
 
 echo ""
 echo_success "Setup Complete!"
@@ -241,9 +273,9 @@ echo_info "Device: $DEVICE"
 echo_info "Services: ${SERVICE_NAME}.service, ${ZPOOL_SERVICE}.service"
 echo ""
 echo_success "Configuration:"
-echo "  ✓ NVMe-oF connection will start early in boot (sysinit.target)"
-echo "  ✓ Pool import will happen after NVMe connection"
-echo "  ✓ ZFS cache import disabled (pool not in cache file)"
+echo "  ✓ NVMe-oF connection will start once the network is online"
+echo "  ✓ Pool import will happen after NVMe connection (before guest autostart)"
+echo "  ✓ Pool kept out of the ZFS cache file (other pools still import normally)"
 echo ""
 echo_info "Test with: systemctl status ${SERVICE_NAME}.service"
 echo_info "Reboot to test full persistence!"
