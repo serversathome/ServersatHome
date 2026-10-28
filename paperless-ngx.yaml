@@ -1,16 +1,24 @@
+# Paperless-ngx (v3+) with PostgreSQL and Valkey, matching upstream's
+# docker/compose/docker-compose.postgres.yml (checked 2026-10).
 services:
   broker:
-    image: docker.io/library/redis:7
+    # Upstream switched the broker from Redis to Valkey (Redis-protocol compatible)
+    image: docker.io/valkey/valkey:9-alpine
     container_name: paperless-broker
     restart: unless-stopped
     volumes:
       - ./redisdata:/data
   db:
-    image: docker.io/library/postgres:16
+    # Postgres 18+ keeps its data under /var/lib/postgresql/<major>/docker, so the
+    # volume is mounted at /var/lib/postgresql (not .../data).
+    # Already running this stack on postgres:16? Do NOT just change the tag: keep
+    # postgres:16 with ./pgdata:/var/lib/postgresql/data, or migrate first
+    # (document_exporter / document_importer, or pg_upgrade).
+    image: docker.io/library/postgres:18
     restart: unless-stopped
     container_name: paperless-db
     volumes:
-      - ./pgdata:/var/lib/postgresql/data
+      - ./pgdata:/var/lib/postgresql
     environment:
       POSTGRES_DB: paperless
       POSTGRES_USER: paperless
@@ -31,7 +39,12 @@ services:
       - ./consume:/usr/src/paperless/consume
     environment:
       PAPERLESS_REDIS: redis://broker:6379
+      # v3 requires the engine to be explicit; without it Paperless silently uses SQLite
+      PAPERLESS_DBENGINE: postgresql
       PAPERLESS_DBHOST: db
+      # Required since v3 (Paperless refuses to start without it). Generate one with:
+      #   python3 -c "import secrets; print(secrets.token_urlsafe(64))"
+      PAPERLESS_SECRET_KEY: change-me
       USERMAP_UID: 1000
       USERMAP_GID: 100
 
