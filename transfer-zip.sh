@@ -3,6 +3,7 @@
 #  Transfer.zip Automated Deployment Script
 #  For Servers@Home / TrueNAS users
 #  https://wiki.serversatho.me
+#  Version: 2.0 (2026-10-28)
 # ============================================================================
 
 set -e
@@ -52,7 +53,7 @@ echo -e "${BOLD}Current directory:${NC} $STACKS_DIR"
 echo ""
 
 # Check for required tools
-for cmd in git docker openssl sed; do
+for cmd in git docker openssl sed curl; do
     if ! command -v "$cmd" &>/dev/null; then
         log_error "$cmd is required but not installed. Aborting."
         exit 1
@@ -175,26 +176,20 @@ log_info "Frontend configuration file ready"
 
 log_step "Patching next/Dockerfile (fixing public dir ownership)..."
 sed -i 's|COPY --from=builder /app/public ./public|COPY --from=builder --chown=nextjs:nodejs /app/public ./public|' next/Dockerfile
-log_info "Fixed EACCES permission issue for /app/public"
-
-# ============================================================================
-#  Generate JWT key pair
-# ============================================================================
-
-log_step "Generating JWT key pair for API ↔ worker authentication..."
-openssl genrsa -out private.pem 2048 2>/dev/null
-openssl rsa -in private.pem -pubout -out public.pem 2>/dev/null
-chmod 600 private.pem
-chmod 644 public.pem
-log_info "Generated private.pem and public.pem"
+if grep -q 'COPY --from=builder --chown=nextjs:nodejs /app/public ./public' next/Dockerfile; then
+    log_info "Fixed EACCES permission issue for /app/public"
+else
+    log_warn "Could not find the public dir COPY line in next/Dockerfile (upstream changed?). Skipped."
+fi
 
 # ============================================================================
 #  Update docker-compose.yml — replace 127.0.0.1 with host IP
 # ============================================================================
 
-log_step "Updating docker-compose.yml — binding ports to ${HOST_IP}..."
-sed -i "s|127.0.0.1:|${HOST_IP}:|g" docker-compose.yml
-log_info "All service ports now bind to ${HOST_IP}"
+log_step "Updating docker-compose.yml — binding web and signaling ports to ${HOST_IP}..."
+# Only the web (9001) and signaling (9002) ports; MongoDB stays on 127.0.0.1
+sed -i -E "s#127\.0\.0\.1:(\\$\{(WEB_SERVER|SIGNALING_SERVER)_FORWARD_PORT)#${HOST_IP}:\1#" docker-compose.yml
+log_info "Web and signaling ports now bind to ${HOST_IP} (MongoDB stays on 127.0.0.1)"
 
 # ============================================================================
 #  Update next/.env — SITE_URL and COOKIE_DOMAIN
@@ -226,7 +221,11 @@ log_info "COOKIE_DOMAIN=${COOKIE_DOMAIN}"
 if [ -z "$USER_DOMAIN" ]; then
     log_step "Patching cookie for HTTP access (LAN-only mode)..."
     sed -i 's|secure: !IS_DEV,|secure: false,|' next/src/lib/server/serverUtils.js
-    log_info "Disabled Secure cookie flag (required for HTTP without HTTPS)"
+    if grep -q 'secure: false,' next/src/lib/server/serverUtils.js; then
+        log_info "Disabled Secure cookie flag (required for HTTP without HTTPS)"
+    else
+        log_warn "Could not patch the Secure cookie flag (upstream changed?). Sign-in over plain HTTP may fail."
+    fi
     log_info "If you add a domain with HTTPS later, revert this and rebuild"
 fi
 
@@ -236,7 +235,11 @@ fi
 
 log_step "Increasing storage quota to 1 PB..."
 sed -i 's|10e12   // 10TB for good measure|10e15   // 1PB for self-host|' next/src/lib/server/mongoose/models/User.js
-log_info "Storage quota set to 1 PB (effectively unlimited)"
+if grep -q '10e15   // 1PB for self-host' next/src/lib/server/mongoose/models/User.js; then
+    log_info "Storage quota set to 1 PB (effectively unlimited)"
+else
+    log_warn "Could not patch the storage quota (upstream changed?). Default quota kept."
+fi
 
 # ============================================================================
 #  Deploy with Docker Compose
@@ -247,40 +250,31 @@ docker compose up -d --build
 log_info "All four services starting: mongo, next, signaling-server, worker"
 
 # ============================================================================
-#  Copy public.pem into worker volume
+#  Check the worker key pair
+#  The worker image generates /worker_data/private.pem + public.pem at build
+#  time and they are copied into the worker_data volume on first start.
+#  Do NOT replace public.pem with another key: it must match private.pem.
 # ============================================================================
 
-log_step "Copying public.pem into worker data volume..."
+log_step "Checking worker key pair..."
 
-# Wait briefly for volumes to be created
+# Wait briefly for the worker to start
 sleep 3
 
-WORKER_VOL=$(docker volume inspect transfer-zip-web_worker_data --format '{{ .Mountpoint }}' 2>/dev/null || true)
-
-if [ -n "$WORKER_VOL" ] && [ -d "$WORKER_VOL" ]; then
-    cp public.pem "$WORKER_VOL/public.pem"
-    chmod 644 "$WORKER_VOL/public.pem"
-    log_info "Public key copied to worker volume"
+if docker compose exec -T worker test -f /worker_data/public.pem 2>/dev/null; then
+    log_info "Worker key pair present in the worker_data volume"
 else
-    log_warn "Could not find worker volume mountpoint automatically."
-    log_warn "Trying docker cp fallback..."
-    WORKER_CONTAINER=$(docker compose ps -q worker 2>/dev/null || true)
-    if [ -n "$WORKER_CONTAINER" ]; then
-        docker cp public.pem "${WORKER_CONTAINER}:/worker_data/public.pem"
-        log_info "Public key copied via docker cp"
+    log_warn "Worker key pair missing (old or empty worker_data volume). Generating it..."
+    if docker compose run --rm --no-deps -T -u 0 worker /app/docker-create-keys.sh; then
+        docker compose restart worker
+        sleep 2
+        log_info "Worker key pair generated"
     else
-        log_error "Could not copy public.pem to worker. You may need to do this manually:"
-        echo "    docker cp public.pem <worker-container>:/worker_data/public.pem"
+        log_error "Could not generate the worker key pair. Try: docker compose down && docker volume rm transfer-zip-web_worker_data && docker compose up -d"
     fi
 fi
 
-# ============================================================================
-#  Restart worker to pick up the key
-# ============================================================================
-
-log_step "Restarting worker service..."
-docker compose restart worker
-sleep 2
+WORKER_PUBKEY=$(docker compose run --rm --no-deps -T worker cat /worker_data/public.pem 2>/dev/null || true)
 
 # ============================================================================
 #  Verify services are running
@@ -316,10 +310,13 @@ if [[ "$CREATE_ACCT" =~ ^[Yy]$ ]]; then
     echo ""
 
     if [ -n "$ACCT_EMAIL" ] && [ -n "$ACCT_PASS" ]; then
+        # Escape backslashes and double quotes for the JSON body
+        JSON_EMAIL=$(printf '%s' "$ACCT_EMAIL" | sed 's/\\/\\\\/g; s/"/\\"/g')
+        JSON_PASS=$(printf '%s' "$ACCT_PASS" | sed 's/\\/\\\\/g; s/"/\\"/g')
         REGISTER_RESP=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
             "http://${HOST_IP}:9001/api/auth/register" \
             -H "Content-Type: application/json" \
-            -d "{\"email\":\"${ACCT_EMAIL}\",\"password\":\"${ACCT_PASS}\"}")
+            -d "{\"email\":\"${JSON_EMAIL}\",\"password\":\"${JSON_PASS}\"}" || echo "000")
 
         if [ "$REGISTER_RESP" = "200" ] || [ "$REGISTER_RESP" = "201" ]; then
             log_info "Account created for ${ACCT_EMAIL}"
@@ -364,6 +361,16 @@ else
     echo -e "  ${BOLD}Access Transfer.zip at:${NC} http://${HOST_IP}:9001"
 fi
 
+echo ""
+echo -e "  ${BOLD}Stored Transfers:${NC} need a separate transfer.zip-node server"
+echo -e "    https://github.com/robinkarlberg/transfer.zip-node"
+echo -e "    Put this worker public key in the node repo's ${BOLD}keys/public.pem${NC},"
+echo -e "    then add the node's public URL to ${BOLD}${REPO_DIR}/next/conf.json${NC} and rebuild next."
+if [ -n "$WORKER_PUBKEY" ]; then
+    echo "$WORKER_PUBKEY" | sed 's/^/    /'
+else
+    echo -e "    (show it with: docker compose exec worker cat /worker_data/public.pem)"
+fi
 echo ""
 echo -e "  ${BOLD}Useful commands:${NC}"
 echo -e "    cd ${REPO_DIR}"
