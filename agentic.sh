@@ -843,8 +843,10 @@ systemctl restart cloudcli || echo "    [WARN] cloudcli restart failed"
 
 echo ">>> [5/6] Docker images (one-shot Watchtower)..."
 if command -v docker >/dev/null 2>&1 && [ -n "$(docker ps -q 2>/dev/null)" ]; then
+  # nickfedor/watchtower: the maintained fork (same flags). containrrr/watchtower
+  # is archived and its old Docker API client is refused by Docker Engine 29+.
   docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
-    containrrr/watchtower --run-once --cleanup \
+    nickfedor/watchtower --run-once --cleanup \
     || echo "    [WARN] Watchtower one-shot run failed"
 else
   echo "    (no running containers; skipped)"

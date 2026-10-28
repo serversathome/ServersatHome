@@ -540,8 +540,8 @@ esac
 
 # ── Layout ──────────────────────────────────────────────────────────────────
 # configs/<app>: one dataset per app. Seerr is the exception: its container
-# always runs as UID 1000 (the node user) and ignores `user:`, so its dataset
-# is owned by 1000 — see wiki.serversatho.me/en/seerr.
+# runs as UID 1000 (the node user) by default, so its dataset is owned by
+# 1000 — see wiki.serversatho.me/en/seerr.
 # stacks/<container>: one DIRECTORY per container inside the stacks dataset,
 # each with its own compose.yaml — the layout Dockge manages.
 CONFIG_DATASETS=("prowlarr" "radarr" "sonarr" "seerr" "profilarr" "bazarr" "jellyfin" "qbittorrent" "qui" "dozzle" "tracearr" "trawl" "dockge")
@@ -634,6 +634,9 @@ done
 for subdir in postgres redis data; do
     [ -d "$CONFIGS_PATH/tracearr/$subdir" ] || create_directory "$CONFIGS_PATH/tracearr/$subdir"
 done
+# Its backups go to /data/backup, which the entrypoint does not re-own: the
+# folder belongs to the image's tracearr user (UID 1001) from the start.
+[ -d "$CONFIGS_PATH/tracearr/backup" ] || create_directory "$CONFIGS_PATH/tracearr/backup" "1001:apps"
 
 create_dataset "$CONFIG_POOL" "stacks"
 for stack in "${STACKS[@]}"; do
@@ -720,7 +723,7 @@ EOF
 write_stack seerr <<EOF
 services:
   seerr:
-    # Runs as UID 1000 internally and ignores "user:"; its config dataset is
+    # Runs as UID 1000 (the node user) by default; its config dataset is
     # owned by 1000 for that reason.
     image: ghcr.io/seerr-team/seerr:latest
     init: true
@@ -732,7 +735,7 @@ services:
     ports:
       - 5055:5055
     healthcheck:
-      test: wget --no-verbose --tries=1 --spider http://localhost:5055/api/v1/status || exit 1
+      test: wget --no-verbose --tries=1 --spider http://localhost:5055/api/v1/settings/public || exit 1
       start_period: 20s
       timeout: 3s
       interval: 15s
@@ -910,6 +913,7 @@ services:
       - "$CONFIGS_PATH/tracearr/postgres:/data/postgres"
       - "$CONFIGS_PATH/tracearr/redis:/data/redis"
       - "$CONFIGS_PATH/tracearr/data:/data/tracearr"
+      - "$CONFIGS_PATH/tracearr/backup:/data/backup"
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://127.0.0.1:3000/health"]
@@ -951,8 +955,9 @@ services:
       - WATCHTOWER_NOTIFICATIONS_HOSTNAME=TrueNAS
       - WATCHTOWER_INCLUDE_STOPPED=true
       # Skip TrueNAS catalog apps (ix-<app>-...). This Watchtower fork matches
-      # names as anchored regexes, so "ix*" would match nothing useful.
-      - WATCHTOWER_DISABLE_CONTAINERS=ix-.*
+      # names as regexes (wiki.serversatho.me/en/Watchtower), so "ix*" would
+      # match nothing useful; the ^ keeps it to names that start with ix-.
+      - WATCHTOWER_DISABLE_CONTAINERS=^ix-.*
       - WATCHTOWER_NO_STARTUP_MESSAGE=true
       - WATCHTOWER_SCHEDULE=0 0 3 * * *
     image: nickfedor/watchtower
@@ -2248,7 +2253,7 @@ print(pick["name"], file=sys.stderr); print(anime["name"] if anime else "", file
 
 configure_seerr() {
     info "[8/12] Seerr"
-    wait_for "Seerr" 180 bash -c "curl -fs $SEERR_URL/api/v1/status -o /dev/null" \
+    wait_for "Seerr" 180 bash -c "curl -fs $SEERR_URL/api/v1/settings/public -o /dev/null" \
         || { todo "Seerr did not come up; skipping."; return 1; }
     local initialized
     initialized=$(http GET "$SEERR_URL/api/v1/settings/public" | jpy "d.get('initialized')")

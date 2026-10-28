@@ -2,15 +2,15 @@
 
 # ============================================================
 # Headscale Auto-Installer
-# Deploys Headscale v0.28.0 with Headscale-UI and Traefik
+# Deploys Headscale v0.29.6 with Headscale-UI and Traefik
 # ============================================================
 
 set -euo pipefail
 
 # --- Version Pinning ---
-HEADSCALE_VERSION="0.28.0"
-HEADSCALE_UI_VERSION="2025.08.23"
-TRAEFIK_VERSION="v3.6"
+HEADSCALE_VERSION="0.29.6"
+HEADSCALE_UI_VERSION="2026.03.17"
+TRAEFIK_VERSION="v3.7"
 
 # Check if the script is run as root
 if [[ $EUID -ne 0 ]]; then
@@ -66,6 +66,8 @@ services:
     container_name: 'headscale'
     restart: 'unless-stopped'
     command: 'serve'
+    ports:
+      - "3478:3478/udp" # embedded DERP STUN
     read_only: true
     tmpfs:
       - /var/run/headscale
@@ -107,10 +109,10 @@ services:
     command:
       - "--providers.docker=true"
       - "--providers.docker.exposedbydefault=false"
-      - "--entryPoints.web.address=:80"
+      - "--entrypoints.web.address=:80"
       - "--entrypoints.web.http.redirections.entrypoint.to=websecure"
       - "--entrypoints.web.http.redirections.entrypoint.scheme=https"
-      - "--entryPoints.websecure.address=:443"
+      - "--entrypoints.websecure.address=:443"
       - "--certificatesresolvers.myresolver.acme.httpchallenge=true"
       - "--certificatesresolvers.myresolver.acme.httpchallenge.entrypoint=web"
       - "--certificatesresolvers.myresolver.acme.email=${ACME_EMAIL}"
@@ -118,7 +120,6 @@ services:
     ports:
       - "80:80"
       - "443:443"
-      - "3478:3478/udp"
     volumes:
       - "./letsencrypt:/letsencrypt"
       - "/var/run/docker.sock:/var/run/docker.sock:ro"
@@ -160,7 +161,10 @@ derp:
   update_frequency: 3h
 
 disable_check_updates: false
-ephemeral_node_inactivity_timeout: 30m
+
+node:
+  ephemeral:
+    inactivity_timeout: 30m
 
 database:
   type: sqlite
@@ -212,8 +216,6 @@ unix_socket_permission: "0770"
 logtail:
   enabled: false
 
-randomize_client_port: false
-
 taildrop:
   enabled: true
 EOF
@@ -247,8 +249,8 @@ if [[ "$HEALTH" != "healthy" ]]; then
 fi
 
 # Create the API key and capture the output
-API_KEY=$(docker exec headscale headscale apikeys create 2>&1)
-if [ $? -ne 0 ]; then
+if ! API_KEY=$(docker exec headscale headscale apikeys create 2>&1); then
+    echo "$API_KEY"
     echo "Failed to create API Key. You can create one manually with:"
     echo "  docker exec headscale headscale apikeys create"
     exit 1
@@ -274,4 +276,5 @@ echo "  Useful commands:"
 echo "    docker exec headscale headscale users create <username>"
 echo "    docker exec headscale headscale nodes list"
 echo "    docker exec headscale headscale apikeys list"
+echo "    docker exec headscale headscale preauthkeys create --user <id>  (numeric ID from users list)"
 echo "============================================================"

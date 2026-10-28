@@ -292,7 +292,8 @@ if v is not None:
     print(json.dumps(v) if isinstance(v, (dict, list)) else v)' "$1"
 }
 
-result_of() { jget 'd.get("result")'; }
+# A failed request has no "result", only "error" (e.g. {"error": "Not authorized"}).
+result_of() { jget 'd.get("result") or d.get("error")'; }
 
 # ── Prompts ─────────────────────────────────────────────────────────────────
 # ask <prompt> <default> — prints the answer (the default on Enter). With no
