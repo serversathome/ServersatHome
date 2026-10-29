@@ -1693,12 +1693,12 @@ tui_configure_alerts() {
         [[ $sel == *" recovery "* ]] && EVENT_RECOVERY=1
         if [[ $sel == *" load "* ]]; then
             EVENT_SERVER_LOAD=1
-            LOAD_THRESHOLD=$(ask "Alert when the server's load is at or above this many %" "$LOAD_THRESHOLD")
+            LOAD_THRESHOLD=$(ask "Alert when the server's load is at or above this percentage:" "$LOAD_THRESHOLD")
             [[ "$LOAD_THRESHOLD" =~ ^[0-9]+$ ]] || LOAD_THRESHOLD=90
         fi
         if [[ $sel == *" expiry "* ]]; then
             EVENT_EXPIRY=1
-            EXPIRY_DAYS=$(ask "Warn how many days before the subscription expires" "$EXPIRY_DAYS")
+            EXPIRY_DAYS=$(ask "Warn this many days before the subscription expires:" "$EXPIRY_DAYS")
             [[ "$EXPIRY_DAYS" =~ ^[0-9]+$ ]] || EXPIRY_DAYS=7
         fi
         break
