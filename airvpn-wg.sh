@@ -1501,11 +1501,23 @@ generate() {
 
     # The device goes by name: an unknown name or an id is silently replaced
     # by the account's default device, so the Address is checked below.
-    conf=$(api generator protocols="wireguard_1_udp_$port" servers="$SERVER" system=linux \
-        device="$DEVICE" iplayer_entry=ipv4 iplayer_exit=ipv4)
+    # The generator names a WireGuard profile wireguard_<entry IP>_udp_<port>,
+    # and not every port is offered on entry IP 1: for one it doesn't know it
+    # answers "zero files in package". Then the other entry IPs are tried.
+    local entry tried=""
+    for entry in 1 3 2 4; do
+        tried+=" wireguard_${entry}_udp_$port"
+        conf=$(api generator protocols="wireguard_${entry}_udp_$port" servers="$SERVER" system=linux \
+            device="$DEVICE" iplayer_entry=ipv4 iplayer_exit=ipv4)
+        grep -q '^\[Interface\]' <<<"$conf" && break
+        [[ "$(result_of <<<"$conf")" == *"zero files"* ]] || break
+    done
     if ! grep -q '^\[Interface\]' <<<"$conf"; then
+        [[ "$(result_of <<<"$conf")" == *"zero files"* ]] \
+            && die "AirVPN's generator has no WireGuard profile for UDP $port on $SERVER (tried$tried). Pick another port."
         die "AirVPN did not return a config: $(result_of <<<"$conf")"
     fi
+    [ "$entry" != 1 ] && ok "UDP $port is on $SERVER's entry IP $entry"
     grep -q '^PrivateKey' <<<"$conf" && grep -q '^Endpoint' <<<"$conf" || die "AirVPN returned an incomplete config."
     addr=$(sed -n 's/^Address *= *//p' <<<"$conf")
     [ "$addr" = "$DEVICE_IP/32" ] \
