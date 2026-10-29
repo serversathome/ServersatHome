@@ -26,6 +26,11 @@
 #      container. With alerts or auto-switch on, the monitor's cron job
 #      ("airvpn-wg.sh monitor", every 5 minutes) is added automatically.
 #
+# Run again once set up, it opens a menu: change just the server, device,
+# port or alerts, send a test alert, or check the server's status. On a
+# terminal the menus are full screen (arrow keys, Enter, Esc = back); --plain
+# keeps numbered prompts.
+#
 # Needs an AirVPN API key: https://airvpn.org/apisettings/ (premium account).
 # Settings (key, choices, alert channel) are kept in airvpn-wg.env next to
 # wg0.conf, readable by root only.
@@ -72,8 +77,10 @@ usage() {
 Usage: airvpn-wg.sh [command] [options]
 
 Commands:
-  setup        (default) pick a device and server, write wg0.conf, set up
-               alerts and auto-switch
+  menu         (default once set up) change the server, device, port or
+               alerts, send a test alert or check the status
+  setup        (default the first time) pick a device and server, write
+               wg0.conf, set up alerts and auto-switch
   alerts       change the alert channel, events and auto-switch only
   test-alert   send a test message to the configured channel
   monitor      check the chosen server once, alert on changes and
@@ -86,7 +93,11 @@ Options:
   --server NAME       AirVPN server name (e.g. Menkent)
                       (skips the server menu)
   --port PORT         WireGuard port: 1637 (default), 47107 or 51820
+  --plain             numbered prompts instead of full-screen menus
+                      (same as AIRVPN_WG_TUI=0)
   -h, --help          this help
+
+On a terminal the menus are full screen: arrow keys, Enter, Esc = back.
 
 The API key is read from airvpn-wg.env, or from AIRVPN_API_KEY in the
 environment, or asked for. With --device and --server, setup runs without
@@ -101,14 +112,15 @@ SELF=$(cd "$(dirname "$0")" 2>/dev/null && pwd)/$(basename "$0")
 SCRIPT_PATH=$SELF
 
 # ── Arguments ───────────────────────────────────────────────────────────────
-CMD=setup; OUTPUT="./wg0.conf"; OUTPUT_GIVEN=0; ARG_DEVICE=""; ARG_SERVER=""; ARG_PORT=""
+CMD=setup; CMD_GIVEN=0; OUTPUT="./wg0.conf"; OUTPUT_GIVEN=0; ARG_DEVICE=""; ARG_SERVER=""; ARG_PORT=""
 while [ $# -gt 0 ]; do
     case "$1" in
-        setup|alerts|test-alert|monitor) CMD=$1 ;;
+        menu|setup|alerts|test-alert|monitor) CMD=$1; CMD_GIVEN=1 ;;
         -o|--output) OUTPUT=${2-}; OUTPUT_GIVEN=1; shift ;;
         --device)    ARG_DEVICE=${2-}; shift ;;
         --server)    ARG_SERVER=${2-}; shift ;;
         --port)      ARG_PORT=${2-}; shift ;;
+        --plain)     AIRVPN_WG_TUI=0 ;;
         -h|--help)   usage; exit 0 ;;
         *) die "Unknown argument: $1 (see --help)" ;;
     esac
@@ -118,6 +130,463 @@ done
 
 command -v curl >/dev/null || die "curl is required."
 command -v python3 >/dev/null || die "python3 is required."
+
+# ── Full-screen menus ───────────────────────────────────────────────────────
+# On a terminal that can show them, the menus are full screen (Python's
+# curses, part of python3's standard library): arrow keys, Enter, Esc = back.
+# With no terminal, a terminal that is too small or can't do it, --plain or
+# AIRVPN_WG_TUI=0, the same questions are plain numbered prompts. Cron
+# ("monitor") never shows a menu. TUI_PY is the program; tui runs one screen.
+TUI=0
+TUI_TITLE="AirVPN WireGuard"
+read -r -d '' TUI_PY <<'PY'
+import curses, locale, os, sys, textwrap, time
+
+locale.setlocale(locale.LC_ALL, "")
+os.environ.setdefault("ESCDELAY", "25")
+UTF8 = "utf" in locale.getpreferredencoding(False).lower()
+G = dict(up="↑↓", dot="●", bullet="•", line="─", more="…") if UTF8 else \
+    dict(up="Up/Down", dot="*", bullet="*", line="-", more="...")
+ENTER = ("\n", "\r", curses.KEY_ENTER)
+BACKSPACE = (curses.KEY_BACKSPACE, "\x7f", "\x08")
+
+
+def num(v, missing=9e9):
+    try:
+        return float(v)
+    except ValueError:
+        return missing
+
+
+class UI:
+    def __init__(self, scr, title, text):
+        self.scr, self.title, self.text = scr, title, text
+        scr.keypad(True)
+        self.cursor(0)
+        rev, bold = curses.A_REVERSE, curses.A_BOLD
+        self.bar = self.sel = rev
+        self.bar |= bold
+        self.dim, self.warn, self.good, self.accent = curses.A_DIM, bold, bold, bold
+        if curses.has_colors():
+            curses.start_color()
+            bg = -1
+            try:
+                curses.use_default_colors()
+            except curses.error:
+                bg = curses.COLOR_BLACK
+            curses.init_pair(1, curses.COLOR_WHITE, curses.COLOR_BLUE)
+            curses.init_pair(2, curses.COLOR_BLACK, curses.COLOR_CYAN)
+            curses.init_pair(3, curses.COLOR_YELLOW, bg)
+            curses.init_pair(4, curses.COLOR_GREEN, bg)
+            curses.init_pair(5, curses.COLOR_CYAN, bg)
+            self.bar = curses.color_pair(1) | bold
+            self.sel = curses.color_pair(2)
+            self.warn = curses.color_pair(3) | bold
+            self.good = curses.color_pair(4)
+            self.accent = curses.color_pair(5) | bold
+
+    @staticmethod
+    def cursor(on):
+        try:
+            curses.curs_set(on)
+        except curses.error:
+            pass
+
+    def put(self, y, x, s, attr=0):
+        h, w = self.scr.getmaxyx()
+        if not 0 <= y < h or x >= w - 1:
+            return
+        try:
+            self.scr.addstr(y, x, s.replace("\t", " ")[: w - 1 - x], attr)
+        except Exception:   # off-screen, or a character the terminal can't show
+            pass
+
+    # key — the next key. Arrow and page keys the terminal sends in a form its
+    # terminfo entry doesn't list (e.g. ESC [ B instead of ESC O B) are
+    # decoded here, so they don't read as Esc.
+    SEQ = {"A": curses.KEY_UP, "B": curses.KEY_DOWN, "C": curses.KEY_RIGHT, "D": curses.KEY_LEFT,
+           "H": curses.KEY_HOME, "F": curses.KEY_END, "1~": curses.KEY_HOME, "7~": curses.KEY_HOME,
+           "4~": curses.KEY_END, "8~": curses.KEY_END, "3~": curses.KEY_DC,
+           "5~": curses.KEY_PPAGE, "6~": curses.KEY_NPAGE}
+
+    def key(self):
+        try:
+            k = self.scr.get_wch()
+        except curses.error:
+            return None
+        if k != "\x1b":
+            return k
+        self.scr.nodelay(True)
+        try:
+            seq = ""
+            try:
+                c = self.scr.get_wch()
+            except curses.error:
+                return k
+            if c not in ("[", "O"):
+                return k
+            while len(seq) < 6:
+                try:
+                    c = self.scr.get_wch()
+                except curses.error:
+                    break
+                seq += c if isinstance(c, str) else ""
+                if seq[-1:].isalpha() or seq[-1:] == "~":
+                    break
+            return self.SEQ.get(seq, None)
+        finally:
+            self.scr.nodelay(False)
+
+    # frame <footer> — clear, title bar, footer bar. Returns (h, w).
+    def frame(self, footer):
+        self.scr.erase()
+        h, w = self.scr.getmaxyx()
+        self.put(0, 0, (" " + self.title).ljust(w), self.bar)
+        self.put(h - 1, 0, (" " + footer).ljust(w), self.bar)
+        return h, w
+
+    # text <y> <max rows> — the screen's explanation, wrapped. Lines starting
+    # with ⚠/! are warnings. Returns the rows used (plus a blank one).
+    def text_block(self, y, maxrows):
+        w = self.scr.getmaxyx()[1]
+        lines = []
+        for para in self.text.split("\n"):
+            lines += textwrap.wrap(para, max(10, w - 5), break_on_hyphens=False) or [""]
+        while lines and not lines[-1]:
+            lines.pop()
+        if not lines or maxrows <= 0:
+            return 0
+        if len(lines) > maxrows:
+            lines = lines[: maxrows - 1] + [G["more"]]
+        warn = False
+        for i, l in enumerate(lines):
+            if l[:1] in ("⚠", "!"):
+                warn = True
+            elif not l:
+                warn = False
+            self.put(y + i, 2, l, self.warn if warn else 0)
+        return len(lines) + 1
+
+    @staticmethod
+    def scroll(top, cur, rows, n):
+        if cur < top:
+            top = cur
+        elif cur >= top + rows:
+            top = cur - rows + 1
+        return max(0, min(top, n - rows))
+
+    # nav <key> <cur> <n> <page> [selectable] — the new cursor for a movement
+    # key, or None for any other key.
+    @staticmethod
+    def nav(k, cur, n, page, ok=lambda i: True):
+        step = {curses.KEY_UP: -1, curses.KEY_DOWN: 1, curses.KEY_PPAGE: -page,
+                curses.KEY_NPAGE: page, curses.KEY_HOME: -n, curses.KEY_END: n}.get(k)
+        if step is None or n == 0:
+            return None
+        i = max(0, min(n - 1, cur + step))
+        d = 1 if step > 0 else -1
+        while not ok(i) and 0 <= i + d < n:
+            i += d
+        while not ok(i) and 0 <= i - d < n:
+            i -= d
+        return i if ok(i) else cur
+
+    # menu — items "key<TAB>label[<TAB>hotkey]"; key "-" is a heading line.
+    # Returns the key picked, None for Esc.
+    def menu(self, default, items):
+        ok = lambda i: items[i][0] != "-"
+        idx = [i for i in range(len(items)) if ok(i)]
+        if not idx:
+            return None
+        cur = next((i for i in idx if items[i][0] == default), idx[0])
+        hot = {it[2].lower(): it[0] for it in items if len(it) > 2 and it[2]}
+        top = 0
+        while True:
+            h, w = self.frame("%s move   Enter select   Esc back" % G["up"])
+            y = 2 + self.text_block(2, h - 4 - min(len(items), 5))
+            rows = max(1, h - 2 - y)
+            top = self.scroll(top, cur, rows, len(items))
+            for r in range(min(rows, len(items) - top)):
+                i = top + r
+                label = items[i][1] if len(items[i]) > 1 else items[i][0]
+                if not ok(i):
+                    self.put(y + r, 2, label, self.accent)
+                else:
+                    self.put(y + r, 2, (" " + label).ljust(w - 5), self.sel if i == cur else 0)
+            if len(items) > rows:
+                self.put(h - 2, 2, "%d of %d" % (idx.index(cur) + 1, len(idx)), self.dim)
+            k = self.key()
+            if k in ENTER:
+                return items[cur][0]
+            if isinstance(k, str) and k.lower() in hot:
+                return hot[k.lower()]
+            if k in ("\x1b", "q", curses.KEY_LEFT) + BACKSPACE:
+                return None
+            n = self.nav(k, cur, len(items), rows, ok)
+            if n is not None:
+                cur = n
+
+    # input — one line of text, prefilled with the default. Returns it, None for Esc.
+    def input(self, default, secret):
+        buf, pos, off = list(default), len(default), 0
+        while True:
+            h, w = self.frame("Enter OK   Esc back   Ctrl-U clear")
+            y = 2 + self.text_block(2, h - 6)
+            fw = max(10, w - 8)
+            if pos < off:
+                off = pos
+            elif pos > off + fw - 1:
+                off = pos - fw + 1
+            shown = "".join(G["bullet"] * len(buf) if secret else buf)
+            self.put(y, 2, "> ", self.accent)
+            self.put(y, 4, shown[off:off + fw].ljust(fw), self.sel)
+            self.cursor(1)
+            try:
+                self.scr.move(y, 4 + pos - off)
+            except curses.error:
+                pass
+            k = self.key()
+            self.cursor(0)
+            if k in ENTER:
+                return "".join(buf)
+            if k == "\x1b":
+                return None
+            if k in BACKSPACE:
+                if pos:
+                    del buf[pos - 1]
+                    pos -= 1
+            elif k == curses.KEY_DC:
+                if pos < len(buf):
+                    del buf[pos]
+            elif k == curses.KEY_LEFT:
+                pos = max(0, pos - 1)
+            elif k == curses.KEY_RIGHT:
+                pos = min(len(buf), pos + 1)
+            elif k in (curses.KEY_HOME, "\x01"):
+                pos = 0
+            elif k in (curses.KEY_END, "\x05"):
+                pos = len(buf)
+            elif k == "\x15":
+                buf, pos = [], 0
+            elif isinstance(k, str) and k.isprintable():
+                buf.insert(pos, k)
+                pos += 1
+
+    # checklist — items "key<TAB>label<TAB>1|0". Returns the ticked keys,
+    # space separated ("" = none), None for Esc. Typing jumps to an item.
+    def checklist(self, items):
+        on = [len(it) > 2 and it[2] == "1" for it in items]
+        cur = top = 0
+        typed, last = "", 0.0
+        n = len(items)
+        while True:
+            h, w = self.frame("%s move   Space tick   + all   - none   Enter done   Esc back" % G["up"])
+            y = 2 + self.text_block(2, h - 5 - min(n, 5))
+            rows = max(1, h - 3 - y)
+            top = self.scroll(top, cur, rows, n)
+            for r in range(min(rows, n - top)):
+                i = top + r
+                label = items[i][1] if len(items[i]) > 1 else items[i][0]
+                attr = self.sel if i == cur else (self.good if on[i] else 0)
+                self.put(y + r, 2, (" [%s] %s" % ("x" if on[i] else " ", label)).ljust(w - 5), attr)
+            status = "%d ticked" % sum(on)
+            if n > rows:
+                status += "   %d of %d" % (cur + 1, n)
+            if typed and time.time() - last < 1.5:
+                status += "   jump: " + typed
+            self.put(h - 2, 2, status, self.dim)
+            k = self.key()
+            if k in ENTER:
+                return " ".join(it[0] for it, o in zip(items, on) if o)
+            if k in ("\x1b", curses.KEY_LEFT):
+                return None
+            if k == " " and n:
+                on[cur] = not on[cur]
+            elif k == "+":
+                on = [True] * n
+            elif k == "-":
+                on = [False] * n
+            elif isinstance(k, str) and k.isalnum():
+                now = time.time()
+                typed = typed + k.lower() if now - last < 1.5 else k.lower()
+                last = now
+                for i in list(range(cur, n)) + list(range(cur)):
+                    words = [items[i][0].lower()] + (items[i][1].lower().split() if len(items[i]) > 1 else [])
+                    if any(wd.startswith(typed) for wd in words):
+                        cur = i
+                        break
+            else:
+                m = self.nav(k, cur, n, rows)
+                if m is not None:
+                    cur = m
+
+    # servers — server_rows TSV (see airvpn-wg.sh). Returns the picked row's
+    # number in the ranked order, "c" to change the filters, None for Esc.
+    def servers(self, current, items, pinged):
+        rows = [r + ["-"] * (14 - len(r)) for r in items]
+        if not rows:
+            return None
+        hist_ok = lambda r: r[7] in ("ok", "new")
+        sorts = [("rank", lambda i: i),
+                 ("load", lambda i: (num(rows[i][4]), i)),
+                 ("ping", lambda i: (num(rows[i][6]), i)),
+                 ("outages", lambda i: (num(rows[i][11]) if hist_ok(rows[i]) else 9e9, i)),
+                 ("name", lambda i: rows[i][0].lower())]
+        sort, order, cur, top = 0, list(range(len(rows))), 0, 0
+        while True:
+            h, w = self.frame("%s move   Enter use this server   s sort: %s   c change filters   Esc back"
+                              % (G["up"], sorts[sort][0]))
+            y = 2 + self.text_block(2, min(4, max(0, h - 14)))
+            cols = 3 + 1 + 3 + 2 + 14 + 1 + 3 + 1 + 6 + 1 + 6 + (7 if pinged else 0) + 2
+            outw = 26
+            locw = max(6, min(24, w - 2 - cols - outw))
+            self.put(y, 1, " %3s  %-14s %-3s %-*s %6s %6s%s  %s" % (
+                "#", "Server", "CC", locw, "Location", "Load", "Users",
+                " %6s" % "Ping" if pinged else "", "Outages"), curses.A_BOLD)
+            y += 1
+            detail_y = h - 6
+            avail = max(1, detail_y - y - 1)
+            top = self.scroll(top, cur, avail, len(order))
+            for r in range(min(avail, len(order) - top)):
+                i = order[top + r]
+                n, cc, loc, load, rload, users, ms, hist, lng, sht, days, rate, deep, ip = rows[i][:14]
+                shown_load = "~%s%%" % rload if rload != load else "%s%%" % load
+                if hist in ("ok", "new"):
+                    out = "%s long, %s short in %sd" % (lng, sht, days)
+                    oattr = self.good if lng == "0" and sht == "0" else 0
+                    if hist == "new" and num(days) < 10:
+                        out += " (new)"
+                else:
+                    out = "unknown" if hist == "unknown" else "not checked"
+                    oattr = self.warn
+                mark = G["dot"] if n == current else " "
+                line = "%s%3d  %-14s %-3s %-*.*s %6s %6s%s  " % (
+                    mark, i + 1, n, cc, locw, locw, loc, shown_load, users,
+                    " %6s" % ("-" if ms == "-" else ms + "ms") if pinged else "")
+                selected = top + r == cur
+                self.put(y + r, 1, (line + out).ljust(w - 3) if selected else line,
+                         self.sel if selected else 0)
+                if not selected:
+                    self.put(y + r, 1 + len(line), out, oattr)
+            if len(order) > avail:
+                self.put(detail_y - 1, 2, "%d of %d" % (cur + 1, len(order)), self.dim)
+            self.put(detail_y, 1, G["line"] * (w - 2), self.dim)
+            self.detail(detail_y + 1, rows[order[cur]], current, pinged)
+            k = self.key()
+            if k in ENTER:
+                return str(order[cur] + 1)
+            if k in ("c", "C"):
+                return "c"
+            if k in ("s", "S"):
+                picked = order[cur]
+                sort = (sort + 1) % len(sorts)
+                order = sorted(range(len(rows)), key=sorts[sort][1])
+                cur = order.index(picked)
+            elif k in ("\x1b", "q", curses.KEY_LEFT) + BACKSPACE:
+                return None
+            else:
+                m = self.nav(k, cur, len(order), avail)
+                if m is not None:
+                    cur = m
+
+    def detail(self, y, r, current, pinged):
+        n, cc, loc, load, rload, users, ms, hist, lng, sht, days, rate, deep, ip = r[:14]
+        head = "%s  %s (%s)   entry %s" % (n, loc, cc.upper(), ip)
+        if n == current:
+            head += "   %s in use now" % G["dot"]
+        self.put(y, 2, head, self.accent)
+        l2 = "Load %s%%" % load
+        if rload != load:
+            l2 += " now, ~%s%% once its users are back (it had an outage in the last few hours)" % rload
+        l2 += ", %s users" % users
+        if pinged:
+            l2 += ", no ping answer" if ms == "-" else ", ping %s ms" % ms
+        self.put(y + 1, 2, l2)
+        if hist in ("ok", "new"):
+            l3 = "Outages: %s long (30+ min), %s short in %s days = %s weighted per 30 days" % (lng, sht, days, rate)
+            if deep != "1":
+                l3 += "; only 10 days read, so its rank is less certain"
+            self.put(y + 2, 2, l3)
+        elif hist == "unknown":
+            self.put(y + 2, 2, "Outage history could not be read, so it is ranked as unreliable.", self.warn)
+        else:
+            self.put(y + 2, 2, "Outage history not checked (outside the servers read), so it is ranked as unreliable.", self.warn)
+
+
+def main():
+    a = sys.argv[1:] + [""] * 5
+    widget, title, text, default, out = a[:5]
+    flags = sys.argv[6:]
+    if widget == "probe":
+        try:
+            curses.setupterm()
+            cols, lines = os.get_terminal_size(1)
+        except Exception:
+            return 3
+        return 0 if cols >= 60 and lines >= 16 else 3
+    items = [l.split("\t") for l in os.environ.get("TUI_ITEMS", "").split("\n") if l.strip()]
+
+    def run(scr):
+        ui = UI(scr, title, text)
+        if widget == "menu":
+            return ui.menu(default, items)
+        if widget == "input":
+            return ui.input(default, "secret" in flags)
+        if widget == "checklist":
+            return ui.checklist(items)
+        if widget == "servers":
+            return ui.servers(default, items, "pinged" in flags)
+        raise ValueError("unknown widget " + widget)
+    try:
+        res = curses.wrapper(run)
+    except KeyboardInterrupt:
+        return 130
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        return 3
+    if res is None:
+        return 1
+    with open(out, "w") as f:
+        f.write(res)
+    return 0
+
+
+sys.exit(main())
+PY
+
+# tui_init — use the full-screen menus if this terminal can show them
+# (60x16 at least).
+tui_init() {
+    [ "${AIRVPN_WG_TUI:-1}" != 0 ] || return 0
+    { : </dev/tty; } 2>/dev/null || return 0
+    [ "${TERM:-dumb}" != dumb ] || return 0
+    python3 -c "$TUI_PY" probe </dev/tty >/dev/tty 2>/dev/null && TUI=1
+}
+
+# tui <screen> <text> <default> [items] [flags...] — one full-screen step on
+# the terminal, titled $TUI_TITLE; prints the answer. Returns 1 for Esc (back).
+# Screens: menu (items "key<TAB>label[<TAB>hotkey]", key "-" = a heading),
+# input (flag "secret" hides it), checklist (items "key<TAB>label<TAB>1|0";
+# prints the ticked keys) and servers (items = server_rows; flag "pinged").
+tui() {
+    local out rc
+    out=$(mktemp) || die "mktemp failed."
+    TUI_ITEMS=${4-} python3 -c "$TUI_PY" "$1" "$TUI_TITLE" "$2" "$3" "$out" "${@:5}" </dev/tty >/dev/tty 2>/dev/tty
+    rc=$?
+    cat "$out"; rm -f "$out"
+    case $rc in
+        0|1) return $rc ;;
+        130) kill -s TERM $$; exit 1 ;;     # Ctrl-C
+        *) echo "❌ The full-screen menu failed. Run again with --plain for numbered prompts." >&2
+           kill -s TERM $$; exit 1 ;;
+    esac
+}
+
+# tui_msg <text> — show a message until Enter or Esc.
+tui_msg() { tui menu "$1" ok $'ok\tOK' >/dev/null; return 0; }
+
+case "$CMD" in menu|setup|alerts) tui_init ;; esac
 
 # wg_in_use [exclude] — "container<TAB>path<TAB>note<TAB>running (1/0)" for
 # every container that
@@ -180,9 +649,17 @@ for c in containers:
 # Without --output the default is ./wg0.conf in the current folder, which is
 # easy to get wrong (e.g. running from a home folder). If a running container
 # already uses a wg0.conf, offer that file instead.
-if [ "$OUTPUT_GIVEN" = 0 ] && { [ "$CMD" = setup ] || [ "$CMD" = alerts ]; } && [ -z "${AIRVPN_WG_EMBEDDED:-}" ]; then
+if [ "$OUTPUT_GIVEN" = 0 ] && { [ "$CMD" = setup ] || [ "$CMD" = alerts ] || [ "$CMD" = menu ]; } && [ -z "${AIRVPN_WG_EMBEDDED:-}" ]; then
     in_use=$(wg_in_use "$OUTPUT")
-    if [ -n "$in_use" ]; then
+    if [ -n "$in_use" ] && [ "$TUI" = 1 ]; then
+        default_out="$(cd "$(dirname "$OUTPUT")" 2>/dev/null && pwd)/wg0.conf"
+        pick=$(tui menu "No --output given. Which WireGuard config should this work on? These are the ones your containers use." \
+            "$(head -n 1 <<<"$in_use" | cut -f2)" \
+            "$(awk -F'\t' '{ printf "%s\t%s (%s)\n", $2, $2, $3 }' <<<"$in_use")"$'\n'"@default"$'\t'"The default: $default_out") \
+            || { info "Cancelled; nothing was changed."; exit 0; }
+        [ "$pick" != @default ] && OUTPUT=$pick
+        unset in_use pick default_out
+    elif [ -n "$in_use" ]; then
         echo "No --output given, so the default is $(cd "$(dirname "$OUTPUT")" 2>/dev/null && pwd)/wg0.conf."
         echo "WireGuard configs used by your containers:"
         i=0
@@ -238,6 +715,13 @@ EVENT_RECOVERY AUTO_SWITCH RESTART_CONTAINER"
 # shellcheck disable=SC1090
 [ -f "$ENV_FILE" ] && . "$ENV_FILE"
 [ -n "$ENV_KEY" ] && AIRVPN_API_KEY=$ENV_KEY
+
+# Once set up (a device and server saved), running without a command opens
+# the menu, so one thing can be changed without going through everything.
+if [ "$CMD_GIVEN" = 0 ] && [ -n "$DEVICE" ] && [ -n "$SERVER" ] && [ -z "$ARG_DEVICE$ARG_SERVER$ARG_PORT" ] \
+    && [ -z "${AIRVPN_WG_EMBEDDED:-}" ] && { : </dev/tty; } 2>/dev/null; then
+    CMD=menu
+fi
 
 save_settings() {
     local v tmp
@@ -315,6 +799,10 @@ no_tty() {
 }
 ask() {
     local a
+    if [ "$TUI" = 1 ]; then
+        a=$(tui input "$1" "$2") || a=$2    # Esc keeps the default
+        printf '%s' "$a"; return 0
+    fi
     tty_read -rp "$1${2:+ [$2]}: " a
     printf '%s' "${a:-$2}"
 }
@@ -322,15 +810,23 @@ ask() {
 # or for a blank answer when there is no default to keep. Prints the answer.
 ask_or_back() {
     local a hint
-    if [ -n "$2" ]; then hint=" (b = back)"; else hint=" (Enter = back)"; fi
-    tty_read -rp "$1$hint${2:+ [$2]}: " a
-    case "$a" in b|B|back) return 1 ;; esac
+    if [ "$TUI" = 1 ]; then
+        a=$(tui input "$1" "$2") || return 1
+    else
+        if [ -n "$2" ]; then hint=" (b = back)"; else hint=" (Enter = back)"; fi
+        tty_read -rp "$1$hint${2:+ [$2]}: " a
+        case "$a" in b|B|back) return 1 ;; esac
+    fi
     a=${a:-$2}
     [ -n "$a" ] || return 1
     printf '%s' "$a"
 }
 yesno() {  # yesno <prompt> <y|n>
     local a
+    if [ "$TUI" = 1 ]; then
+        a=$(tui menu "$1" "$2" $'y\tYes\ty\nn\tNo\tn') || a=n    # Esc = no
+        [ "$a" = y ]; return
+    fi
     a=$(ask "$1 (y/n)" "$2")
     [[ "$a" =~ ^[Yy] ]]
 }
@@ -339,8 +835,12 @@ yesno() {  # yesno <prompt> <y|n>
 USERINFO=""
 ensure_key() {
     if [ -z "$AIRVPN_API_KEY" ]; then
-        echo "Create an API key at https://airvpn.org/apisettings/ (and activate it)."
-        tty_read -rsp "AirVPN API key: " AIRVPN_API_KEY; echo
+        if [ "$TUI" = 1 ]; then
+            AIRVPN_API_KEY=$(TUI_TITLE="AirVPN API key" tui input "Paste your AirVPN API key. Create one at https://airvpn.org/apisettings/ (and activate it); it needs a premium account." "" secret) || AIRVPN_API_KEY=""
+        else
+            echo "Create an API key at https://airvpn.org/apisettings/ (and activate it)."
+            tty_read -rsp "AirVPN API key: " AIRVPN_API_KEY; echo
+        fi
     fi
     [ -n "$AIRVPN_API_KEY" ] || die "No API key."
     USERINFO=$(api userinfo)
@@ -416,6 +916,8 @@ pick_device() {
         [ "$(cut -f3 <<<"$line")" = ready ] || die "Device $ARG_DEVICE is not ready yet (status $(cut -f3 <<<"$line")). Try again in a minute."
         busy=$(awk -F'\t' -v n="$ARG_DEVICE" '$1==n{print $2}' <<<"$online" | paste -sd, - | sed 's/,/, /g')
         [ -n "$busy" ] && warn "Device $ARG_DEVICE is connected right now (to $busy). If that is another machine, give this one its own device."
+    elif [ "$TUI" = 1 ]; then
+        tui_pick_device; return
     else
         while :; do
             echo
@@ -455,6 +957,42 @@ pick_device() {
     fi
 
     DEVICE=$(cut -f1 <<<"$line"); DEVICE_IP=$(cut -f4 <<<"$line")
+    ok "Device $DEVICE ($DEVICE_IP)"
+}
+
+# tui_pick_device — pick_device's menu, full screen (uses its rows and
+# online). Returns 1 for Esc.
+tui_pick_device() {
+    local TUI_TITLE="Device" items name status ip last busy when def choice line
+    while :; do
+        items=""
+        while IFS=$'\t' read -r name _ status ip last; do
+            [ -n "$name" ] || continue
+            busy=$(awk -F'\t' -v n="$name" '$1==n{print $2}' <<<"$online" | paste -sd, - | sed 's/,/, /g')
+            if [ -n "$busy" ]; then when="connected now to $busy"; else when="last connected $last"; fi
+            items+=$(printf '%s\t%-20s %-8s %-16s %s' "$name" "$name" "$status" "$ip" "$when")$'\n'
+        done <<<"$rows"
+        items+=$'@new\t+ Create a new device\tn'
+        def=${DEVICE:-}
+        [ -z "$def" ] && def=$(head -n 1 <<<"$rows" | cut -f1)
+        [ -z "$def" ] && def=@new
+        choice=$(tui menu "Pick the AirVPN device (WireGuard key) this machine connects as. One device = one connection: two machines sharing a device keep knocking each other off." "$def" "$items") || return 1
+        if [ "$choice" = @new ]; then
+            create_device "$rows" && return 0
+            continue    # went back: show the list again
+        fi
+        line=$(awk -F'\t' -v n="$choice" '$1==n' <<<"$rows")
+        if [ "$(cut -f3 <<<"$line")" != ready ]; then
+            tui_msg "Device $choice is not ready yet (status $(cut -f3 <<<"$line")). Pick another, or wait a minute and pick it again."
+            continue
+        fi
+        busy=$(awk -F'\t' -v n="$choice" '$1==n{print $2}' <<<"$online" | paste -sd, - | sed 's/,/, /g')
+        [ -z "$busy" ] && break
+        yesno "⚠ Device $choice is connected right now (to $busy). If another machine uses it, the two will keep knocking each other off.
+
+Use it anyway? (only if this is the same machine)" n && break
+    done
+    DEVICE=$choice; DEVICE_IP=$(cut -f4 <<<"$line")
     ok "Device $DEVICE ($DEVICE_IP)"
 }
 
@@ -773,6 +1311,10 @@ pick_server() {
         SERVER=$match
         set_server_label; ok "Server: $SERVER_LABEL"; return 0
     fi
+    if [ "$TUI" = 1 ]; then
+        tui_pick_server || return 1
+        set_server_label; ok "Server: $SERVER_LABEL"; return 0
+    fi
 
     # Bandwidth, countries and the ranked list loop: "c" at the server prompt
     # (or filters that match nothing) goes back to bandwidth and countries.
@@ -886,6 +1428,66 @@ pick_server() {
     set_server_label; ok "Server: $SERVER_LABEL"
 }
 
+# tui_pick_server — pick_server's bandwidth, countries and ranked list, full
+# screen. Esc goes back a step; returns 1 for Esc at the bandwidth.
+tui_pick_server() {
+    local TUI_TITLE="Server" items choice usable cc name n all on text shallow unknown
+    while :; do
+        [ -n "$MIN_BW" ] || MIN_BW=$(largest_size)
+        # Sizes come from the live server list, as in the plain menu.
+        items=$(MINBW="$MIN_BW" python3 -c '
+import collections, json, os, sys
+d = json.load(sys.stdin)
+ok = [s.get("bw_max", 0) for s in d["servers"] if s.get("health") == "ok"]
+sizes = collections.Counter(ok)
+cur = os.environ["MINBW"]
+for b in sorted(sizes, reverse=True):
+    print("%d\t%6d Mbit/s or more   %3d healthy servers (%d of this size)" % (b, b, sum(1 for x in ok if x >= b), sizes[b]))
+print("0\t   Any size            %3d healthy servers" % len(ok))
+if cur.isdigit() and int(cur) and int(cur) not in sizes:
+    print("%s\t%6s Mbit/s or more   (your saved minimum)" % (cur, cur))
+print("@other\t   Another minimum...")' <<<"$STATUS")
+        choice=$(tui menu "Minimum server size. AirVPN servers come in different sizes (bandwidth, in Mbit/s); bigger ones have more room for everyone's traffic. Only servers at least this big are listed next." "$MIN_BW" "$items") || return 1
+        if [ "$choice" = @other ]; then
+            choice=$(ask_or_back "Minimum server bandwidth in Mbit/s (0 = any size)" "$MIN_BW") || continue
+            [[ "$choice" =~ ^[0-9]+$ ]] || { tui_msg "A number, please (0 = any size)."; continue; }
+        fi
+        MIN_BW=$choice
+
+        while :; do
+            usable=$(country_rows "$MIN_BW" | awk -F'\t' '$3 > 0')
+            if [ -z "$usable" ]; then
+                tui_msg "No healthy AirVPN server has >= $MIN_BW Mbit/s right now; pick a lower minimum."
+                continue 2
+            fi
+            items=""
+            while IFS=$'\t' read -r cc name n all; do
+                on=0; [[ " $COUNTRIES " == *" $cc "* ]] && on=1
+                items+=$(printf '%s\t%s  %-24s %3d / %-3d\t%s' "$cc" "$cc" "$name" "$n" "$all" "$on")$'\n'
+            done <<<"$usable"
+            # Saved countries that no longer qualify are dropped: only listed
+            # ones can come back ticked.
+            choice=$(tui checklist "Countries: tick the ones you'd like (Space), then Enter. Nothing ticked = every country. Numbers: healthy servers of >= $MIN_BW Mbit/s / all servers there." "" "$items") || continue 2
+            COUNTRIES=$choice
+
+            echo
+            if ! rank_servers; then
+                tui_msg "No healthy server matches those filters; lower the bandwidth or add countries."
+                continue
+            fi
+            text="Ranked best first on load + reliability + ping (1 outage a month = $OUTAGE_PENALTY% load, 1 ms of ping = $PING_WEIGHT% load). Outages from AirVPN's session history: $RELIABILITY_DAYS days for the top $DEEP_CHECKS, 10 for the rest; long = down ~30 min or more, short = under ~20 min. ~ = load once its users are back after a recent outage."
+            shallow=$(shallow_top <<<"$RANKED" | xargs)
+            unknown=$(awk -F'\t' '$8 == "unknown"' <<<"$RANKED" | grep -c .)
+            [ -n "$shallow" ] && text+=$'\n'"⚠ Only 10 days of history for $shallow (stopped by the re-check or request limit), so their rank is less certain."
+            [ "$unknown" -gt 0 ] && text+=$'\n'"⚠ Could not read the outage history of $unknown server(s); they are ranked as unreliable."
+            choice=$(tui servers "$text" "$SERVER" "$RANKED" "$([ "$PINGED" = 1 ] && echo pinged)") || continue
+            [ "$choice" = c ] && continue 2
+            SERVER=$(sed -n "${choice}p" <<<"$RANKED" | cut -f1)
+            return 0
+        done
+    done
+}
+
 set_server_label() {
     SERVER_LABEL="$SERVER ($(N="$SERVER" jget '[s["location"] + ", " + s["country_name"] for s in d["servers"] if s["public_name"] == __import__("os").environ["N"]][0]' <<<"$STATUS"))"
 }
@@ -969,6 +1571,7 @@ send_alert() {
 
 configure_alerts() {
     local c n
+    [ "$TUI" = 1 ] && { tui_configure_alerts; return; }
     echo
     echo "Alerts (Enter = keep the choice in brackets):"
     echo "  1) None (no alerts)"
@@ -1038,35 +1641,110 @@ configure_alerts() {
 
 mark() { [ "$1" = 1 ] && echo x || echo " "; }
 
+# tui_configure_alerts — configure_alerts, full screen. Esc on a channel's
+# details goes back to the channels, Esc on the events back to the channel
+# too; returns 1 for Esc on the channels (nothing changed).
+tui_configure_alerts() {
+    local TUI_TITLE="Alerts" c v1 v2 sel err
+    local saved_channel=$ALERT_CHANNEL
+    while :; do
+        c=$(tui menu "Where should alerts go? A cron job checks your server every 5 minutes and alerts you about the events you pick next." "$ALERT_CHANNEL" \
+            $'none\tNone (no alerts)\nntfy\tntfy\ndiscord\tDiscord webhook\ngotify\tGotify\ntelegram\tTelegram bot') \
+            || { ALERT_CHANNEL=$saved_channel; return 1; }
+        case "$c" in
+            ntfy) v1=$(ask_or_back "ntfy topic URL (e.g. https://ntfy.sh/my-airvpn-alerts)" "$NTFY_URL") || continue
+                  v2=$(ask "ntfy access token (leave empty if none)" "$NTFY_TOKEN")
+                  ALERT_CHANNEL=ntfy NTFY_URL=$v1 NTFY_TOKEN=$v2 ;;
+            discord) v1=$(ask_or_back "Discord webhook URL" "$DISCORD_WEBHOOK") || continue
+                  ALERT_CHANNEL=discord DISCORD_WEBHOOK=$v1 ;;
+            gotify) v1=$(ask_or_back "Gotify URL (e.g. https://gotify.example.com)" "$GOTIFY_URL") || continue
+                  v2=$(ask_or_back "Gotify application token" "$GOTIFY_TOKEN") || continue
+                  ALERT_CHANNEL=gotify GOTIFY_URL=$v1 GOTIFY_TOKEN=$v2 ;;
+            telegram) v1=$(ask_or_back "Telegram bot token" "$TELEGRAM_TOKEN") || continue
+                  v2=$(ask_or_back "Telegram chat ID" "$TELEGRAM_CHAT_ID") || continue
+                  ALERT_CHANNEL=telegram TELEGRAM_TOKEN=$v1 TELEGRAM_CHAT_ID=$v2 ;;
+            *) ALERT_CHANNEL=none; ok "Alerts off"; return 0 ;;
+        esac
+        sel=$(tui checklist "Which events should send an alert via $ALERT_CHANNEL?" "" "$(printf '%s\t%s\t%s\n' \
+            down "Server down (health error, or removed by AirVPN)" "$EVENT_SERVER_DOWN" \
+            warning "Server warning (e.g. packet loss, maintenance announced)" "$EVENT_SERVER_WARNING" \
+            load "Server load at or above a threshold (asked next; now $LOAD_THRESHOLD%)" "$EVENT_SERVER_LOAD" \
+            offline "Device ${DEVICE:-?} not connected to AirVPN" "$EVENT_DEVICE_OFFLINE" \
+            expiry "Subscription about to expire (asked next; now $EXPIRY_DAYS days before)" "$EVENT_EXPIRY" \
+            recovery "All clear when a problem goes away" "$EVENT_RECOVERY")") || continue
+        sel=" $sel "
+        EVENT_SERVER_DOWN=0; EVENT_SERVER_WARNING=0; EVENT_SERVER_LOAD=0
+        EVENT_DEVICE_OFFLINE=0; EVENT_EXPIRY=0; EVENT_RECOVERY=0
+        [[ $sel == *" down "* ]] && EVENT_SERVER_DOWN=1
+        [[ $sel == *" warning "* ]] && EVENT_SERVER_WARNING=1
+        [[ $sel == *" offline "* ]] && EVENT_DEVICE_OFFLINE=1
+        [[ $sel == *" recovery "* ]] && EVENT_RECOVERY=1
+        if [[ $sel == *" load "* ]]; then
+            EVENT_SERVER_LOAD=1
+            LOAD_THRESHOLD=$(ask "Alert when the server's load is at or above this many %" "$LOAD_THRESHOLD")
+            [[ "$LOAD_THRESHOLD" =~ ^[0-9]+$ ]] || LOAD_THRESHOLD=90
+        fi
+        if [[ $sel == *" expiry "* ]]; then
+            EVENT_EXPIRY=1
+            EXPIRY_DAYS=$(ask "Warn how many days before the subscription expires" "$EXPIRY_DAYS")
+            [[ "$EXPIRY_DAYS" =~ ^[0-9]+$ ]] || EXPIRY_DAYS=7
+        fi
+        break
+    done
+    if yesno "Send a test alert via $ALERT_CHANNEL now?" y; then
+        if err=$(send_alert "AirVPN monitor test" "Test from airvpn-wg.sh on $(hostname): alerts for $DEVICE work." 2>&1); then
+            tui_msg "Test alert sent via $ALERT_CHANNEL. If it didn't arrive, check the details and change them here again."
+        else
+            tui_msg "⚠ $(tail -n 1 <<<"$err" | sed "s/^⚠️ *//") Check the details and change them here again."
+        fi
+    fi
+}
+
 # configure_monitor — the alert and auto-switch questions, then a review;
 # "n" goes through them again, so a slip needs no restart.
+# Returns 1 when the full-screen menus were left with Esc (nothing to save).
 configure_monitor() {
-    local events
+    if [ "$TUI" = 1 ]; then
+        while :; do
+            tui_configure_alerts || return 1
+            configure_autoswitch
+            TUI_TITLE="Alerts and auto-switch" yesno "Review:
+
+$(monitor_summary)
+
+Save this? (No = go through alerts and auto-switch again)" y && return 0
+        done
+    fi
     while :; do
         configure_alerts
         configure_autoswitch
         echo
-        if [ "$ALERT_CHANNEL" = none ]; then
-            echo "Review: alerts off"
-        else
-            events=""
-            [ "$EVENT_SERVER_DOWN" = 1 ] && events="$events server down,"
-            [ "$EVENT_SERVER_WARNING" = 1 ] && events="$events warning,"
-            [ "$EVENT_SERVER_LOAD" = 1 ] && events="$events load >= $LOAD_THRESHOLD%,"
-            [ "$EVENT_DEVICE_OFFLINE" = 1 ] && events="$events device offline,"
-            [ "$EVENT_EXPIRY" = 1 ] && events="$events expiry within $EXPIRY_DAYS days,"
-            [ "$EVENT_RECOVERY" = 1 ] && events="$events all clear,"
-            events=${events%,}
-            echo "Review: alerts via $ALERT_CHANNEL for${events:- no events}"
-        fi
-        if [ "$AUTO_SWITCH" = 1 ]; then
-            if [ -n "$RESTART_CONTAINER" ]; then echo "        auto-switch on, restarts $RESTART_CONTAINER"
-            else echo "        auto-switch on, no restart (a new wg0.conf waits for a manual restart)"; fi
-        else
-            echo "        auto-switch off"
-        fi
+        monitor_summary | sed '1s/^/Review: /; 2,$s/^/        /'
         yesno "Save this? (n = go through alerts and auto-switch again)" y && return 0
     done
+}
+
+# monitor_summary — the alert and auto-switch settings, two lines.
+monitor_summary() {
+    local events=""
+    if [ "$ALERT_CHANNEL" = none ]; then
+        echo "alerts off"
+    else
+        [ "$EVENT_SERVER_DOWN" = 1 ] && events="$events server down,"
+        [ "$EVENT_SERVER_WARNING" = 1 ] && events="$events warning,"
+        [ "$EVENT_SERVER_LOAD" = 1 ] && events="$events load >= $LOAD_THRESHOLD%,"
+        [ "$EVENT_DEVICE_OFFLINE" = 1 ] && events="$events device offline,"
+        [ "$EVENT_EXPIRY" = 1 ] && events="$events expiry within $EXPIRY_DAYS days,"
+        [ "$EVENT_RECOVERY" = 1 ] && events="$events all clear,"
+        events=${events%,}
+        echo "alerts via $ALERT_CHANNEL for${events:- no events}"
+    fi
+    if [ "$AUTO_SWITCH" = 1 ]; then
+        if [ -n "$RESTART_CONTAINER" ]; then echo "auto-switch on, restarts $RESTART_CONTAINER"
+        else echo "auto-switch on, no restart (a new wg0.conf waits for a manual restart)"; fi
+    else
+        echo "auto-switch off"
+    fi
 }
 
 # key_reasons — what the cron monitor needs the API key for, comma separated;
@@ -1098,6 +1776,7 @@ save_monitor_settings() {
 }
 
 configure_autoswitch() {
+    [ "$TUI" = 1 ] && { tui_configure_autoswitch; return; }
     echo
     echo "Auto-switch: when $SERVER goes down, the monitor rewrites wg0.conf for the next"
     echo "best healthy server matching your filters (${COUNTRIES:-all countries}, >= ${MIN_BW:-the largest size} Mbit/s;"
@@ -1138,6 +1817,41 @@ configure_autoswitch() {
     else
         AUTO_SWITCH=0
     fi
+}
+
+# tui_configure_autoswitch — configure_autoswitch, full screen: the
+# container to restart is picked from the ones on this machine.
+tui_configure_autoswitch() {
+    local TUI_TITLE="Auto-switch" names detected def items c
+    if ! yesno "When $SERVER goes down, the monitor can rewrite wg0.conf for the next best healthy server matching your filters (${COUNTRIES:-all countries}, >= ${MIN_BW:-the largest size} Mbit/s; load + reliability + ping, as in the list) and restart the container that uses it.
+
+Turn auto-switch on?" "$([ "$AUTO_SWITCH" = 1 ] && echo y || echo n)"; then
+        AUTO_SWITCH=0; return 0
+    fi
+    AUTO_SWITCH=1
+    names=""
+    if [ -z "${AIRVPN_WG_EMBEDDED:-}" ] && command -v docker >/dev/null; then
+        names=$(docker ps -a --format '{{.Names}}' 2>/dev/null | sort)
+    fi
+    # From arr-complete.sh (no containers yet) or without docker: type it.
+    if [ -z "$names" ]; then
+        c=$(ask "Container to restart after a switch (\"none\" = don't restart)" "${RESTART_CONTAINER:-none}")
+        [ "$c" = none ] && c=""
+        RESTART_CONTAINER=$c
+    else
+        detected=$(containers_using "$OUTPUT" | head -n 1)
+        def=$RESTART_CONTAINER
+        grep -qxF "$def" <<<"$names" || def=${detected:-@none}
+        items=$(while read -r c; do
+                    if [ "$c" = "$detected" ]; then printf '%s\t%s (uses this wg0.conf)\n' "$c" "$c"
+                    else printf '%s\t%s\n' "$c" "$c"; fi
+                done <<<"$names")$'\n@none\tDon\'t restart anything (a new wg0.conf waits for a manual restart)'
+        c=$(tui menu "Which container should be restarted after a switch? A new wg0.conf only takes effect when the container using it restarts." "$def" "$items") || c=${RESTART_CONTAINER:-@none}
+        [ "$c" = @none ] && c=""
+        RESTART_CONTAINER=$c
+    fi
+    if [ -n "$RESTART_CONTAINER" ]; then ok "Auto-switch on, restarts $RESTART_CONTAINER"
+    else warn "Auto-switch on, but no container is restarted: a new wg0.conf only takes effect when the container using it restarts."; fi
 }
 
 # install_self — keep the script next to wg0.conf (and its settings), so the
@@ -1377,6 +2091,207 @@ else:
     if [ ${#active[@]} -gt 0 ]; then printf '%s\n' "${active[@]}" > "$STATE_FILE"; else rm -f "$STATE_FILE"; fi
 }
 
+# ── Setup ───────────────────────────────────────────────────────────────────
+# run_setup — the whole setup: device, server, wg0.conf, alerts and
+# auto-switch. Returns 1 if it was left with Esc before anything was written.
+run_setup() {
+    info "AirVPN WireGuard config for $OUTPUT"
+    ensure_key
+    # Esc on the server goes back to the device (full-screen menus only).
+    while :; do
+        pick_device || return 1
+        pick_server && break
+        [ -n "$ARG_DEVICE" ] && return 1
+    done
+    generate
+    install_self
+    if [ -n "$ARG_DEVICE" ] && [ -n "$ARG_SERVER" ]; then
+        save_settings
+    else
+        echo
+        echo "Optional: a monitor (run from cron) can alert you about problems and switch"
+        echo "servers automatically when this one goes down."
+        configure_monitor
+        save_monitor_settings
+        setup_cron
+        echo "To change the server, alerts or auto-switch later: bash $(q "$SCRIPT_PATH") --output $(q "$OUTPUT")"
+    fi
+    echo
+    finish_change
+}
+
+# finish_change — after a new wg0.conf: restart the container using it.
+finish_change() {
+    local others
+    # A new wg0.conf only takes effect when the container using it
+    # restarts, so do that here. arr-complete.sh runs this before starting
+    # the containers, so there is nothing to restart then.
+    if [ -n "${AIRVPN_WG_EMBEDDED:-}" ]; then
+        info "Done."
+    elif [ "$WG_CHANGED" = 0 ]; then
+        info "Done. wg0.conf is unchanged, so nothing needs a restart."
+    elif restart_users; then
+        info "Done."
+    else
+        others=$(wg_in_use "$OUTPUT" | awk -F'\t' '{ printf "%s%s uses %s", (NR > 1 ? "; " : ""), $1, $2 }')
+        if [ -n "$others" ]; then
+            warn "No running container uses $OUTPUT ($others). To change that one: bash $(q "$SCRIPT_PATH") --output <its wg0.conf>"
+            info "Done."
+        else
+            info "Done. No running container uses $OUT_DIR; restart whatever uses wg0.conf to switch over."
+        fi
+    fi
+}
+
+# ── Menu ────────────────────────────────────────────────────────────────────
+# The menu once set up: change one thing (server, device, port, alerts)
+# without going through the rest, send a test alert or check the status.
+
+# load_device — the saved device's address (generate checks the new config
+# against it), or pick another device if it is gone. Returns 1 for Esc.
+load_device() {
+    local list line
+    list=$(api devices action=list)
+    [ "$(result_of <<<"$list")" = ok ] || die "Could not list devices: $(result_of <<<"$list")"
+    line=$(device_rows <<<"$list" | awk -F'\t' -v n="$DEVICE" '$1==n')
+    if [ -n "$line" ] && [ "$(cut -f3 <<<"$line")" = ready ]; then
+        DEVICE_IP=$(cut -f4 <<<"$line"); return 0
+    fi
+    warn "Device $DEVICE is no longer on your AirVPN account (or not ready); pick another."
+    [ "$TUI" = 1 ] && tui_msg "⚠ Device $DEVICE is no longer on your AirVPN account (or not ready). Pick another one next."
+    pick_device
+}
+
+# pick_port — the WireGuard port. Returns 1 for Esc.
+pick_port() {
+    local p
+    if [ "$TUI" = 1 ]; then
+        p=$(TUI_TITLE="WireGuard port" tui menu "AirVPN takes WireGuard on these UDP ports. If your network blocks or slows down one, try another." "$WG_PORT" \
+            "$(for p in $WG_PORTS; do printf '%s\tUDP %s%s\n' "$p" "$p" "$([ "$p" = 1637 ] && echo ' (default)')"; done)") || return 1
+    else
+        while :; do
+            p=$(ask "WireGuard port ($WG_PORTS)" "$WG_PORT")
+            [[ " $WG_PORTS " == *" $p "* ]] && break
+            echo "Pick one of: $WG_PORTS"
+        done
+    fi
+    WG_PORT=$p; ARG_PORT=""
+}
+
+# status_text — the current server's health and the saved settings.
+status_text() {
+    local status used conf_time
+    status=$(api status)
+    if [ "$(result_of <<<"$status")" = ok ]; then
+        N="$SERVER" python3 -c '
+import json, os, sys
+d = json.load(sys.stdin)
+m = [s for s in d["servers"] if s["public_name"] == os.environ["N"]]
+if not m:
+    print("Server:       %s is no longer listed by AirVPN!" % os.environ["N"])
+else:
+    s = m[0]
+    print("Server:       %s (%s, %s): health %s, load %s%%, %s users, %s Mbit/s" % (
+        s["public_name"], s.get("location", "?"), s.get("country_name", "?"), s.get("health", "?"),
+        s.get("currentload", "?"), s.get("users", "?"), s.get("bw_max", "?")))
+    w = " ".join(s.get("warning", "").split())
+    if w:
+        print("              warning: " + w)' <<<"$status"
+    else
+        echo "Server:       $SERVER (could not reach the AirVPN status API)"
+    fi
+    echo "Device:       $DEVICE"
+    echo "Port:         UDP $WG_PORT, endpoint $(sed -n 's/^Endpoint *= *//p' "$OUTPUT" 2>/dev/null)"
+    conf_time=$(date -r "$OUTPUT" '+%Y-%m-%d %H:%M' 2>/dev/null)
+    echo "wg0.conf:     $OUTPUT${conf_time:+ (written $conf_time)}"
+    used=$(containers_using "$OUTPUT" | xargs)
+    echo "Used by:      ${used:-no running container}"
+    echo "Filters:      ${COUNTRIES:-all countries}, >= ${MIN_BW:-the largest size} Mbit/s"
+    monitor_summary | sed '1s/^/Monitor:      /; 2,$s/^/              /'
+    if [ -s "$STATE_FILE" ]; then
+        echo "Active alerts: $(cut -d'|' -f2 "$STATE_FILE" | paste -sd ';' - | sed 's/;/; /g')"
+    fi
+    if [ -s "$SWITCH_FAILED_FILE" ]; then
+        echo "Last auto-switch failed: $(cat "$SWITCH_FAILED_FILE")"
+    fi
+}
+
+# menu_action <action> — one menu entry. Returns 1 if it was left with Esc.
+menu_action() {
+    case "$1" in
+        server)
+            ensure_key; load_device || return 1
+            pick_server || return 1
+            generate; install_self; save_settings; setup_cron; finish_change ;;
+        device)
+            ensure_key; pick_device || return 1
+            generate; install_self; save_settings; setup_cron; finish_change ;;
+        port)
+            pick_port || return 1
+            ensure_key; load_device || return 1
+            generate; install_self; save_settings; setup_cron; finish_change ;;
+        alerts)
+            configure_monitor || return 1
+            save_monitor_settings; install_self; setup_cron ;;
+        test)
+            if [ "$ALERT_CHANNEL" = none ]; then
+                [ "$TUI" = 1 ] && tui_msg "No alert channel is set up yet: pick \"Alerts and auto-switch\" first." && return 1
+                warn "No alert channel is set up yet: pick \"Alerts and auto-switch\" first."; return 0
+            fi
+            local err
+            if err=$(send_alert "AirVPN monitor test" "Test from airvpn-wg.sh on $(hostname)." 2>&1); then
+                [ "$TUI" = 1 ] && { tui_msg "Test alert sent via $ALERT_CHANNEL."; return 1; }
+                ok "Test alert sent via $ALERT_CHANNEL"
+            else
+                [ "$TUI" = 1 ] && { tui_msg "⚠ $(tail -n 1 <<<"$err" | sed "s/^⚠️ *//")"; return 1; }
+                echo "$err" >&2
+            fi ;;
+        status)
+            if [ "$TUI" = 1 ]; then
+                TUI_TITLE="Status" tui_msg "$(status_text)"; return 1
+            fi
+            echo; status_text ;;
+        setup)
+            run_setup || return 1 ;;
+    esac
+}
+
+# home_menu — the menu, until q (or Esc).
+home_menu() {
+    local choice items summary
+    items=$'server\t1) Change server\t1
+device\t2) Change device (WireGuard key)\t2
+port\t3) Change WireGuard port\t3
+alerts\t4) Alerts and auto-switch\t4
+test\t5) Send a test alert\t5
+status\t6) Status: is the server OK?\t6
+setup\t7) Full setup again\t7
+quit\tq) Quit\tq'
+    while :; do
+        summary="Server $SERVER, device $DEVICE, UDP $WG_PORT -> $OUTPUT
+Alerts: $(monitor_summary | paste -sd ';' - | sed 's/;/; /')"
+        if [ "$TUI" = 1 ]; then
+            choice=$(tui menu "$summary" server "$items") || choice=quit
+        else
+            echo
+            echo "$summary"
+            cut -f2 <<<"$items" | sed 's/^/  /'
+            while :; do
+                choice=$(ask "Choice" "q")
+                choice=$(awk -F'\t' -v k="$choice" '$3 == k { print $1 }' <<<"$items")
+                [ -n "$choice" ] && break
+                echo "Type 1-7 or q."
+            done
+        fi
+        [ "$choice" = quit ] && return 0
+        echo
+        # Back from the full-screen menus: show what the change printed.
+        if menu_action "$choice" && [ "$TUI" = 1 ]; then
+            tty_read -rp "Press Enter to go back to the menu... " _
+        fi
+    done
+}
+
 # ── Main ────────────────────────────────────────────────────────────────────
 case "$CMD" in
     monitor)
@@ -1386,43 +2301,12 @@ case "$CMD" in
         send_alert "AirVPN monitor test" "Test from airvpn-wg.sh on $(hostname)." && ok "Test alert sent via $ALERT_CHANNEL" ;;
     alerts)
         [ -f "$ENV_FILE" ] || die "No $ENV_FILE. Run setup first."
-        configure_monitor; save_monitor_settings; install_self; setup_cron ;;
+        configure_monitor || { info "Cancelled; nothing was changed."; exit 0; }
+        save_monitor_settings; install_self; setup_cron ;;
+    menu)
+        [ -n "$DEVICE" ] && [ -n "$SERVER" ] || die "Nothing set up yet for $OUTPUT. Run: bash $(q "$SELF") setup --output $(q "$OUTPUT")"
+        home_menu ;;
     setup)
-        info "AirVPN WireGuard config for $OUTPUT"
-        ensure_key
-        pick_device
-        pick_server
-        generate
-        install_self
-        if [ -n "$ARG_DEVICE" ] && [ -n "$ARG_SERVER" ]; then
-            save_settings
-        else
-            echo
-            echo "Optional: a monitor (run from cron) can alert you about problems and switch"
-            echo "servers automatically when this one goes down."
-            configure_monitor
-            save_monitor_settings
-            setup_cron
-            echo "To change alerts or auto-switch later: bash $(q "$SCRIPT_PATH") alerts --output $(q "$OUTPUT")"
-        fi
-        echo
-        # A new wg0.conf only takes effect when the container using it
-        # restarts, so do that here. arr-complete.sh runs this before starting
-        # the containers, so there is nothing to restart then.
-        if [ -n "${AIRVPN_WG_EMBEDDED:-}" ]; then
-            info "Done."
-        elif [ "$WG_CHANGED" = 0 ]; then
-            info "Done. wg0.conf is unchanged, so nothing needs a restart."
-        elif restart_users; then
-            info "Done."
-        else
-            others=$(wg_in_use "$OUTPUT" | awk -F'\t' '{ printf "%s%s uses %s", (NR > 1 ? "; " : ""), $1, $2 }')
-            if [ -n "$others" ]; then
-                warn "No running container uses $OUTPUT ($others). To change that one: bash $(q "$SCRIPT_PATH") --output <its wg0.conf>"
-                info "Done."
-            else
-                info "Done. No running container uses $OUT_DIR; restart whatever uses wg0.conf to switch over."
-            fi
-        fi
+        run_setup || info "Cancelled; nothing was changed."
         ;;
 esac
