@@ -253,10 +253,59 @@ if [ -z "${CIDR_NETWORK:-}" ]; then
     warn "Could not derive the LAN prefix; assuming $CIDR_NETWORK"
 fi
 
-# Timezone for the containers: whatever TrueNAS is set to.
-TZ_VALUE=$(timedatectl show -p Timezone --value 2>/dev/null || true)
-[ -n "$TZ_VALUE" ] || TZ_VALUE=$(cat /etc/timezone 2>/dev/null || true)
-[ -n "$TZ_VALUE" ] || TZ_VALUE="America/New_York"
+# Timezone for the containers (TZ=): TrueNAS's own by default, or the one
+# saved from the last run; the user can pick another. Typing a name that isn't
+# a timezone searches for it, e.g. "london" or "new york".
+DETECTED_TZ=$(timedatectl show -p Timezone --value 2>/dev/null || true)
+[ -n "$DETECTED_TZ" ] || DETECTED_TZ=$(cat /etc/timezone 2>/dev/null || true)
+[ -n "$DETECTED_TZ" ] || DETECTED_TZ="America/New_York"
+TZ_VALUE=${TZ_VALUE:-$DETECTED_TZ}
+list_timezones() {
+    timedatectl list-timezones 2>/dev/null && return
+    { echo UTC; awk '!/^#/ { print $3 }' /usr/share/zoneinfo/zone1970.tab /usr/share/zoneinfo/zone.tab 2>/dev/null; } | sort -u
+}
+choose_timezone() {
+    local answer pick i
+    local -a zones matches
+    mapfile -t zones < <(list_timezones)
+    while :; do
+        echo ""
+        read -rp "Timezone for the containers [$TZ_VALUE] (Enter keeps it, or type a city or region to search): " answer || return 0
+        answer="${answer#"${answer%%[![:space:]]*}"}"; answer="${answer%"${answer##*[![:space:]]}"}"
+        [ -z "$answer" ] && return 0
+        if [ "${#zones[@]}" -eq 0 ]; then
+            # No list to search: accept a name the system has a zone file for.
+            if [ -f "/usr/share/zoneinfo/$answer" ]; then TZ_VALUE="$answer"; return 0; fi
+            echo "  '$answer' is not a timezone (e.g. Europe/London, America/Chicago)."; continue
+        fi
+        mapfile -t matches < <(printf '%s\n' "${zones[@]}" | grep -ixF -- "$answer")
+        if [ "${#matches[@]}" -eq 1 ]; then TZ_VALUE="${matches[0]}"; return 0; fi
+        mapfile -t matches < <(printf '%s\n' "${zones[@]}" | grep -iF -- "${answer// /_}")
+        if [ "${#matches[@]}" -eq 0 ]; then
+            echo "  Nothing matches '$answer'. Try a big city in your timezone, e.g. Chicago, London, Sydney."
+            continue
+        fi
+        if [ "${#matches[@]}" -eq 1 ]; then
+            TZ_VALUE="${matches[0]}"; echo "  Using $TZ_VALUE."; return 0
+        fi
+        if [ "${#matches[@]}" -gt 30 ]; then
+            echo "  ${#matches[@]} timezones match '$answer'; type more of the name (e.g. America/Chicago)."
+            continue
+        fi
+        for i in "${!matches[@]}"; do printf '  %d) %s\n' "$(( i + 1 ))" "${matches[$i]}"; done
+        echo "  0) Search again"
+        while :; do
+            read -rp "  Select a timezone [0-${#matches[@]}]: " pick || return 0
+            [ "$pick" = 0 ] && break
+            if [[ "$pick" =~ ^[0-9]+$ ]] && [ "$pick" -le "${#matches[@]}" ]; then
+                TZ_VALUE="${matches[$(( pick - 1 ))]}"; return 0
+            fi
+            echo "  Please enter a number between 0 and ${#matches[@]}."
+        done
+    done
+}
+choose_timezone
+echo "Containers will use timezone $TZ_VALUE."
 
 # Group that owns the Docker socket (999 on a standard TrueNAS install).
 # Dozzle runs as 568:568 and must join it to see containers.
@@ -610,7 +659,7 @@ create_dataset "$CONFIG_POOL" "configs"
 save_answers() {
     {
         echo "# Answers from the last run of arr-complete.sh (root only). Delete to be asked afresh."
-        printf 'ADMIN_USER=%q\nADMIN_PASS=%q\nQB_FORWARDED_PORT=%q\n' "$ADMIN_USER" "$ADMIN_PASS" "$QB_FORWARDED_PORT"
+        printf 'ADMIN_USER=%q\nADMIN_PASS=%q\nQB_FORWARDED_PORT=%q\nTZ_VALUE=%q\n' "$ADMIN_USER" "$ADMIN_PASS" "$QB_FORWARDED_PORT" "$TZ_VALUE"
     } > "$SETUP_STATE_FILE" && chmod 600 "$SETUP_STATE_FILE"
 }
 save_answers
